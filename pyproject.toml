@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fauxbus"
+version = "0.1.0.dev0"
+description = "A wire-level fake of the Globus API — deterministic failure on demand"
+readme = "README.md"
+requires-python = ">=3.11"
+# No license stamp yet — that decision is xram's, not the code's.
+# SPEC.md recommends BSD-3-Clause; pyproject gains it when he stamps it.
+authors = []
+keywords = ["globus", "testing", "fake", "http", "integration-tests"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+]
+# Zero runtime dependencies, on purpose.  A test fake that consumers add
+# to their dev environments should not bring a supply chain with it.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.5,<1",
+]
+# The conformance suite drives the real globus-sdk against Fauxbus.
+# The pin here IS the stated SDK contract version from SPEC.md.
+conformance = [
+    "globus-sdk>=4.8.1,<5",
+]
+
+[project.scripts]
+fauxbus = "fauxbus.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fauxbus"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fauxbus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
