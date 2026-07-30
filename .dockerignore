@@ -1,0 +1,13 @@
+# Podman reads this too (falls back to .dockerignore when no
+# .containerignore exists) — one file covers both runtimes.
+.git
+.worktrees
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+dist
+build
+*.egg-info

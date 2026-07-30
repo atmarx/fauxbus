@@ -35,6 +35,27 @@ fauxbus serve --port 9800
 Point `globus_sdk.GroupsClient(...)` (or any Globus client) at that port
 instead of the real service host, and run your existing test suite.
 
+## In a compose stack
+
+The repo ships a `Containerfile`.  Zero runtime dependencies means the
+image is the Python base plus one stdlib-only wheel — nothing else rides
+along.  Mount a state document at `/seed.json` and the world exists
+before the first test connects:
+
+```yaml
+services:
+  fauxbus:
+    build: { context: ., dockerfile: Containerfile }
+    ports: ["9800:9800"]
+    volumes: ["./seed.json:/seed.json:ro"]
+```
+
+The image ships a healthcheck on the control-plane index, so
+`depends_on: { fauxbus: { condition: service_healthy } }` does the
+waiting for you.  A runnable example — sibling-service pattern, seed
+file included, both round-trip tested in CI — is in
+[`examples/`](examples/).
+
 ## Loud 501s, no fiction
 
 Fauxbus only implements endpoints a real consumer needs. Anything it

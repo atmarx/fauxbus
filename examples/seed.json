@@ -1,0 +1,53 @@
+{
+  "clock": 0,
+  "counters": {
+    "group": 1
+  },
+  "groups": {
+    "47c2164b-c572-51b0-9246-1a8211fb9e80": {
+      "description": "Runs when everything else is down.",
+      "enforce_session": false,
+      "group_type": "regular",
+      "membership_fields": {},
+      "memberships": {
+        "00000000-0000-4000-8000-00000000000a": {
+          "role": "admin",
+          "status": "active",
+          "username": "alice@example.org"
+        },
+        "00000000-0000-4000-8000-00000000000b": {
+          "role": "member",
+          "status": "active",
+          "username": "bob@example.org"
+        }
+      },
+      "name": "Night Owl Service",
+      "parent_id": null,
+      "policies": {
+        "authentication_assurance_timeout": 28800,
+        "group_members_visibility": "managers",
+        "group_visibility": "private",
+        "is_high_assurance": false,
+        "join_requests": false,
+        "signup_fields": []
+      },
+      "session_limit": 28800,
+      "session_timeouts": {},
+      "subscription_admin_verified_id": null,
+      "subscription_id": null,
+      "subscription_info": null
+    }
+  },
+  "identities": {
+    "t-alice": {
+      "identity_id": "00000000-0000-4000-8000-00000000000a",
+      "username": "alice@example.org"
+    },
+    "t-bob": {
+      "identity_id": "00000000-0000-4000-8000-00000000000b",
+      "username": "bob@example.org"
+    }
+  },
+  "preferences": {},
+  "version": 0
+}

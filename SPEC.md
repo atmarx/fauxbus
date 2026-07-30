@@ -165,8 +165,17 @@ test connects.
 ## Packaging
 
 - Python ≥3.11.  `pipx install fauxbus && fauxbus serve --port 9800`.
-- A container image for compose stacks and CI services.
-- Dependency-light on purpose; nothing exotic.
+- A container image (`Containerfile`, OCI-neutral name) for compose
+  stacks and CI services.  Conventions: mount a state document at
+  `/seed.json` and it loads on boot; the healthcheck probes the
+  control-plane index, so `depends_on: service_healthy` just works;
+  runtime args pass through to `fauxbus serve`.  Runs unprivileged
+  (uid 9800 — yes, the port).  `examples/compose.yaml` is the copyable
+  pattern, and `examples/seed.json` is a real state dump kept honest by
+  a byte-identical round-trip test in CI.
+- Zero runtime dependencies — stdlib only, on purpose.  A test fake
+  consumers add to their dev environments should not bring a supply
+  chain with it.
 - MIT (decided 2026-07-30).  We reviewed the Globus Connect source
   license first: it covers GCS/GCP source code only — not the APIs, not
   the Apache-2 SDK — and Fauxbus stays entirely outside its scope by
@@ -209,6 +218,12 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.2** (2026-07-30) — the container image lands: multi-stage
+  `Containerfile` (wheel-only final image, unprivileged uid 9800),
+  seed-at-`/seed.json` convention, healthcheck on the control-plane
+  index, and `examples/` with a compose pattern plus a seed file that
+  CI round-trips byte-identically.  Packaging bullet promoted from
+  "dependency-light" to the truth: zero runtime dependencies.
 - **v0.2.1** (2026-07-30) — license decided: MIT, xram's stamp, after
   reviewing the Globus Connect source license and confirming the SDK's
   Apache-2.0 terms from the wheel itself.  BSD-3 recommendation retired

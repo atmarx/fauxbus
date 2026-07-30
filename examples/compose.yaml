@@ -1,0 +1,49 @@
+# Fauxbus as a compose service — the sibling-container pattern: a faux
+# Globus next to your real-but-local Keycloak/Postgres/whatever, so the
+# dev stack has every external service it talks to and none of them are
+# real.
+#
+# Try it from the repo root:
+#   docker compose -f examples/compose.yaml up
+#   curl -s http://localhost:9800/_fauxbus/state | python -m json.tool
+#
+# In your own stack, copy the fauxbus service block and either build
+# from a checkout (as here) or point `image:` at a published one.
+
+services:
+  fauxbus:
+    build:
+      context: ..
+      dockerfile: Containerfile
+    ports:
+      - "9800:9800"
+    volumes:
+      # The convention: a state document mounted at /seed.json exists
+      # before the first test connects.  Omit the mount to boot empty.
+      # This file is round-trip tested in CI — it is a real dump of
+      # GET /_fauxbus/state, not a hand-written approximation.
+      - ./seed.json:/seed.json:ro
+
+    # The image ships this same healthcheck; repeated here so
+    # depends_on works even against an image that predates it.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9800/_fauxbus/', timeout=1)"
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  # Your application goes here.  The two lines that matter:
+  #
+  #   app:
+  #     depends_on:
+  #       fauxbus:
+  #         condition: service_healthy
+  #     environment:
+  #       # ...or however your code injects a Globus base_url — the one
+  #       # seam it must leave open.  Inside the compose network the
+  #       # hostname is the service name:
+  #       GLOBUS_GROUPS_BASE_URL: http://fauxbus:9800
