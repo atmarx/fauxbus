@@ -9,9 +9,13 @@ the real service will never give you on purpose: a 429 exactly when your
 retry logic needs testing, a member that's mysteriously already in the
 group, a task that fails at 60%.
 
-**Status: early.** The skeleton boots and answers the control plane; the
-Groups API surface is landing next. Nothing here is stable yet — see
-[SPEC.md](SPEC.md) for the full design and the v0.1 scope.
+**Status: early but real.** The complete `GroupsClient` surface of
+globus-sdk 4.8.1 is implemented — all fourteen methods, all eleven batch
+membership verbs — and the test suite drives the actual globus-sdk
+against it, unmodified, including its retry logic sailing through an
+injected 429. Response shapes not yet backed by a recording are marked
+`PROVISIONAL` in code and tracked as conformance obligations. Nothing is
+stable yet — see [SPEC.md](SPEC.md) for the full design.
 
 ## Fake, not mock
 
