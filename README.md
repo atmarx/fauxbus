@@ -25,6 +25,12 @@ you ship is the client library you test against — Fauxbus imitates what
 `globus-sdk` actually sends and expects, pinned to a stated SDK version and
 derived from real recorded responses, never guesswork.
 
+If canned responses inside a Python unit test are all you need, use the
+SDK's own `globus_sdk.testing` — that's the in-process layer, and its
+fixtures are Fauxbus's ground truth.  Fauxbus is for the layer it
+architecturally can't reach: a real socket your whole stack can talk
+to, with state behind it (think moto next to botocore's `Stubber`).
+
 ## Quick start
 
 ```sh

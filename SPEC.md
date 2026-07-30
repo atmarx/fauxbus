@@ -25,6 +25,35 @@ tests your fiction of it.  A shared, wire-level fake — kept honest by a
 conformance suite that also runs against the real thing — is the missing
 piece, and it gets more useful every year Globus grows.
 
+### Prior art: `globus_sdk.testing`
+
+The SDK ships a testing module, and Fauxbus is deliberately not a
+second one.  `globus_sdk.testing` (public as of SDK 4.x; `_testing` in
+3.x) is an in-process mock layer built on the `responses` library: it
+intercepts HTTP inside the Python process that activates it, replaying
+canned per-method fixtures.  For unit tests — "my function calls
+`get_group` and handles the response" — it is the right tool and
+lighter than Fauxbus.  Use it there.
+
+What it cannot be, by architecture rather than by gap, is a server.
+Nothing listens on a socket, so a containerized app, a compose stack, a
+non-Python client, or plain `curl` cannot reach it.  Its fixtures are
+stateless — create a group, then list groups, and the list fixture
+doesn't know — and its own docs scope the payloads as "a best
+approximation of API responses" that "may change in any SDK release."
+(The Globus-operated `sandbox`/`preview`/`test` environments the SDK
+config knows about are the other direction: real, online, credentialed,
+shared, non-deterministic — not a local dev tool either.)
+
+Fauxbus is the complementary layer, in the same relationship to
+`globus_sdk.testing` as moto stands to botocore's `Stubber`, or
+WireMock to Mockito stubs: the stateful wire fake next to the
+in-process mock, a standard pairing in mature ecosystems.  Not a rival
+but a consumer — the RECORDED truth grade is *defined* as "backed by a
+fixture the SDK ships," which mostly means that module's data.  Their
+mock data is our ground truth; our conformance suite drives their real
+client.
+
 ## Design principles
 
 1. **The SDK is the contract.**  Fauxbus imitates what the official
@@ -218,6 +247,14 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.3** (2026-07-30) — prior-art section added after xram asked
+  the question any Globus engineer would ask first: doesn't
+  `globus_sdk.testing` already do this?  Answer, grounded in the 4.8.1
+  wheel and their docs: no — it's an in-process `responses`-based mock
+  (no socket, stateless fixtures, "best approximation" by its own
+  docs), and Fauxbus is the complementary stateful wire layer that
+  *consumes* those fixtures as ground truth.  moto : Stubber ::
+  Fauxbus : globus_sdk.testing.
 - **v0.2.2** (2026-07-30) — the container image lands: multi-stage
   `Containerfile` (wheel-only final image, unprivileged uid 9800),
   seed-at-`/seed.json` convention, healthcheck on the control-plane
