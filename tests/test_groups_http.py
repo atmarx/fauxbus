@@ -11,7 +11,7 @@ from fauxbus.ids import identity_id_for_token
 A, B, C = "t-alice", "t-bob", "t-carol"
 
 
-def make_group(fx, name="Rough Riders", token=A, **extra):
+def make_group(fx, name="Route 9800", token=A, **extra):
     status, doc, _ = fx.post("/v2/groups", {"name": name, "description": "d", **extra}, token=token)
     assert status == 200, doc
     return doc
@@ -382,7 +382,7 @@ def test_subscription_lookup_returns_restricted_projection(fx):
                     "policies": {"group_visibility": "authenticated"},
                     "subscription_id": sid,
                     "subscription_info": {
-                        "name": "Golems R Us",  # not part of the projection
+                        "name": "Charter Coach Co",  # not part of the projection
                         "is_high_assurance": True,
                         "is_baa": False,
                         "connectors": {},

@@ -35,12 +35,12 @@ def client(fx) -> GroupsClient:
 
 
 def test_create_get_update_delete_round_trip(client):
-    created = client.create_group({"name": "Rough Riders", "description": "no stairs"})
+    created = client.create_group({"name": "Route 9800", "description": "same stops every run"})
     gid = created["id"]
     assert created["my_memberships"][0]["role"] == "admin"
 
     fetched = client.get_group(gid, include=["memberships", "child_ids"])
-    assert fetched["name"] == "Rough Riders"
+    assert fetched["name"] == "Route 9800"
     assert fetched["child_ids"] == []
 
     updated = client.update_group(gid, {"name": "Renamed Riders"})
