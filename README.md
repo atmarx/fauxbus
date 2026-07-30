@@ -55,3 +55,9 @@ Fauxbus is an independent test tool, not affiliated with or endorsed by
 Globus or the University of Chicago. "Globus" is their trademark; this
 project imitates the API's behavior for local testing only — the name is a
 confession, not an infringement. It's *faux*.
+
+## License
+
+MIT. Fauxbus contains no Globus code: it imitates publicly documented
+wire behavior, grounded against the Apache-2.0 `globus-sdk` as a
+test-time dependency only.

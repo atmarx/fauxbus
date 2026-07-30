@@ -167,7 +167,11 @@ test connects.
 - Python ≥3.11.  `pipx install fauxbus && fauxbus serve --port 9800`.
 - A container image for compose stacks and CI services.
 - Dependency-light on purpose; nothing exotic.
-- BSD-3-Clause (recommended — sits comfortably next to the Apache-2 SDK).
+- MIT (decided 2026-07-30).  We reviewed the Globus Connect source
+  license first: it covers GCS/GCP source code only — not the APIs, not
+  the Apache-2 SDK — and Fauxbus stays entirely outside its scope by
+  never touching that source.  With provenance handled by discipline,
+  the outbound license just needs to be short and adoptable.
 
 ## The conformance tether
 
@@ -205,6 +209,10 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.1** (2026-07-30) — license decided: MIT, xram's stamp, after
+  reviewing the Globus Connect source license and confirming the SDK's
+  Apache-2.0 terms from the wheel itself.  BSD-3 recommendation retired
+  (that rationale belonged to root-cellar's iRODS alignment).
 - **v0.2** (2026-07-30) — Groups scope expanded from a five-bullet subset
   to the complete `GroupsClient` surface, pinned to globus-sdk 4.8.1, per
   xram's directive that the SDK client is the guidepost.  Added the
