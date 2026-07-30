@@ -53,19 +53,71 @@ piece, and it gets more useful every year Globus grows.
 ## v0.1 — Groups
 
 The first release imitates the **Globus Groups API v2**, scoped to the
-`globus-sdk` `GroupsClient` surface:
+**complete `globus-sdk` `GroupsClient` surface, pinned to SDK 4.8.1** —
+all fourteen client methods, not a subset.  The SDK client is the
+guidepost: if `GroupsClient` has a method, Fauxbus answers it.
 
-- create / get / delete a group; subgroup creation under a parent
-- list "my groups" for the calling identity
-- batch membership actions: add, remove, and the invite/approve family —
-  with per-identity success/failure results in the response document, the
-  way the real service partially succeeds
-- group policies get/set
-- membership roles as Globus defines them (`admin`, `manager`, `member`)
-  with the real service's rules about who may perform which action
+**Group lifecycle**
+- `POST /v2/groups` — create; subgroups via `parent_id` in the document;
+  the creating identity becomes an active `admin`
+- `GET /v2/groups/{id}` — with `include=` support for `memberships`,
+  `my_memberships`, `policies`, `allowed_actions`, `child_ids`
+- `PUT /v2/groups/{id}` — update name/description
+- `DELETE /v2/groups/{id}` — returns the deleted group document (recorded
+  SDK-fixture behavior, not a guess)
 
-Response documents, id formats (UUIDs where Globus uses them), pagination
-shape, and error bodies match recorded real-service responses.
+**Membership**
+- `GET /v2/groups/my_groups` — the calling identity's groups, with the
+  `statuses` filter.  Note a recorded quirk: the list-view documents are
+  *slimmer* than the single-group document (no `description`, no
+  subscription fields), and the response is a **bare JSON array** — no
+  pagination envelope.
+- `POST /v2/groups/{id}` — batch membership actions, all eleven verbs:
+  `add`, `invite`, `accept`, `decline`, `approve`, `reject`, `join`,
+  `leave`, `remove`, `change_role`, `request_join` — with per-identity
+  success/failure results in the response document, the way the real
+  service partially succeeds.  Membership statuses as Globus defines
+  them: `active`, `invited`, `pending`, `rejected`, `removed`, `left`,
+  `declined`.
+- Roles as Globus defines them (`admin`, `manager`, `member`) with the
+  real service's rules about who may perform which action — including
+  the guardrails: managers cannot touch admins, the last admin cannot
+  leave.
+
+**Policies, preferences, fields**
+- `GET/PUT /v2/groups/{id}/policies` — the six-field policy document
+- `GET/PUT /v2/preferences` — identity preferences (`allow_add` is
+  enforced: an identity that set `allow_add: false` cannot be added)
+- `GET/PUT /v2/groups/{id}/membership_fields`
+
+**Subscriptions**
+- `GET /v2/subscription_info/{subscription_id}` — group lookup by
+  subscription, returning the restricted `subscription_info` projection
+  (`is_high_assurance`, `is_baa`, `connectors`)
+- `PUT /v2/groups/{id}/subscription_admin_verified`
+
+Response documents, id formats (UUIDs where Globus uses them), and error
+bodies match recorded real-service responses where recordings exist.
+
+### Recorded, documented, provisional
+
+Every imitated behavior carries one of three grades of truth, and the
+code says which:
+
+1. **Recorded** — backed by a response fixture shipped in the SDK itself
+   or captured from the real service.  The strongest grade.
+2. **Documented** — stated by SDK docstrings or the published API docs,
+   but not yet witnessed on the wire.
+3. **Provisional** — Fauxbus's best inference where neither exists,
+   marked `PROVISIONAL` in code.  Every provisional behavior is an open
+   conformance obligation: the tether run against the real service either
+   promotes it or corrects it.  The batch-action response document is the
+   most prominent provisional today and the top priority for the first
+   recording session.
+
+Error documents are shaped `{"code": ..., "detail": ...}` — the form the
+SDK's error classes parse into `.code` and `.message` regardless of which
+of its three error-format branches fires.
 
 ### Auth posture
 
@@ -73,10 +125,12 @@ Requests must carry a bearer token — a client that forgets auth should fail
 in dev, not in prod (`--allow-anonymous` exists but defaults off).  The
 token is **not** cryptographically validated: by default, any token is
 accepted and its *identity is derived from the token string itself* (a
-stable mapping, so `token-for-alice` is always the same caller).  A config
-file can pin explicit token → identity mappings when a test needs to be
-picky.  Real token introspection is out of scope until an Auth API mock
-exists (roadmap).
+stable mapping, so `token-for-alice` is always the same caller — same
+UUID, same username, every run).  When a test needs to be picky, the seed
+document's `identities` section pins explicit token → identity mappings;
+because the state dump includes the same section, pinning is just seeding.
+Real token introspection is out of scope until an Auth API mock exists
+(roadmap).
 
 ## The control plane (`/_fauxbus/`)
 
@@ -87,12 +141,22 @@ exists (roadmap).
   checks what's *actually in the directory*, not what your code claims it
   did.
 - `POST /_fauxbus/failures` — arm failure injection: match on method +
-  path glob, respond with a chosen status/body, for the next N matching
-  requests (or until cleared).  `DELETE /_fauxbus/failures` disarms.
+  path glob, respond with a chosen status (optional custom body/headers),
+  for the next N matching requests (or until cleared).  `GET
+  /_fauxbus/failures` lists what's armed; `DELETE /_fauxbus/failures`
+  disarms (all, or one by `?id=`).  Injection applies only to the
+  imitated `/v2/…` surface — you cannot brick the control plane with it.
   One-shot inline variant: send `X-Fauxbus-Fail: 429` on any request to get
   that failure exactly once, for quick cases.
-- `POST /_fauxbus/tick` — advance Fauxbus's clock (roadmap: what makes
-  transfer-task progression testable without `sleep`).
+- `POST /_fauxbus/tick` — advance Fauxbus's logical clock by N seconds
+  (roadmap: what makes transfer-task progression testable without
+  `sleep`; nothing consumes it in v0.1, but it exists from day one so
+  determinism is load-bearing, not retrofitted).
+
+**The round-trip invariant:** the document `GET /_fauxbus/state` returns
+is a valid `POST /_fauxbus/seed` body, and seeding a fresh world with a
+state dump reproduces that state exactly.  Dump, seed, dump again: byte
+-identical.  This is tested, not aspirational.
 
 State is in-memory and disposable by design.  `--seed state.json` on boot
 covers the compose-stack case where the world should exist before the first
@@ -123,6 +187,13 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   in milliseconds and fail it at will.
 - **Auth** — identities lookup, token introspection, dependent tokens; at
   that point the Groups auth posture can grow real introspection.
+- **Web interface** (penciled for v0.4) — a browser face at
+  `app.fauxbus.local` (mocked in DNS) that lightly mirrors
+  `app.globus.org`: browse groups and memberships, watch transfer tasks
+  progress as tests drive them.  Strictly an *observer* over the same
+  in-memory world — it reads what the control plane reads, changes
+  nothing, and lives on the harness side of the principle-4 line.  Makes
+  Fauxbus a debugging companion, not just a CI fixture.
 - Whatever consumers file issues for, in that order, per principle 2.
 
 ## Not affiliated with Globus
@@ -131,3 +202,13 @@ Fauxbus is an independent test tool, not affiliated with or endorsed by
 Globus or the University of Chicago.  "Globus" is their trademark; this
 project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
+
+## Changelog
+
+- **v0.2** (2026-07-30) — Groups scope expanded from a five-bullet subset
+  to the complete `GroupsClient` surface, pinned to globus-sdk 4.8.1, per
+  xram's directive that the SDK client is the guidepost.  Added the
+  recorded/documented/provisional truth grades, the seed/state round-trip
+  invariant, identity pinning via the seed document, and corrected the
+  pagination claim: Groups `my_groups` returns a bare array, no envelope.
+- **v0.1** (2026-07-30) — founding document, spun off from #root-cellar.
