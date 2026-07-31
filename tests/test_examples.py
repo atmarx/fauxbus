@@ -33,6 +33,27 @@ def test_example_seed_is_byte_identical_to_its_own_dump(fx):
     ).read_text()
 
 
+def test_example_seed_as_canonical_comes_home_on_reset(fx):
+    # The workflow the container is built for: the mounted seed is the
+    # fixed point.  Pin it, mutate the world as a throw-away, reset —
+    # and the state is byte-identical to the shipped file again.
+    doc = example_seed()
+    fx.post("/_fauxbus/seed?canonical=true", doc)
+
+    (gid,) = doc["groups"]
+    bob = "00000000-0000-4000-8000-00000000000b"
+    fx.post(f"/v2/groups/{gid}", {"change_role": [{"identity_id": bob, "role": "manager"}]},
+            token="t-alice")
+    _, mutated, _ = fx.get("/_fauxbus/state")
+    assert mutated["groups"][gid]["memberships"][bob]["role"] == "manager"
+
+    fx.post("/_fauxbus/reset")
+    _, restored, _ = fx.get("/_fauxbus/state")
+    assert json.dumps(restored, indent=2, sort_keys=True) + "\n" == (
+        EXAMPLES / "seed.json"
+    ).read_text()
+
+
 def test_example_seed_pins_work_on_the_wire(fx):
     fx.post("/_fauxbus/seed", example_seed())
     status, groups, _ = fx.get("/v2/groups/my_groups", token="t-alice")

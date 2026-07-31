@@ -83,7 +83,11 @@ def live_server():
 
 @pytest.fixture
 def fx(live_server: Client) -> Client:
-    """A client against a freshly reset world."""
+    """A client against a freshly reset, canonical-free world."""
+    # A previous test may have pinned a canonical seed on the shared
+    # server; forget it first so the reset below really means empty.
+    status, _, _ = live_server.delete("/_fauxbus/seed")
+    assert status == 200
     status, _, _ = live_server.post("/_fauxbus/reset")
     assert status == 200
     return live_server

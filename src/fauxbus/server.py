@@ -88,6 +88,7 @@ class FauxbusServer(ThreadingHTTPServer):
         world: World | None = None,
         allow_anonymous: bool = False,
         verbose: bool = False,
+        canonical_seed: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(address, FauxbusHandler)
         self.world = world or World()
@@ -97,6 +98,9 @@ class FauxbusServer(ThreadingHTTPServer):
         self.routes: list[Route] = []
         self.failures: list[FailureRule] = []
         self.fail_counter = 0
+        # The document reset restores — the fixed point tests return to.
+        # Set at boot (--seed) or via POST /_fauxbus/seed?canonical=true.
+        self.canonical_seed = canonical_seed
 
     def add_route(self, method: str, pattern: str, handler: Handler, *, auth: bool) -> None:
         self.routes.append(Route(method, re.compile(f"^{pattern}$"), handler, auth))
@@ -279,12 +283,17 @@ def make_server(
     world: World | None = None,
     allow_anonymous: bool = False,
     verbose: bool = False,
+    canonical_seed: dict[str, Any] | None = None,
 ) -> FauxbusServer:
     from .control_api import register as register_control
     from .groups_api import register as register_groups
 
     server = FauxbusServer(
-        (host, port), world=world, allow_anonymous=allow_anonymous, verbose=verbose
+        (host, port),
+        world=world,
+        allow_anonymous=allow_anonymous,
+        verbose=verbose,
+        canonical_seed=canonical_seed,
     )
     register_groups(server)
     register_control(server)

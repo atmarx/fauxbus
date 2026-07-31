@@ -73,8 +73,10 @@ the fastest way to get it prioritized.
 
 Everything test-harness-y lives under `/_fauxbus/`, a prefix no Globus API
 will ever claim — the imitated surface stays pure. `GET /_fauxbus/state`
-dumps everything in the world for assertions; `POST /_fauxbus/reset` wipes
-it between tests. Full control-plane surface is in [SPEC.md](SPEC.md).
+dumps everything in the world for assertions; `POST /_fauxbus/reset`
+returns the world to its canonical seed (or to empty) between tests —
+mutate freely, reset comes home. Full control-plane surface is in
+[SPEC.md](SPEC.md).
 
 ## Not affiliated with Globus
 

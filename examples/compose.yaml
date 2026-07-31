@@ -22,6 +22,9 @@ services:
       # before the first test connects.  Omit the mount to boot empty.
       # This file is round-trip tested in CI — it is a real dump of
       # GET /_fauxbus/state, not a hand-written approximation.
+      #
+      # It is also the fixed point: POST /_fauxbus/reset restores THIS
+      # world, so tests mutate freely and come home between runs.
       - ./seed.json:/seed.json:ro
 
     # The image ships this same healthcheck; repeated here so

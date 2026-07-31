@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from conftest import BOB, PINS
+
 TOKEN = "t-alice"
 
 
@@ -146,3 +148,66 @@ def test_seed_rejects_garbage(fx):
     status, doc, _ = fx.post("/_fauxbus/seed", {"groups": {"not-a-uuid": {"name": "x"}}})
     assert status == 422
     assert doc["code"] == "VALIDATION_ERROR"
+
+
+# ------------------------------------------------------- canonical seed
+
+def _pinned_world(fx) -> dict:
+    """Seed identities, create one group via the API, return the dump."""
+    fx.post("/_fauxbus/seed", {"identities": PINS})
+    fx.post("/v2/groups", {"name": "Route 9800"}, token=TOKEN)
+    _, state, _ = fx.get("/_fauxbus/state")
+    return state
+
+
+def test_reset_restores_the_canonical_seed(fx):
+    # The staged-fixture workflow: canonical roster pinned once, tests
+    # mutate freely as throw-aways, reset comes home — not to empty.
+    canonical = _pinned_world(fx)
+    status, doc, _ = fx.post("/_fauxbus/seed?canonical=true", canonical)
+    assert (status, doc) == (200, {"ok": True, "groups": 1, "canonical": True})
+
+    gid = next(iter(canonical["groups"]))
+    fx.post(f"/v2/groups/{gid}", {"add": [{"identity_id": BOB}]}, token=TOKEN)
+    _, mutated, _ = fx.get("/_fauxbus/state")
+    assert mutated != canonical
+
+    status, doc, _ = fx.post("/_fauxbus/reset")
+    assert (status, doc["world"]) == (200, "seed")
+    _, restored, _ = fx.get("/_fauxbus/state")
+    assert json.dumps(restored, sort_keys=True) == json.dumps(canonical, sort_keys=True)
+
+
+def test_reset_to_empty_opts_out_but_keeps_the_canonical(fx):
+    fx.post("/_fauxbus/seed?canonical=true", _pinned_world(fx))
+
+    status, doc, _ = fx.post("/_fauxbus/reset", {"to": "empty"})
+    assert (status, doc) == (200, {"ok": True, "world": "empty", "groups": 0})
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert state["groups"] == {}
+
+    # ...but the pin survives: the next plain reset still comes home
+    fx.post("/_fauxbus/reset")
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert len(state["groups"]) == 1
+
+
+def test_forgetting_the_seed_makes_reset_mean_empty(fx):
+    fx.post("/_fauxbus/seed?canonical=true", _pinned_world(fx))
+
+    status, doc, _ = fx.delete("/_fauxbus/seed")
+    assert (status, doc) == (200, {"cleared": True})
+    fx.post("/_fauxbus/reset")
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert state["groups"] == {}
+
+
+def test_reset_without_canonical_reports_empty(fx):
+    status, doc, _ = fx.post("/_fauxbus/reset")
+    assert (status, doc) == (200, {"ok": True, "world": "empty", "groups": 0})
+
+
+def test_reset_rejects_unknown_targets(fx):
+    status, doc, _ = fx.post("/_fauxbus/reset", {"to": "narnia"})
+    assert status == 400
+    assert doc["code"] == "BAD_REQUEST"

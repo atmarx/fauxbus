@@ -40,9 +40,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     world = World()
+    canonical_seed = None
     if args.seed:
         try:
-            world.load(json.loads(args.seed.read_text()))
+            canonical_seed = json.loads(args.seed.read_text())
+            world.load(canonical_seed)
         except Exception as err:  # noqa: BLE001 — boot failures should be plain, not tracebacks
             print(f"fauxbus: could not load seed {args.seed}: {err}", file=sys.stderr)
             return 2
@@ -54,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         world=world,
         allow_anonymous=args.allow_anonymous,
         verbose=args.verbose,
+        canonical_seed=canonical_seed,
     )
     print(boot_line(server), file=sys.stderr)
     try:

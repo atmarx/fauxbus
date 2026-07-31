@@ -21,8 +21,9 @@ def index(ctx: Ctx) -> tuple[int, Any]:
         "imitates": ["groups v2"],
         "control": [
             "GET  /_fauxbus/state",
-            "POST /_fauxbus/reset",
-            "POST /_fauxbus/seed",
+            'POST /_fauxbus/reset (to canonical seed; body {"to": "empty"} for blank)',
+            "POST /_fauxbus/seed[?canonical=true]",
+            "DELETE /_fauxbus/seed (forget canonical)",
             "GET  /_fauxbus/failures",
             "POST /_fauxbus/failures",
             "DELETE /_fauxbus/failures[?id=fail-N]",
@@ -36,18 +37,43 @@ def get_state(ctx: Ctx) -> tuple[int, Any]:
 
 
 def reset(ctx: Ctx) -> tuple[int, Any]:
-    # The between-tests handshake: wipes the world AND disarms failures —
-    # a reset that left tripwires armed would not be much of a reset.
+    # The between-tests handshake: disarms failures always — a reset that
+    # left tripwires armed would not be much of a reset — and returns the
+    # world to its canonical seed if one is on record (--seed at boot, or
+    # seed?canonical=true).  The canonical document is the fixed point
+    # tests come home to; everything between resets was a throw-away.
+    # {"to": "empty"} opts out and gives a blank world instead.
+    body = ctx.body if isinstance(ctx.body, dict) else {}
+    target = body.get("to", "seed")
+    if target not in ("seed", "empty"):
+        raise ApiError(400, "BAD_REQUEST", "'to' must be \"seed\" or \"empty\"")
     ctx.world.reset()
     ctx.server.failures.clear()
-    return 200, {"ok": True}
+    if target == "seed" and ctx.server.canonical_seed is not None:
+        ctx.world.load(ctx.server.canonical_seed)
+        return 200, {"ok": True, "world": "seed", "groups": len(ctx.world.groups)}
+    return 200, {"ok": True, "world": "empty", "groups": 0}
 
 
 def seed(ctx: Ctx) -> tuple[int, Any]:
     if not isinstance(ctx.body, dict):
         raise ApiError(400, "BAD_REQUEST", "seed body must be a state document")
     ctx.world.load(ctx.body)
-    return 200, {"ok": True, "groups": len(ctx.world.groups)}
+    doc: dict[str, Any] = {"ok": True, "groups": len(ctx.world.groups)}
+    if ctx.query.get("canonical") in ("true", "1"):
+        # Pin this document as what reset restores — the over-HTTP twin
+        # of booting with --seed, for harnesses that can't mount files.
+        ctx.server.canonical_seed = ctx.body
+        doc["canonical"] = True
+    return 200, doc
+
+
+def forget_seed(ctx: Ctx) -> tuple[int, Any]:
+    # Unpin the canonical seed; the current world is untouched.  After
+    # this, reset means empty again.
+    had = ctx.server.canonical_seed is not None
+    ctx.server.canonical_seed = None
+    return 200, {"cleared": had}
 
 
 def list_failures(ctx: Ctx) -> tuple[int, Any]:
@@ -91,6 +117,7 @@ def register(server: FauxbusServer) -> None:
     add("GET", "/_fauxbus/state", get_state, auth=False)
     add("POST", "/_fauxbus/reset", reset, auth=False)
     add("POST", "/_fauxbus/seed", seed, auth=False)
+    add("DELETE", "/_fauxbus/seed", forget_seed, auth=False)
     add("GET", "/_fauxbus/failures", list_failures, auth=False)
     add("POST", "/_fauxbus/failures", arm_failure, auth=False)
     add("DELETE", "/_fauxbus/failures", disarm_failures, auth=False)

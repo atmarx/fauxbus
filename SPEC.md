@@ -163,9 +163,19 @@ Real token introspection is out of scope until an Auth API mock exists
 
 ## The control plane (`/_fauxbus/`)
 
-- `POST /_fauxbus/reset` — wipe all state; the between-tests handshake.
-- `POST /_fauxbus/seed` — load a state document (groups, members, roles) so
-  a test starts mid-story instead of building the world via API calls.
+- `POST /_fauxbus/reset` — the between-tests handshake.  If a canonical
+  seed is on record (`--seed` at boot, `/seed.json` in the container, or
+  `seed?canonical=true`), reset restores *that world*, not an empty one:
+  the canonical document is the fixed point tests come home to, and
+  every mutation in between was a throw-away.  Body `{"to": "empty"}`
+  opts out of the restore.  Either way, armed failures are disarmed.
+- `POST /_fauxbus/seed` — load a state document (groups, members, roles)
+  so a test starts mid-story instead of building the world via API
+  calls.  Seeding always replaces the whole world, never merges.  With
+  `?canonical=true` the document is also pinned as what reset restores —
+  the over-HTTP twin of booting with `--seed`, for harnesses that can't
+  mount files.  `DELETE /_fauxbus/seed` forgets the pin (the current
+  world is untouched).
 - `GET  /_fauxbus/state` — dump everything, for assertions.  Your test
   checks what's *actually in the directory*, not what your code claims it
   did.
@@ -226,7 +236,21 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
 - **Transfer** — the big one: endpoints/collections, task submission, and a
   simulated task lifecycle (ACTIVE → SUCCEEDED/FAILED with byte progress)
   driven by `/_fauxbus/tick`, so e2e suites can watch a transfer "run"
-  in milliseconds and fail it at will.
+  in milliseconds and fail it at will.  The bright line (decided
+  2026-07-31): Fauxbus fakes the Transfer *API* — the bookkeeping —
+  never the data plane.  No GridFTP, no byte movement.  Three reasons
+  the line holds: consumer code can only observe the API, so faking it
+  covers everything a test can see; the data plane is Globus Connect
+  Server territory, the source this project never reads; and only the
+  bookkeeping can be made deterministic.  One deliberate extension
+  waits behind a real consumer need: optionally materializing declared
+  placeholder files into a mounted volume when a task completes
+  ("presto, a file appears"), so post-transfer filesystem checks can
+  pass — strictly opt-in, because an API fake that writes to disks is
+  a different risk class.  Likely first slice, per principle 2: ACLs
+  and guest-collection permissions (group-membership-driven data
+  access), which is Groups-shaped CRUD — task lifecycle lands when a
+  pipeline consumer shows up.
 - **Auth** — identities lookup, token introspection, dependent tokens; at
   that point the Groups auth posture can grow real introspection.
 - **Web interface** (penciled for v0.4) — a browser face at
@@ -247,6 +271,15 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.4** (2026-07-31) — reset learns the canonical seed: with
+  `--seed`/`/seed.json`/`seed?canonical=true` on record,
+  `POST /_fauxbus/reset` restores that world instead of an empty one
+  (`{"to": "empty"}` opts out; `DELETE /_fauxbus/seed` forgets the
+  pin).  The staged-fixture workflow — canonical roster seeded, tests
+  mutate as throw-aways, reset comes home — is now a single call, with
+  the container's mounted seed as the fixed point.  Also drew the
+  Transfer bright line in the roadmap: fake the API's bookkeeping,
+  never the data plane.
 - **v0.2.3** (2026-07-30) — prior-art section added after xram asked
   the question any Globus engineer would ask first: doesn't
   `globus_sdk.testing` already do this?  Answer, grounded in the 4.8.1
