@@ -11,9 +11,9 @@ group, a task that fails at 60%.
 
 **Status: early but real.** The complete `GroupsClient` surface of
 globus-sdk 4.8.1 is implemented — all fourteen methods, all eleven batch
-membership verbs — and the test suite drives the actual globus-sdk
-against it, unmodified, including its retry logic sailing through an
-injected 429. Response shapes not yet backed by a recording are marked
+membership verbs — and the conformance suite drives every one of the
+fourteen through the actual globus-sdk, unmodified, including its retry
+logic sailing through an injected 429. Response shapes not yet backed by a recording are marked
 `PROVISIONAL` in code and tracked as conformance obligations. Nothing is
 stable yet — see [SPEC.md](SPEC.md) for the full design.
 
@@ -40,7 +40,8 @@ to, with state behind it (think moto next to botocore's `Stubber`).
 ## Quick start
 
 ```sh
-pipx install fauxbus
+# not on PyPI yet — install straight from the repo
+pipx install git+https://git.dev.xram.net/atmarx/fauxbus
 fauxbus serve --port 9800
 ```
 

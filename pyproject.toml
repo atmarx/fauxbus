@@ -26,6 +26,10 @@ classifiers = [
 # to their dev environments should not bring a supply chain with it.
 dependencies = []
 
+[project.urls]
+Homepage = "https://git.dev.xram.net/atmarx/fauxbus"
+Issues = "https://git.dev.xram.net/atmarx/fauxbus/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<9",

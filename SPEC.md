@@ -271,6 +271,16 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.8** (2026-08-05) — the pre-tag audit, prompted by xram's
+  "convince me": four of the fourteen GroupsClient methods had never
+  been driven through the real SDK (`get_membership_fields`,
+  `set_membership_fields`, `set_subscription_admin_verified`,
+  `get_group_by_subscription_id`) — wire-tested by hand-rolled HTTP,
+  but the SDK's own spelling of them unproven.  Conformance cases
+  added; all passed first try, and now all fourteen are CI-enforced
+  rather than coincidentally correct.  Also: README's `pipx install
+  fauxbus` promised a PyPI package that doesn't exist — replaced with
+  the honest from-repo install; `[project.urls]` added to pyproject.
 - **v0.2.7** (2026-08-05) — the first consumer answered, and the
   answer reshapes the roadmap's ground truth (#fauxbus
   >>01KZ82F5ECFR8E75GN8162PRMJ).  Root-cellar wired fauxbus in six

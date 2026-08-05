@@ -129,6 +129,69 @@ def test_preferences_round_trip(client):
     assert client.get_identity_preferences()["allow_add"] is False
 
 
+def test_membership_fields_round_trip_via_sdk(client):
+    # Wire-level coverage existed for this path; what was missing until
+    # the pre-v0.1 audit was the SDK's own spelling of it.  Four of the
+    # fourteen GroupsClient methods had never been driven through the
+    # real SDK — this test and the two below close that gap.
+    gid = client.create_group({"name": "Fielded", "description": ""})["id"]
+    fields = {"institution": "Drexel", "current_project_name": "root-cellar"}
+    # PROVISIONAL downstream: fields are stored and returned as sent.
+    assert client.set_membership_fields(gid, fields).data == fields
+    assert client.get_membership_fields(gid).data == fields
+
+
+def test_subscription_admin_verified_via_sdk(fx, client):
+    gid = client.create_group({"name": "Verified", "description": ""})["id"]
+    sid = "11111111-2222-4333-8444-555555555555"
+    doc = client.set_subscription_admin_verified(gid, sid)
+    assert doc["id"] == gid
+    # The group document doesn't carry the verified id (RECORDED shape
+    # omits it), so the state dump is where a test proves it stuck.
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert state["groups"][gid]["subscription_admin_verified_id"] == sid
+    # Clearing is spelled None on the SDK side, null on the wire.
+    client.set_subscription_admin_verified(gid, None)
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert state["groups"][gid]["subscription_admin_verified_id"] is None
+
+
+def test_get_group_by_subscription_id_via_sdk(fx, client):
+    # subscription_id has no write endpoint (true of the real service
+    # too — subscriptions come from Globus operations, not the API), so
+    # the seed is how a test world gets one.
+    sid = "99999999-8888-4777-8666-555555555444"
+    gid = "00000000-0000-4000-8000-0000000000aa"
+    alice = identity_id_for_token("t-alice")
+    fx.post(
+        "/_fauxbus/seed",
+        {
+            "groups": {
+                gid: {
+                    "name": "Subscribed",
+                    "memberships": {alice: {"role": "admin", "status": "active"}},
+                    "subscription_id": sid,
+                    "subscription_info": {
+                        "is_high_assurance": True,
+                        "is_baa": False,
+                        "connectors": {},
+                        "internal_bookkeeping": "must not leak",
+                    },
+                }
+            }
+        },
+    )
+    found = client.get_group_by_subscription_id(sid)
+    assert found["group_id"] == gid
+    # RECORDED: the endpoint returns the restricted projection only.
+    assert found["subscription_info"]["is_high_assurance"] is True
+    assert "internal_bookkeeping" not in found["subscription_info"]
+
+    with pytest.raises(GroupsAPIError) as exc:
+        client.get_group_by_subscription_id("00000000-0000-4000-8000-00000000dead")
+    assert exc.value.http_status == 404
+
+
 def test_unimplemented_endpoint_raises_loud_501(client):
     with pytest.raises(GroupsAPIError) as exc:
         client.get("/v2/definitely_not_a_thing")
