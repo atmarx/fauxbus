@@ -271,6 +271,17 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.5** (2026-08-04) — CI exists, so the tether's Fauxbus leg is
+  machinery instead of intent: `.woodpecker.yml` runs lint, the suite,
+  and a wheel build across 3.11/3.12/3.13, plus one image build that
+  boots the container and waits on the same control-plane probe the
+  healthcheck uses.  The find that prompted it: with globus-sdk absent,
+  `importorskip` deleted the whole conformance file and the run still
+  reported green — the SDK-is-the-contract suite testing no SDK at all.
+  A bare checkout still skips; `FAUXBUS_REQUIRE_CONFORMANCE=1`, which CI
+  sets, turns the skip into a collection error.  The real-service leg
+  stays unwired until the recording session — a gate nobody can run is
+  worse than an honest gap.
 - **v0.2.4** (2026-07-31) — reset learns the canonical seed: with
   `--seed`/`/seed.json`/`seed?canonical=true` on record,
   `POST /_fauxbus/reset` restores that world instead of an empty one

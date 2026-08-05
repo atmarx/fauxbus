@@ -9,9 +9,21 @@ base_url alone, which is the whole point.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
-globus_sdk = pytest.importorskip("globus_sdk")
+# The tether's weak point, and the reason for the switch below: with
+# globus-sdk absent, `importorskip` deletes this entire file and the run
+# still reports green — a suite whose founding claim is "the SDK is the
+# contract" quietly testing no SDK at all.  A bare checkout should still
+# be runnable, so the skip stays the local default; CI sets
+# FAUXBUS_REQUIRE_CONFORMANCE=1 and the missing import becomes a
+# collection error instead of a shrug.
+if os.environ.get("FAUXBUS_REQUIRE_CONFORMANCE"):
+    import globus_sdk
+else:
+    globus_sdk = pytest.importorskip("globus_sdk")
 
 from globus_sdk import (  # noqa: E402
     AccessTokenAuthorizer,

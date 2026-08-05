@@ -1,0 +1,98 @@
+# Fauxbus CI — the conformance tether, mechanized.
+#
+# SPEC.md promises "one test suite, two backends: Fauxbus on every CI run,
+# the real Globus service env-gated before each release."  This file is the
+# first half of that promise.  The second half arrives with the recording
+# session; there is deliberately no hook for it here yet, because a gate
+# nobody can run is worse than an honest gap.
+#
+# Fauxbus is a library, not a service — no deploy step.  What ships is a
+# wheel and an image, so CI builds both.
+#
+# Pip cache mounted at /opt/cache/pip, per house convention.
+
+when:
+  - event: push
+
+labels:
+  host: xdocker01
+
+matrix:
+  PYTHON:
+    - "3.11"
+    - "3.12"
+    - "3.13"
+
+steps:
+  # `ruff check` only — deliberately no `ruff format --check`.  pyproject
+  # ignores E501 at line-length 100, which is the author saying line breaks
+  # are a human call in this codebase; a formatter gate would overrule that.
+  - name: lint
+    image: python:${PYTHON}-slim
+    commands:
+      - pip install --cache-dir /cache/pip -e ".[dev]"
+      - ruff check src/ tests/
+    volumes:
+      - /opt/cache/pip:/cache/pip
+
+  # FAUXBUS_REQUIRE_CONFORMANCE is the point of this step, not decoration.
+  # tests/test_sdk_conformance.py guards its import with `importorskip` so a
+  # bare checkout still runs; that same guard means a CI image missing
+  # globus-sdk would drop every SDK test and still go green.  The env var
+  # turns that skip into a collection error, so "the SDK is the contract"
+  # stays a fact about this pipeline rather than a claim in a README.
+  - name: test
+    image: python:${PYTHON}-slim
+    environment:
+      FAUXBUS_REQUIRE_CONFORMANCE: "1"
+    commands:
+      - pip install --cache-dir /cache/pip -e ".[dev,conformance]"
+      - python -c "import globus_sdk; print('SDK under test:', globus_sdk.__version__)"
+      - pytest -v --tb=short
+    volumes:
+      - /opt/cache/pip:/cache/pip
+
+  # An editable install never exercises the wheel path, and the wheel is what
+  # the container image and every consumer actually installs.  Build it here
+  # so a packaging break fails CI instead of surfacing at someone's `pipx
+  # install`.
+  - name: build-wheel
+    image: python:${PYTHON}-slim
+    commands:
+      - pip install --cache-dir /cache/pip build
+      - python -m build --wheel
+      - pip install --cache-dir /cache/pip dist/*.whl
+      - fauxbus --help
+    volumes:
+      - /opt/cache/pip:/cache/pip
+    depends_on:
+      - test
+
+  # The image is shipped documentation: examples/compose.yaml tells consumers
+  # to build it.  Nothing else proves the Containerfile still builds, so this
+  # does — once, not once per Python, since the Containerfile pins its own
+  # base.  It builds and boots the image, then asks the control plane whether
+  # it is alive: the same unauthenticated probe the HEALTHCHECK uses, which is
+  # what compose's `depends_on: service_healthy` hangs on.
+  - name: build-image
+    image: docker:cli
+    when:
+      matrix:
+        PYTHON: "3.13"
+    commands:
+      - docker build -f Containerfile -t fauxbus:ci-${CI_COMMIT_SHA} .
+      - docker run -d --name fauxbus-ci-${CI_COMMIT_SHA} fauxbus:ci-${CI_COMMIT_SHA}
+      - |
+        for i in $(seq 1 30); do
+          docker exec fauxbus-ci-${CI_COMMIT_SHA} python -c \
+            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9800/_fauxbus/', timeout=1)" \
+            && break
+          [ "$i" = "30" ] && { docker logs fauxbus-ci-${CI_COMMIT_SHA}; exit 1; }
+          sleep 1
+        done
+      - docker rm -f fauxbus-ci-${CI_COMMIT_SHA}
+      - docker rmi fauxbus:ci-${CI_COMMIT_SHA} || true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - test
