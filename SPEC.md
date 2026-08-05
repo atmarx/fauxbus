@@ -271,6 +271,18 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **Package release: fauxbus 0.1.0** (2026-08-05, tag `v0.1.0`) — the
+  Groups surface, shipped.  Fourteen GroupsClient methods, every one
+  driven through the real globus-sdk 4.8.1 in CI; eleven batch verbs;
+  the `/_fauxbus/` control plane (state/reset/seed/failures/tick);
+  canonical-seed restore; container image with healthcheck and its own
+  CycloneDX SBOM; zero runtime dependencies, and the SBOM proves it.
+  Consumer-proven before tagging: root-cellar runs its entire Globus
+  wire surface against it, 9/9, zero 501s possible by architecture.
+  Ships with 16 PROVISIONAL markers documented in-code (the
+  batch-action response document remains the #1 recording target);
+  per RELEASING.md, the real-service recording session becomes
+  release-blocking the moment a tenancy makes it possible.
 - **v0.2.9** (2026-08-05) — xram's two release conditions, met.  SBOM:
   the image now generates and carries its own CycloneDX bill of
   materials (`/usr/share/fauxbus/sbom.json`), built from a clean venv
