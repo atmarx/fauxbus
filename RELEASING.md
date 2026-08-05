@@ -47,7 +47,12 @@ So, until the first recording session is possible:
 
 - The wheel: CI builds it on every push; the tagged pipeline's wheel is
   the release artifact.
-- The image: built from the tag via the shipped `Containerfile`.
+- The image: built from the tag via the shipped `Containerfile`.  It
+  carries its own CycloneDX SBOM at `/usr/share/fauxbus/sbom.json`,
+  generated at image build from a clean install of the wheel and
+  asserted by CI — for a zero-dependency package, the SBOM is the
+  receipt for the packaging claim.  A bare wheel install can mint the
+  same receipt: `cyclonedx-py environment <venv-python>`.
 - Publication targets (PyPI, a registry) are **decisions not yet
   taken**.  When one is taken, it gets recorded here as a step, not
   improvised at tag time.

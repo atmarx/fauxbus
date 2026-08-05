@@ -109,6 +109,12 @@ steps:
           [ "$i" = "30" ] && { docker logs fauxbus-ci-${CI_PIPELINE_NUMBER}; exit 1; }
           sleep 1
         done
+      # The SBOM must ride in the image and name what it claims to name
+      # — an image that lost its bill of materials fails the build, not
+      # a compliance review three months later.
+      - |
+        docker exec fauxbus-ci-${CI_PIPELINE_NUMBER} python -c \
+          "import json; d = json.load(open('/usr/share/fauxbus/sbom.json')); names = sorted(c['name'] for c in d['components']); assert 'fauxbus' in names, names; print('SBOM components:', names)"
       - docker rm -f fauxbus-ci-${CI_PIPELINE_NUMBER}
       - docker rmi fauxbus:ci-${CI_PIPELINE_NUMBER} || true
     volumes:

@@ -271,6 +271,19 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.9** (2026-08-05) — xram's two release conditions, met.  SBOM:
+  the image now generates and carries its own CycloneDX bill of
+  materials (`/usr/share/fauxbus/sbom.json`), built from a clean venv
+  holding only the fauxbus wheel so the generator never pollutes the
+  receipt; CI asserts presence and contents on every image build.
+  Verified locally before shipping: components `[fauxbus, pip]`,
+  license record `MIT (declared)` read straight from wheel metadata —
+  the zero-dependency claim, machine-readable.  License once-over:
+  LICENSE is clean MIT (© 2026 Andrew Marx), pyproject and the OCI
+  label agree, README's License section already states the posture
+  (no Globus code; globus-sdk consumed under Apache-2.0 as a
+  test-time dependency only; fixture-string echoes scrubbed in
+  85f876d).  Confirmed good — nothing needed fixing.
 - **v0.2.8** (2026-08-05) — the pre-tag audit, prompted by xram's
   "convince me": four of the fourteen GroupsClient methods had never
   been driven through the real SDK (`get_membership_fields`,
