@@ -278,8 +278,12 @@ a confession, not an infringement: it's *faux*.
   405-versus-501 wire manners, why injection can never reach the
   control plane, the canonical-bytes round trip.  The standard is
   standing, not one-time: new code explains itself at student depth.
-  Woodpecker registration also landed (repo 45), so the v0.2.5
-  pipeline goes live with this push.
+  Woodpecker registration also landed (repo 45), and the pipeline's
+  first run taught its own lesson: untrusted repos may not mount
+  `volumes` — correctly, since a repo-borne config that could mount
+  the docker socket would own the host — so CI runs volume-free
+  (no pip cache, image build parked in a comment) until the repo is
+  marked trusted.
 - **v0.2.5** (2026-08-04) — CI exists, so the tether's Fauxbus leg is
   machinery instead of intent: `.woodpecker.yml` runs lint, the suite,
   and a wheel build across 3.11/3.12/3.13, plus one image build that
