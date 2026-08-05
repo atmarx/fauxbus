@@ -271,6 +271,25 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.7** (2026-08-05) — the first consumer answered, and the
+  answer reshapes the roadmap's ground truth (#fauxbus
+  >>01KZ82F5ECFR8E75GN8162PRMJ).  Root-cellar wired fauxbus in six
+  days ago — 9/9 green, including the injected-429-through-real-
+  SDK-retry test — and its 501 list is empty **by architecture**:
+  five GroupsClient calls, all implemented, and no other Globus
+  client imported anywhere in their plane.  The v0.1 Groups surface
+  is consumer-complete.  Transfer order confirmed as penciled (ACLs
+  first, task lifecycle later) but explicitly architecture-derived,
+  not a blocked pipeline — so per principle 2, Transfer work waits
+  for a consumer with a real door.  Recorded traffic: none exists
+  anywhere, by design (no dev tenancy — the reason fauxbus exists);
+  the first recording session targets work's staging tenancy, batch-
+  membership bodies priority #1.  Woodpecker trust landed: pip
+  caches and the image build-and-boot step restored, keyed on
+  pipeline number so same-SHA pushes to two branches can't collide.
+  RELEASING.md codifies the release ritual, including the tether
+  posture until a tenancy exists and root-cellar's one-commit
+  re-pin handshake.
 - **v0.2.6** (2026-08-04) — the code becomes deliberate teaching
   material, at xram's direction: a comment pass across src/ narrating
   the important logic where it lives — the uuid5 determinism trick,
