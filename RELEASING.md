@@ -53,9 +53,27 @@ So, until the first recording session is possible:
   asserted by CI — for a zero-dependency package, the SBOM is the
   receipt for the packaging claim.  A bare wheel install can mint the
   same receipt: `cyclonedx-py environment <venv-python>`.
-- Publication targets (PyPI, a registry) are **decisions not yet
-  taken**.  When one is taken, it gets recorded here as a step, not
-  improvised at tag time.
+- Publication: **PyPI — decided 2026-08-05, not yet armed.**  The name
+  is free and the v0.1.0 artifacts pass `twine check`.  The sequence,
+  in order, none of it improvised at tag time:
+  1. **First upload is manual**, from a clean tag build:
+     `git archive vX.Y.Z | tar -x -C /tmp/rel`, then `python -m build`
+     and `twine upload dist/*` from there.  Manual because the first
+     upload is what creates the PyPI project a token can be scoped to.
+  2. **Scope a token** to the project; store it as the Woodpecker
+     secret `pypi_token`.
+  3. **Restore the parked `publish-pypi` step** at the bottom of
+     `.woodpecker.yml` (restore conditions annotated there).  Tags
+     publish automatically from then on, with a guard that dies if the
+     tag's version disagrees with the built artifacts.
+  4. **Then, and only then, flip the docs**: README's install line
+     becomes the real `pipx install fauxbus`, and the blog draft's
+     "not on PyPI yet" caveat goes.  Docs never promise a package
+     that isn't live.
+
+  Prerequisite for all of it: public homepage/issues URLs in
+  pyproject (the mirror decision).  A container registry remains a
+  decision not yet taken.
 
 ## 4. Tell the people
 

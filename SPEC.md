@@ -271,6 +271,18 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.10** (2026-08-05) — PyPI publishing written down while the
+  iron was warm, parked until it can actually run: the name checked
+  free, the v0.1.0 artifacts verified against `twine check`, and
+  `.woodpecker.yml` now carries a parked tag-gated publish step
+  (token via Woodpecker secret; a guard dies loudly if the tag's
+  version disagrees with the build — uploads are burn-once).  Tag
+  events now trigger CI, so the step has something to hang on when
+  restored.  RELEASING.md records the four-move sequence — manual
+  first upload, scoped token, restore the step, docs flip *last* —
+  and the prerequisite in front of all of it: public-facing URLs.
+  Nothing flips today, per xram: install stays from-repo until he
+  takes the mirror public.
 - **Package release: fauxbus 0.1.0** (2026-08-05, tag `v0.1.0`) — the
   Groups surface, shipped.  Fourteen GroupsClient methods, every one
   driven through the real globus-sdk 4.8.1 in CI; eleven batch verbs;
