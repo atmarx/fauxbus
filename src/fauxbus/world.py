@@ -121,6 +121,13 @@ class World:
 
     The server holds one World behind a lock.  Everything here is plain
     data in, plain data out — no HTTP awareness.
+
+    That split is the load-bearing design decision of the codebase:
+    world.py knows the *rules* of the imitated service (who may do
+    what, and when); server.py knows the *wire* (sockets, headers,
+    routing).  You could drive a World from a REPL with no socket in
+    sight.  Errors are raised, not returned — see errors.ApiError for
+    why that keeps every signature clean.
     """
 
     def __init__(self) -> None:
@@ -133,6 +140,10 @@ class World:
     # ------------------------------------------------------------------ ids
 
     def next_id(self, kind: str) -> str:
+        # Determinism, layer by layer: a per-kind counter lives in world
+        # state, and ids.sequential_id hashes (kind, counter) into a
+        # stable UUID.  Reset the world → counters return to zero → the
+        # next group created gets the same id as last run's first group.
         n = self.counters.get(kind, 0)
         self.counters[kind] = n + 1
         return sequential_id(kind, n)
@@ -140,12 +151,18 @@ class World:
     # ----------------------------------------------------------- identities
 
     def identity_for_token(self, token: str) -> Identity:
+        # Pins win over derivation: a seed's ``identities`` section maps
+        # chosen tokens to chosen UUIDs (how tests pin alice); any other
+        # token falls through to the hash-derived identity.  Either way
+        # the answer never changes between calls — that's the contract.
         pin = self.pinned_identities.get(token)
         if pin is not None:
             return Identity(identity_id=pin["identity_id"], username=pin["username"])
         return derive_identity(token)
 
     def username_for(self, identity_id: str) -> str:
+        # Linear scan over pins, and that's fine: worlds are test-sized.
+        # Clarity beats a reverse index we'd have to keep consistent.
         for pin in self.pinned_identities.values():
             if pin["identity_id"] == identity_id:
                 return pin["username"]
@@ -154,6 +171,11 @@ class World:
     # --------------------------------------------------------------- groups
 
     def get_group(self, group_id: str, caller: Identity) -> Group:
+        # The one gate every group-touching path goes through: update,
+        # delete, policies, batch — all resolve their group HERE.  So
+        # the visibility rule and the 404-for-invisible stance (see
+        # errors.group_not_found) hold everywhere by construction:
+        # nobody can forget the check, because nobody else performs it.
         group_id = _require_uuid(group_id, "group_id")
         group = self.groups.get(group_id)
         if group is None or not group.visible_to(caller.identity_id):
@@ -209,6 +231,9 @@ class World:
             raise ApiError(403, "FORBIDDEN", "deleting a group requires the admin role")
         # PROVISIONAL: deletion cascades to subgroups so no group is ever
         # left with a dangling parent_id.
+        # The loop is a worklist: pop a doomed id, enqueue its children,
+        # repeat — subtree deletion without recursion, and grandchildren
+        # can't slip through because every popped id re-scans for kids.
         doomed = [group.id]
         while doomed:
             gid = doomed.pop()
@@ -280,7 +305,12 @@ class World:
 
         results: dict[str, Any] = {}
         errors: dict[str, list[dict[str, str]]] = {}
-        for verb in BATCH_VERBS:  # canonical order keeps runs deterministic
+        # Iterate OUR canonical verb list, not the request's keys: two
+        # requests spelling the same actions in different JSON key order
+        # must produce identical results and identical response bodies.
+        # The request's ordering is an accident of serialization; the
+        # world's must never be.
+        for verb in BATCH_VERBS:
             entries = actions.get(verb)
             if entries is None:
                 continue
@@ -304,6 +334,26 @@ class World:
     def _apply_verb(
         self, caller: Identity, group: Group, verb: str, target: str, entry: dict[str, Any]
     ) -> Membership:
+        # Membership is a small state machine; each verb is one
+        # transition with a permission gate.  The whole table:
+        #
+        #   verb          who        requires status       → new status
+        #   add           manager+   not active            → active
+        #   invite        manager+   not active            → invited
+        #   accept        self       invited               → active
+        #   decline       self       invited               → declined
+        #   approve       manager+   pending               → active
+        #   reject        manager+   pending               → rejected
+        #   join          self       not active (open)     → active
+        #   request_join  self       not active (requests) → pending
+        #   leave         self       active                → left
+        #   remove        manager+   active                → removed
+        #   change_role   manager+   active                → active (role edits)
+        #
+        # The two guard clauses below enforce the "who" column once, up
+        # front; require_status enforces the middle column per verb.
+        # Admin-role edges and the last-admin invariant are the fine
+        # print, handled inside the verbs they complicate.
         m = group.memberships.get(target)
 
         if verb in SELF_VERBS and target != caller.identity_id:
@@ -424,6 +474,10 @@ class World:
     @staticmethod
     def _guard_last_admin(group: Group, m: Membership, action: str) -> None:
         # PROVISIONAL: a group may never lose its last active admin.
+        # The why: a group with zero active admins is unmanageable
+        # forever — nobody left who can add, remove, or delete.
+        # Refusing the final leave/remove/demote keeps the world free
+        # of dead-end states a test would then have to debug.
         if m.role == "admin" and group.active_admins() == [m.identity_id]:
             raise ApiError(409, "LAST_ADMIN", f"cannot {action} the group's only admin")
 
@@ -482,7 +536,12 @@ class World:
     def group_doc(
         self, group: Group, caller: Identity, include: list[str] | None = None
     ) -> dict[str, Any]:
-        """The single-group document — RECORDED shape (BASE_GROUP_DOC fixture)."""
+        """The single-group document — RECORDED shape (BASE_GROUP_DOC fixture).
+
+        Caller-relative on purpose: ``my_memberships`` is the caller's
+        own membership, so alice and bob GET the same group and receive
+        different documents — exactly as the real service renders it.
+        """
         include = include or []
         my = group.memberships.get(caller.identity_id)
         doc: dict[str, Any] = {
@@ -558,7 +617,15 @@ class World:
 
     def dump(self) -> dict[str, Any]:
         """The full state document.  Round-trip invariant: this document is
-        a valid seed, and seeding a fresh world with it reproduces it."""
+        a valid seed, and seeding a fresh world with it reproduces it.
+
+        Every mapping is emitted in sorted order, which makes the
+        serialization canonical: two worlds with equal state produce
+        byte-identical JSON (given sorted keys and fixed indent).  That
+        is what lets CI assert the shipped example seed equals its own
+        re-dump to the byte — state comparison downgraded to string
+        comparison, on purpose, because bytes don't argue.
+        """
         return {
             "version": 0,
             "clock": self.clock,
@@ -591,6 +658,10 @@ class World:
         }
 
     def load(self, doc: dict[str, Any]) -> None:
+        # The seed is the one door where hand-authored data enters the
+        # world, so validation is loud and immediate: a bad UUID, role,
+        # or status fails the seed call itself — not three tests later
+        # as an inexplicable 403.
         if not isinstance(doc, dict):
             raise validation_error("seed document must be an object")
         self.reset()

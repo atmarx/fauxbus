@@ -17,6 +17,12 @@ injected 429. Response shapes not yet backed by a recording are marked
 `PROVISIONAL` in code and tracked as conformance obligations. Nothing is
 stable yet — see [SPEC.md](SPEC.md) for the full design.
 
+The source is written to be read.  Comments narrate the design
+decisions where they live — why uuid5 and never uuid4, why one lock,
+why 404 instead of 403, why injection can't touch the control plane —
+at a depth meant for someone learning how to *build* a wire-level
+fake, not just use one.
+
 ## Fake, not mock
 
 Your code doesn't know Fauxbus is there. No monkeypatching, no fixture

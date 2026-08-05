@@ -25,9 +25,23 @@ class Identity:
 
 
 def derive_identity(token: str) -> Identity:
+    """Mint an Identity from nothing but the token string.
+
+    Two halves, both deterministic:
+    - the UUID is a hash of the token (ids.py) — stable across runs;
+    - the username is the token itself, sanitized into an email local
+      part, so logs and state dumps stay human-readable —
+      ``t-alice@fauxbus.example`` tells you who that was at a glance,
+      where a bare UUID would tell you nothing.
+
+    ``.example`` is an RFC 2606 reserved domain: obviously fake on
+    sight, and mail to it can never reach anyone real.
+    """
     if token == ANONYMOUS_TOKEN:
         local = "anonymous"
     else:
+        # Tokens are arbitrary strings; usernames shouldn't be.
+        # Lowercase, squash anything email-unsafe to '-', cap the length.
         local = re.sub(r"[^a-z0-9_.-]+", "-", token.lower()).strip("-") or "caller"
     return Identity(
         identity_id=identity_id_for_token(token),
@@ -36,7 +50,13 @@ def derive_identity(token: str) -> Identity:
 
 
 def parse_bearer(header_value: str | None) -> str | None:
-    """Return the token from an Authorization header, or None if absent/malformed."""
+    """Return the token from an Authorization header, or None if absent/malformed.
+
+    Malformed is deliberately treated the same as absent: parsing
+    answers "what is the token?", never "is this allowed?".  Policy —
+    401 versus --allow-anonymous — belongs to the server, which is why
+    this returns None instead of raising.
+    """
     if not header_value:
         return None
     parts = header_value.split(None, 1)

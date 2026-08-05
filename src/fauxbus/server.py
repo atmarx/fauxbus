@@ -79,7 +79,20 @@ def injected_body(source: str) -> dict[str, Any]:
 
 
 class FauxbusServer(ThreadingHTTPServer):
-    daemon_threads = True
+    """One server, one World, one lock.
+
+    Threading because real SDK clients pool connections — a
+    single-threaded server can deadlock a client that opens a second
+    connection mid-request.  But the world is plain dicts, so every
+    handler runs under one coarse lock (taken in _dispatch): each API
+    call is atomic, concurrent requests simply serialize.  For a test
+    fake this is the right trade — the critical sections are
+    microseconds, the "load" is one test process, and one big lock is
+    a design you can audit at a glance.  Fine-grained locking earns
+    its complexity on servers with throughput problems; this isn't one.
+    """
+
+    daemon_threads = True  # worker threads must never outlive Ctrl-C
 
     def __init__(
         self,
@@ -103,6 +116,9 @@ class FauxbusServer(ThreadingHTTPServer):
         self.canonical_seed = canonical_seed
 
     def add_route(self, method: str, pattern: str, handler: Handler, *, auth: bool) -> None:
+        # Patterns are anchored ^...$ so "/v2/groups" can never match
+        # "/v2/groups/anything" by prefix.  First registered match wins
+        # — see groups_api.register for why its order is deliberate.
         self.routes.append(Route(method, re.compile(f"^{pattern}$"), handler, auth))
 
     def arm_failure(self, doc: dict[str, Any]) -> FailureRule:
@@ -129,6 +145,10 @@ class FauxbusServer(ThreadingHTTPServer):
         return rule
 
     def consume_failure(self, method: str, path: str) -> FailureRule | None:
+        # First armed rule wins.  Counted rules burn one use per match
+        # and vanish at zero — that countdown is what lets the SDK's
+        # automatic retry finally break through and succeed, which is
+        # exactly the arc a retry test wants to watch.
         for rule in self.failures:
             if rule.matches(method, path):
                 if rule.times is not None:
@@ -140,6 +160,13 @@ class FauxbusServer(ThreadingHTTPServer):
 
 
 class FauxbusHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1 turns on keep-alive, which the SDK's connection pooling
+    # expects.  Keep-alive imposes a discipline: every response must
+    # carry an accurate Content-Length (_send guarantees it), and every
+    # request body must be consumed even on paths that never use it
+    # (_drain_body) — unread bytes left on a reused connection are
+    # parsed as the start of the NEXT request, and everything after
+    # that failure is confusing.
     protocol_version = "HTTP/1.1"
     server: FauxbusServer  # narrowed for type checkers
 
@@ -150,6 +177,8 @@ class FauxbusHandler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _send(self, status: int, doc: Any, headers: dict[str, str] | None = None) -> None:
+        # sort_keys: byte-stable responses across runs.  Principle 3
+        # applies to the wire, not just the world.
         body = json.dumps(doc, sort_keys=True).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -172,11 +201,25 @@ class FauxbusHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- dispatch
 
     def _dispatch(self, method: str) -> None:
+        # The life of a request, in order:
+        #   1. Failure injection (imitated surface only) — armed rules
+        #      and the X-Fauxbus-Fail header answer before any routing,
+        #      the way a genuinely broken service fails before logic.
+        #   2. Read and parse the JSON body.
+        #   3. Route.  No such path → loud 501 (principle 2: never a
+        #      silent wrong answer).  Path exists, wrong verb → 405.
+        #   4. Under the world lock: authenticate, run the handler.
+        #   5. Render.  Handlers return (status, doc[, headers]);
+        #      raised ApiErrors render through one place below.
         parsed = urlparse(self.path)
         path = parsed.path
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         try:
             if path.startswith("/v2/"):
+                # Injection is scoped to the imitated surface.  The
+                # control plane stays unbreakable: a harness that could
+                # sabotage its own reset endpoint couldn't be trusted
+                # to clean up after the test that did it (principle 4).
                 if self._maybe_inject(method, path):
                     return
             body = self._read_body()
@@ -218,6 +261,15 @@ class FauxbusHandler(BaseHTTPRequestHandler):
             )
 
     def _maybe_inject(self, method: str, path: str) -> bool:
+        # Two injection channels, and each earns its keep:
+        # - X-Fauxbus-Fail header: zero-setup, one request — the test
+        #   marks a single call it makes itself as doomed.
+        # - Armed rules (POST /_fauxbus/failures): out-of-band and
+        #   pattern-matched — "the next 2 POSTs to /v2/groups/* answer
+        #   429."  This reaches where the header can't: the SDK retries
+        #   *inside* one client call, re-sending the same headers every
+        #   attempt, so only a rule that counts down and then clears
+        #   can make retry #3 succeed while attempts #1-2 fail.
         header = self.headers.get("X-Fauxbus-Fail")
         if header is not None:
             try:
@@ -245,6 +297,10 @@ class FauxbusHandler(BaseHTTPRequestHandler):
             self.rfile.read(length)
 
     def _find_route(self, method: str, path: str) -> tuple[Route | None, bool]:
+        # Two answers, not one: the route, and whether the PATH exists
+        # under any verb at all.  Wire manners hang on the distinction
+        # — wrong verb on a real path is 405; unknown path is the loud
+        # 501 with a file-an-issue pointer.
         saw_path = False
         for route in self.server.routes:
             if route.pattern.match(path):

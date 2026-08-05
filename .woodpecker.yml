@@ -79,6 +79,10 @@ steps:
     when:
       matrix:
         PYTHON: "3.13"
+    environment:
+      # The Containerfile uses RUN --mount, a BuildKit feature; be
+      # explicit rather than trusting the daemon's default.
+      DOCKER_BUILDKIT: "1"
     commands:
       - docker build -f Containerfile -t fauxbus:ci-${CI_COMMIT_SHA} .
       - docker run -d --name fauxbus-ci-${CI_COMMIT_SHA} fauxbus:ci-${CI_COMMIT_SHA}

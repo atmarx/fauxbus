@@ -12,7 +12,14 @@ from typing import Any
 
 
 class ApiError(Exception):
-    """An error to be rendered as a Globus-shaped JSON error response."""
+    """An error to be rendered as a Globus-shaped JSON error response.
+
+    The pattern to learn here: raise this anywhere — three calls deep
+    in world.py, in a route handler, in auth — and exactly one place
+    (the dispatcher's ``except ApiError`` in server.py) turns it into
+    an HTTP response.  Handlers never thread error tuples back up the
+    call stack; the exception IS the response, waiting to happen.
+    """
 
     def __init__(self, status: int, code: str, detail: str) -> None:
         super().__init__(f"{status} {code}: {detail}")
@@ -22,6 +29,11 @@ class ApiError(Exception):
 
     def body(self) -> dict[str, Any]:
         return {"code": self.code, "detail": self.detail}
+
+
+# Factories, not subclasses: the wire only ever sees (status, code,
+# detail), so a function returning a pre-filled ApiError documents each
+# situation without growing a class hierarchy nothing dispatches on.
 
 
 def unauthorized() -> ApiError:

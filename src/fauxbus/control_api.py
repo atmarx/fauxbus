@@ -15,6 +15,11 @@ from .server import Ctx, FauxbusServer
 
 
 def index(ctx: Ctx) -> tuple[int, Any]:
+    # Self-describing root: curl it and learn the control surface.  It
+    # answers without auth and reads no state, which is also what makes
+    # it the container HEALTHCHECK and compose's service_healthy probe
+    # — a liveness check must never be able to perturb the world it
+    # checks.
     return 200, {
         "fauxbus": __version__,
         "sdk_pin": SDK_PIN,
@@ -112,6 +117,11 @@ def tick(ctx: Ctx) -> tuple[int, Any]:
 
 
 def register(server: FauxbusServer) -> None:
+    # auth=False across the board: the harness's own tools must keep
+    # working even when a test has made the imitated surface hostile
+    # (401 everywhere, armed failures).  Injection skips /_fauxbus/
+    # entirely — see server._dispatch — so these routes cannot be
+    # broken from inside a test.
     add = server.add_route
     add("GET", "/_fauxbus/?", index, auth=False)
     add("GET", "/_fauxbus/state", get_state, auth=False)

@@ -271,6 +271,15 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.6** (2026-08-04) — the code becomes deliberate teaching
+  material, at xram's direction: a comment pass across src/ narrating
+  the important logic where it lives — the uuid5 determinism trick,
+  the one-lock threading story, the membership state-machine table,
+  405-versus-501 wire manners, why injection can never reach the
+  control plane, the canonical-bytes round trip.  The standard is
+  standing, not one-time: new code explains itself at student depth.
+  Woodpecker registration also landed (repo 45), so the v0.2.5
+  pipeline goes live with this push.
 - **v0.2.5** (2026-08-04) — CI exists, so the tether's Fauxbus leg is
   machinery instead of intent: `.woodpecker.yml` runs lint, the suite,
   and a wheel build across 3.11/3.12/3.13, plus one image build that

@@ -4,6 +4,11 @@ Paths and payloads follow what globus-sdk 4.8.1 actually sends (see
 SPEC.md for the recorded/documented/provisional grades of each shape).
 Registration order matters: literal paths (my_groups) register before
 the {group_id} patterns that would otherwise swallow them.
+
+Handlers here are deliberately thin: unpack the wire (path match,
+query params, body), call one World method, render the result.  All
+the rules live in world.py — when you wonder "who may do what," look
+there, not here.
 """
 
 from __future__ import annotations
@@ -20,6 +25,9 @@ def _csv(value: str | None) -> list[str]:
 
 
 def get_my_groups(ctx: Ctx) -> tuple[int, Any]:
+    # Routes registered with auth=True always arrive with an identity;
+    # the assert narrows the Optional for type checkers and documents
+    # the contract.  Same idiom in every authed handler below.
     assert ctx.identity is not None
     statuses = _csv(ctx.query.get("statuses"))
     unknown = set(statuses) - set(STATUSES)
@@ -117,6 +125,9 @@ def get_subscription_info(ctx: Ctx) -> tuple[int, Any]:
     return 200, ctx.world.group_by_subscription(ctx.match.group(1))
 
 
+# One path segment: [^/]+ and never .+, so a {group_id} slot cannot
+# swallow slashes — /v2/groups/abc/policies must reach the policies
+# route rather than becoming group_id="abc/policies".
 SEG = r"([^/]+)"
 
 
@@ -137,6 +148,10 @@ def register(server: FauxbusServer) -> None:
     add("GET", f"/v2/groups/{SEG}", get_group, auth=True)
     add("PUT", f"/v2/groups/{SEG}", update_group, auth=True)
     add("DELETE", f"/v2/groups/{SEG}", delete_group, auth=True)
+    # The surprise of the surface: POST on a group resource is not
+    # "create" — it is the eleven-verb batch MEMBERSHIP document,
+    # the endpoint behind GroupsClient.batch_membership_action (and
+    # add_member, invite, etc., which are single-entry batches).
     add("POST", f"/v2/groups/{SEG}", batch_membership, auth=True)
     add("GET", "/v2/preferences", get_preferences, auth=True)
     add("PUT", "/v2/preferences", set_preferences, auth=True)

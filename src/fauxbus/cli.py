@@ -41,6 +41,9 @@ def main(argv: list[str] | None = None) -> int:
 
     world = World()
     canonical_seed = None
+    # The boot seed IS the canonical seed: POST /_fauxbus/reset
+    # restores this exact document, so a container with a mounted seed
+    # always comes home to it between tests.
     if args.seed:
         try:
             canonical_seed = json.loads(args.seed.read_text())
@@ -58,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
         verbose=args.verbose,
         canonical_seed=canonical_seed,
     )
+    # Boot chatter goes to stderr, like all of it — stdout belongs to
+    # whoever wants to pipe this process.
     print(boot_line(server), file=sys.stderr)
     try:
         server.serve_forever()
