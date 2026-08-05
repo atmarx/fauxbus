@@ -3,24 +3,22 @@
 # SPEC.md promises "one test suite, two backends: Fauxbus on every CI run,
 # the real Globus service env-gated before each release."  This file is the
 # first half of that promise.  The second half arrives with the recording
-# session; there is deliberately no hook for it here yet, because a gate
-# nobody can run is worse than an honest gap.
+# session (see RELEASING.md for the honest posture until then).
 #
 # Fauxbus is a library, not a service — no deploy step.  What ships is a
-# wheel and an image, so CI builds the wheel here (the image step waits on
-# trust — see below).
+# wheel and an image, so CI builds and boots both.
 #
-# THE TRUST LESSON (build #1 failed exactly here): this pipeline config
-# lives in the repo, and Woodpecker refuses `volumes` for repos below the
-# "trusted" level — because a config that could mount /var/run/docker.sock
-# or any host path would hand the host to anyone who can push a branch.
-# That refusal is the security model working, not an obstacle.  So, until
-# an admin marks the repo trusted in Woodpecker's settings:
-#   - no pip cache mounts (dependencies download fresh each step — this
-#     costs seconds; the packages are small),
-#   - no container-image build (it needs the docker socket, full stop).
-# The image step is preserved at the bottom, commented out, ready to
-# restore the moment trust lands.
+# THE TRUST ARC (a lesson worth keeping): build #1 failed because
+# untrusted repos may not mount `volumes` — correctly, since this config
+# lives in the repo and a config that could mount /var/run/docker.sock
+# would hand the host to anyone who can push a branch.  The refusal was
+# the security model working.  An admin has since marked the repo
+# trusted, which is a statement about who can push here, not about
+# Woodpecker relaxing: the socket mount below is exactly as dangerous as
+# it always was, and belongs only in repos where every committer could
+# already root the host by other means.
+#
+# Pip cache mounted at /opt/cache/pip, per house convention.
 
 when:
   - event: push
@@ -41,8 +39,10 @@ steps:
   - name: lint
     image: python:${PYTHON}-slim
     commands:
-      - pip install -e ".[dev]"
+      - pip install --cache-dir /cache/pip -e ".[dev]"
       - ruff check src/ tests/
+    volumes:
+      - /opt/cache/pip:/cache/pip
 
   # FAUXBUS_REQUIRE_CONFORMANCE is the point of this step, not decoration.
   # tests/test_sdk_conformance.py guards its import with `importorskip` so a
@@ -55,9 +55,11 @@ steps:
     environment:
       FAUXBUS_REQUIRE_CONFORMANCE: "1"
     commands:
-      - pip install -e ".[dev,conformance]"
+      - pip install --cache-dir /cache/pip -e ".[dev,conformance]"
       - python -c "import globus_sdk; print('SDK under test:', globus_sdk.__version__)"
       - pytest -v --tb=short
+    volumes:
+      - /opt/cache/pip:/cache/pip
 
   # An editable install never exercises the wheel path, and the wheel is
   # what the container image and every consumer actually installs.  Build
@@ -66,44 +68,50 @@ steps:
   - name: build-wheel
     image: python:${PYTHON}-slim
     commands:
-      - pip install build
+      - pip install --cache-dir /cache/pip build
       - python -m build --wheel
-      - pip install dist/*.whl
+      - pip install --cache-dir /cache/pip dist/*.whl
       - fauxbus --help
+    volumes:
+      - /opt/cache/pip:/cache/pip
     depends_on:
       - test
 
-# ---------------------------------------------------------------------------
-# PARKED PENDING TRUST — restore verbatim once the repo is marked trusted
-# (needs the docker socket, which untrusted repos rightly cannot mount).
-# The step builds the shipped Containerfile, boots it, and waits on the
-# same unauthenticated /_fauxbus/ probe the HEALTHCHECK uses — the thing
-# compose's `depends_on: service_healthy` hangs on, otherwise unverified.
-#
-#  - name: build-image
-#    image: docker:cli
-#    when:
-#      matrix:
-#        PYTHON: "3.13"
-#    environment:
-#      # The Containerfile uses RUN --mount, a BuildKit feature; be
-#      # explicit rather than trusting the daemon's default.
-#      DOCKER_BUILDKIT: "1"
-#    commands:
-#      - docker build -f Containerfile -t fauxbus:ci-${CI_COMMIT_SHA} .
-#      - docker run -d --name fauxbus-ci-${CI_COMMIT_SHA} fauxbus:ci-${CI_COMMIT_SHA}
-#      - |
-#        for i in $(seq 1 30); do
-#          docker exec fauxbus-ci-${CI_COMMIT_SHA} python -c \
-#            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9800/_fauxbus/', timeout=1)" \
-#            && break
-#          [ "$i" = "30" ] && { docker logs fauxbus-ci-${CI_COMMIT_SHA}; exit 1; }
-#          sleep 1
-#        done
-#      - docker rm -f fauxbus-ci-${CI_COMMIT_SHA}
-#      - docker rmi fauxbus:ci-${CI_COMMIT_SHA} || true
-#    volumes:
-#      - /var/run/docker.sock:/var/run/docker.sock
-#    depends_on:
-#      - test
-# ---------------------------------------------------------------------------
+  # The image is shipped documentation: examples/compose.yaml tells
+  # consumers to build it, and root-cellar's deploy module actually does.
+  # This step proves the Containerfile builds, boots, and answers the
+  # same unauthenticated /_fauxbus/ probe the HEALTHCHECK uses — the
+  # thing compose's `depends_on: service_healthy` hangs on.  Gated to one
+  # matrix cell: the image pins its own Python, so building it three
+  # times would test Woodpecker, not Fauxbus.
+  #
+  # Names key on CI_PIPELINE_NUMBER, not the commit SHA: a push to main
+  # and a fleet branch can carry the SAME sha and run concurrently, and
+  # two `docker run --name fauxbus-ci-<sha>` would collide.  The
+  # pipeline number is unique by construction.
+  - name: build-image
+    image: docker:cli
+    when:
+      matrix:
+        PYTHON: "3.13"
+    environment:
+      # The Containerfile uses RUN --mount, a BuildKit feature; be
+      # explicit rather than trusting the daemon's default.
+      DOCKER_BUILDKIT: "1"
+    commands:
+      - docker build -f Containerfile -t fauxbus:ci-${CI_PIPELINE_NUMBER} .
+      - docker run -d --name fauxbus-ci-${CI_PIPELINE_NUMBER} fauxbus:ci-${CI_PIPELINE_NUMBER}
+      - |
+        for i in $(seq 1 30); do
+          docker exec fauxbus-ci-${CI_PIPELINE_NUMBER} python -c \
+            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9800/_fauxbus/', timeout=1)" \
+            && break
+          [ "$i" = "30" ] && { docker logs fauxbus-ci-${CI_PIPELINE_NUMBER}; exit 1; }
+          sleep 1
+        done
+      - docker rm -f fauxbus-ci-${CI_PIPELINE_NUMBER}
+      - docker rmi fauxbus:ci-${CI_PIPELINE_NUMBER} || true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - test
