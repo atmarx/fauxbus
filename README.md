@@ -1,6 +1,6 @@
 # Fauxbus
 
-A wire-level fake of the Globus API — deterministic failure on demand.
+A wire-level fake of the Globus API for E2E testing.
 
 ## The problem
 

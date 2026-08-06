@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir cyclonedx-bom \
 FROM python:3.13-slim
 
 LABEL org.opencontainers.image.title="fauxbus" \
-      org.opencontainers.image.description="A wire-level fake of the Globus API — deterministic failure on demand.  Independent test tool, not affiliated with Globus." \
+      org.opencontainers.image.description="A wire-level fake of the Globus API for E2E testing.  Independent test tool, not affiliated with Globus." \
       org.opencontainers.image.source="https://git.dev.xram.net/atmarx/fauxbus" \
       org.opencontainers.image.licenses="MIT"
 

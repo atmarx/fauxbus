@@ -15,7 +15,7 @@ from .world import World
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="fauxbus",
-        description="A wire-level fake of the Globus API — deterministic failure on demand.",
+        description="A wire-level fake of the Globus API for E2E testing.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

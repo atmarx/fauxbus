@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fauxbus"
 version = "0.2.0.dev0"
-description = "A wire-level fake of the Globus API — deterministic failure on demand"
+description = "A wire-level fake of the Globus API for E2E testing"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
