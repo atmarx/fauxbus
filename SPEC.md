@@ -148,6 +148,41 @@ Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
 of its three error-format branches fires.
 
+### Control-plane reachability
+
+The control plane has no authentication, and that is a decision rather
+than an omission: Fauxbus stands in for a service that answers the
+whole network, the harness driving it is routinely a sibling container
+rather than a process on the same host, and a fake that demands
+credentials to be reset is a fake that gets fought with.  The default
+therefore matches the thing being imitated — bound where you bind it,
+open to whoever can reach it.
+
+What that means, stated plainly rather than left implied: **anyone who
+can reach the port can dump the world, rewrite it, and arm forged
+responses.**  The last one is the interesting risk, and it is peculiar
+to fakes.  An attacker does not need to crash anything — seeding a
+world where the assertion happens to hold, or arming a `200` over a
+path that should `403`, makes the *tests* wrong while everything looks
+healthy.  A tool whose whole value is being believed can be attacked by
+being made to lie.
+
+`--control-loopback-only` refuses `/_fauxbus/` from non-loopback peers
+for anyone who wants the boundary — a shared dev host, a CI runner with
+neighbors.  It is off by default because turning it on breaks the
+sibling-container pattern the project ships in `examples/`.  The
+imitated surface is never affected by the flag; a container's own
+healthcheck dials `127.0.0.1` and stays green under it.
+
+Two things the flag deliberately does not solve.  It is a *network*
+boundary, not a local one: code already running beside the tests — a
+compromised transitive dev dependency, say — reaches loopback as easily
+as the harness does, and no socket rule fixes that.  And the state dump
+returns pinned tokens in cleartext, because the `identities` section is
+a token→identity map and the dump must round-trip as a seed; those
+tokens are fixtures, never real credentials, and treating them as
+secrets would be a fiction of its own.
+
 ### Auth posture
 
 Requests must carry a bearer token — a client that forgets auth should fail
@@ -271,6 +306,26 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.11** (2026-08-06) — first outside security review, and the
+  hardening it bought.  An independent reviewer read the code cold:
+  0 critical, 0 high, 3 medium, 3 low, 1 informational, every finding
+  reproduced locally before acting on it.  Fixed: CRLF/NUL now refused
+  in failure-rule header names and values (a rule could forge extra
+  headers, or split the response outright — validated at arm time, so
+  the failing call is the one that wrote the bad rule); `Content-Length`
+  validated and capped at 32 MiB (`int("-1")` reached `read(-1)`, which
+  on a keep-alive connection parked a worker thread forever);
+  `X-Fauxbus-Fail` now range-checks its status like the armed-rule path
+  always did.  Bucket A, the one that stung: seed validation promised
+  in its own comment to be "loud and immediate" but silently accepted
+  unknown policy keys — a typo'd fixture policy did nothing, quietly —
+  and answered malformed scalars with a 500 blaming Fauxbus for the
+  document's mistake.  Both now 422, with the seed's rules matching the
+  policies endpoint's exactly.  Posture decided rather than drifted
+  (see "Control-plane reachability"): the control plane stays open by
+  default because it imitates a networked service and harnesses are
+  often sibling containers, with `--control-loopback-only` for shared
+  hosts.  28 regression tests, each one failing before its fix.
 - **v0.2.10** (2026-08-05) — PyPI publishing written down while the
   iron was warm, parked until it can actually run: the name checked
   free, the v0.1.0 artifacts verified against `twine check`, and

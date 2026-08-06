@@ -29,6 +29,15 @@ def main(argv: list[str] | None = None) -> int:
         help="accept requests without a bearer token (defaults off: a client "
         "that forgets auth should fail in dev, not in prod)",
     )
+    serve.add_argument(
+        "--control-loopback-only",
+        action="store_true",
+        help="refuse /_fauxbus/ requests from non-loopback peers. Off by "
+        "default: the imitated service answers the whole network, and "
+        "harnesses are often sibling containers. Turn it on when the "
+        "host is shared — the control plane is the surface that can "
+        "rewrite the world and forge responses",
+    )
     serve.add_argument("--verbose", action="store_true", help="log every request")
 
     sub.add_parser("version", help="print version and imitated SDK pin")
@@ -60,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_anonymous=args.allow_anonymous,
         verbose=args.verbose,
         canonical_seed=canonical_seed,
+        control_loopback_only=args.control_loopback_only,
     )
     # Boot chatter goes to stderr, like all of it — stdout belongs to
     # whoever wants to pipe this process.

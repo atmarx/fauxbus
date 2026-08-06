@@ -98,6 +98,17 @@ API will ever claim — the imitated surface stays pure.  `GET
 between tests — mutate freely, reset comes home.  Full control-plane
 surface is in [SPEC.md](SPEC.md).
 
+It is unauthenticated by design — it imitates a service that answers
+the network, and harnesses are often sibling containers.  Which means
+anyone who can reach the port can rewrite the world and arm forged
+responses; for a fake, the sharpest risk isn't a crash but a lie, since
+tests that trust it would go green when they should go red.  Run it
+where you'd run any test fixture.  On a shared host,
+`--control-loopback-only` refuses `/_fauxbus/` from non-loopback peers
+without touching the imitated surface.  The reasoning, and the two
+things that flag deliberately doesn't solve, are in
+[SPEC.md](SPEC.md#control-plane-reachability).
+
 ## Loud 501s, no fiction
 
 Fauxbus only implements endpoints a real consumer needs.  Anything it

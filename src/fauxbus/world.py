@@ -59,6 +59,30 @@ def _require_uuid(value: str, what: str) -> str:
         raise validation_error(f"{what} is not a valid UUID: {value!r}") from None
 
 
+# The seed's scalars need the same manners as its UUIDs.  Before these,
+# a seed carrying `"session_limit": "abc"` reached a bare int() and blew
+# up as a 500 FAUXBUS_INTERNAL_ERROR — the response that means "Fauxbus
+# is broken," when the truth was "your document is."  Wrong blame sends
+# someone to the wrong repository.
+
+
+def _require_int(value: Any, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str, float)):
+        raise validation_error(f"{what} must be an integer, got {type(value).__name__}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise validation_error(f"{what} is not an integer: {value!r}") from None
+
+
+def _require_mapping(value: Any, what: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise validation_error(f"{what} must be an object, got {type(value).__name__}")
+    return value
+
+
 @dataclass
 class Membership:
     identity_id: str
@@ -665,9 +689,12 @@ class World:
         if not isinstance(doc, dict):
             raise validation_error("seed document must be an object")
         self.reset()
-        self.clock = int(doc.get("clock", 0))
-        self.counters = {str(k): int(v) for k, v in (doc.get("counters") or {}).items()}
-        for token, pin in (doc.get("identities") or {}).items():
+        self.clock = _require_int(doc.get("clock", 0), "clock")
+        self.counters = {
+            str(k): _require_int(v, f"counters[{k!r}]")
+            for k, v in _require_mapping(doc.get("counters"), "counters").items()
+        }
+        for token, pin in _require_mapping(doc.get("identities"), "identities").items():
             if not isinstance(pin, dict) or "identity_id" not in pin:
                 raise validation_error(f"identity pin for token {token!r} requires identity_id")
             identity_id = _require_uuid(str(pin["identity_id"]), "identity_id")
@@ -675,16 +702,27 @@ class World:
                 "identity_id": identity_id,
                 "username": str(pin.get("username") or placeholder_username(identity_id)),
             }
-        for identity_id, prefs in (doc.get("preferences") or {}).items():
+        for identity_id, prefs in _require_mapping(doc.get("preferences"), "preferences").items():
+            prefs = _require_mapping(prefs, f"preferences[{identity_id!r}]")
             self.preferences[_require_uuid(str(identity_id), "identity_id")] = {
                 "allow_add": bool(prefs.get("allow_add", True))
             }
-        for gid, g in (doc.get("groups") or {}).items():
+        for gid, g in _require_mapping(doc.get("groups"), "groups").items():
             gid = _require_uuid(str(gid), "group id")
             if not isinstance(g, dict) or not g.get("name"):
                 raise validation_error(f"seed group {gid} requires a name")
+            # Unknown policy keys are refused here exactly as the policies
+            # endpoint refuses them.  They diverged once — PUT /policies
+            # rejected a typo while the seed swallowed it — and a fixture
+            # whose typo'd policy silently does nothing is a test asserting
+            # against a world it doesn't have.  One door's rules are every
+            # door's rules.
+            seed_policies = _require_mapping(g.get("policies"), f"group {gid} policies")
+            unknown = set(seed_policies) - set(DEFAULT_POLICIES)
+            if unknown:
+                raise validation_error(f"seed group {gid} has unknown policy fields: {sorted(unknown)}")
             policies = dict(DEFAULT_POLICIES)
-            policies.update(g.get("policies") or {})
+            policies.update(seed_policies)
             group = Group(
                 id=gid,
                 name=str(g["name"]),
@@ -692,15 +730,20 @@ class World:
                 parent_id=g.get("parent_id"),
                 group_type=str(g.get("group_type", "regular")),
                 enforce_session=bool(g.get("enforce_session", False)),
-                session_limit=int(g.get("session_limit", 28800)),
-                session_timeouts=dict(g.get("session_timeouts") or {}),
+                session_limit=_require_int(g.get("session_limit", 28800), f"group {gid} session_limit"),
+                session_timeouts=_require_mapping(
+                    g.get("session_timeouts"), f"group {gid} session_timeouts"
+                ),
                 policies=policies,
                 subscription_id=g.get("subscription_id"),
                 subscription_info=g.get("subscription_info"),
                 subscription_admin_verified_id=g.get("subscription_admin_verified_id"),
             )
-            for identity_id, m in (g.get("memberships") or {}).items():
+            for identity_id, m in _require_mapping(
+                g.get("memberships"), f"group {gid} memberships"
+            ).items():
                 identity_id = _require_uuid(str(identity_id), "identity_id")
+                m = _require_mapping(m, f"group {gid} membership {identity_id}")
                 role = str(m.get("role", "member"))
                 status = str(m.get("status", "active"))
                 if role not in ROLES:
@@ -715,9 +758,11 @@ class World:
                     role=role,
                     status=status,
                 )
-            for identity_id, fields in (g.get("membership_fields") or {}).items():
-                group.membership_fields[_require_uuid(str(identity_id), "identity_id")] = dict(
-                    fields
+            for identity_id, fields in _require_mapping(
+                g.get("membership_fields"), f"group {gid} membership_fields"
+            ).items():
+                group.membership_fields[_require_uuid(str(identity_id), "identity_id")] = (
+                    _require_mapping(fields, f"group {gid} membership_fields[{identity_id}]")
                 )
             self.groups[gid] = group
 

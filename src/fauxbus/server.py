@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -24,6 +25,11 @@ from . import ISSUES_URL, __version__
 from .auth import ANONYMOUS_TOKEN, Identity, parse_bearer
 from .errors import ApiError, unauthorized
 from .world import World
+
+# A seed document is the largest thing anyone legitimately sends, and a
+# test world is small.  32 MiB is far above any honest seed and far below
+# "buffer whatever you're told to."
+MAX_BODY_BYTES = 32 * 1024 * 1024
 
 
 @dataclass
@@ -78,6 +84,29 @@ def injected_body(source: str) -> dict[str, Any]:
     return {"code": "FAUXBUS_INJECTED_FAILURE", "detail": f"failure injected via {source}"}
 
 
+# A header value is one line, by definition.  Let a CR or LF through and
+# the caller stops writing a header and starts writing the response: one
+# `\r\n` forges extra headers, two forge a whole second response into the
+# byte stream (response splitting).  The injected *body* is arbitrary on
+# purpose — that is the product — but the headers frame the message, and
+# a fake that can be made to emit a message its operator didn't write is
+# a fake that can lie about who said what.  Reject rather than strip, so
+# a harness learns its rule was wrong instead of silently getting a
+# different one than it asked for.
+def checked_header(name: str, value: str) -> tuple[str, str]:
+    name, value = str(name), str(value)
+    for part, what in ((name, "name"), (value, "value")):
+        if "\r" in part or "\n" in part or "\0" in part:
+            raise ApiError(
+                400,
+                "BAD_REQUEST",
+                f"header {what} may not contain CR, LF, or NUL: {part!r}",
+            )
+    if not name or not name.isascii() or not value.isascii():
+        raise ApiError(400, "BAD_REQUEST", f"header {name!r} must be non-empty and ASCII")
+    return name, value
+
+
 class FauxbusServer(ThreadingHTTPServer):
     """One server, one World, one lock.
 
@@ -102,12 +131,22 @@ class FauxbusServer(ThreadingHTTPServer):
         allow_anonymous: bool = False,
         verbose: bool = False,
         canonical_seed: dict[str, Any] | None = None,
+        control_loopback_only: bool = False,
     ) -> None:
         super().__init__(address, FauxbusHandler)
         self.world = world or World()
         self.lock = threading.Lock()
         self.allow_anonymous = allow_anonymous
         self.verbose = verbose
+        # Off by default, deliberately.  Fauxbus stands in for a service
+        # that answers the whole network, and the harness driving it is
+        # routinely a sibling container rather than a process on this
+        # host — a loopback-only control plane would break the shipped
+        # compose pattern.  What the flag buys, for anyone who wants it:
+        # the control plane is the one surface that can rewrite the world
+        # and forge responses, so on a shared host it is the surface you
+        # may want reachable only from the machine under test.
+        self.control_loopback_only = control_loopback_only
         self.routes: list[Route] = []
         self.failures: list[FailureRule] = []
         self.fail_counter = 0
@@ -138,7 +177,13 @@ class FauxbusServer(ThreadingHTTPServer):
             path=path,
             status=status,
             body=doc.get("body"),
-            headers={str(k): str(v) for k, v in (doc.get("headers") or {}).items()},
+            # Validated at ARM time, not send time: a bad rule should fail
+            # the harness call that armed it, where the stack trace points
+            # at the test that wrote it — not three requests later inside
+            # some unrelated assertion.
+            headers=dict(
+                checked_header(k, v) for k, v in (doc.get("headers") or {}).items()
+            ),
             times=times,
         )
         self.failures.append(rule)
@@ -188,8 +233,53 @@ class FauxbusHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _content_length(self) -> int:
+        """How many body bytes to read — trusting nothing about the number.
+
+        `int()` on a header is where a small server gets hurt: `int("-1")`
+        succeeds, and `rfile.read(-1)` means "read until EOF", which on a
+        keep-alive connection is a client that simply never sends EOF.  The
+        worker thread blocks there forever, and enough of those exhaust the
+        pool with no error anywhere.  An absurd positive length is the same
+        wound the other way — we would happily buffer it into memory.
+        """
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return 0
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            self._refuse_body()
+            raise ApiError(400, "BAD_REQUEST", f"Content-Length is not an integer: {raw!r}") from None
+        if length < 0:
+            self._refuse_body()
+            raise ApiError(400, "BAD_REQUEST", f"Content-Length may not be negative: {length}")
+        if length > MAX_BODY_BYTES:
+            self._refuse_body()
+            raise ApiError(
+                413,
+                "PAYLOAD_TOO_LARGE",
+                f"body of {length} bytes exceeds the {MAX_BODY_BYTES}-byte limit",
+            )
+        return length
+
+    def _refuse_body(self) -> None:
+        """Answer, then hang up — the only safe move after refusing a length.
+
+        Rejecting a Content-Length leaves the connection indeterminate:
+        we declined to say how many body bytes were coming, so we cannot
+        consume them, so whatever the client actually sent is still in
+        the buffer.  On a keep-alive connection those leftovers are
+        parsed as the *next* request — which is request smuggling, and
+        an attacker who picks the bytes picks that request.  This is the
+        same hazard `_drain_body` exists to prevent; there the cure is
+        to read the body, and here, where reading it is precisely what
+        we refused to do, the cure is to close.
+        """
+        self.close_connection = True
+
     def _read_body(self) -> Any:
-        length = int(self.headers.get("Content-Length") or 0)
+        length = self._content_length()
         raw = self.rfile.read(length) if length else b""
         if not raw:
             return None
@@ -215,6 +305,13 @@ class FauxbusHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         try:
+            if path.startswith("/_fauxbus") and not self._control_allowed():
+                raise ApiError(
+                    403,
+                    "CONTROL_PLANE_RESTRICTED",
+                    "the control plane is restricted to loopback callers "
+                    "(--control-loopback-only). The imitated surface is unaffected.",
+                )
             if path.startswith("/v2/"):
                 # Injection is scoped to the imitated surface.  The
                 # control plane stays unbreakable: a harness that could
@@ -276,6 +373,14 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                 status = int(header)
             except ValueError:
                 raise ApiError(400, "BAD_REQUEST", "X-Fauxbus-Fail must be an integer status") from None
+            # Same range the armed-rule path enforces.  Two doors to the
+            # same behavior should not disagree about what is valid —
+            # and send_response() with a nonsense code emits a status
+            # line no HTTP client should be asked to parse.
+            if not 100 <= status <= 599:
+                raise ApiError(
+                    400, "BAD_REQUEST", f"X-Fauxbus-Fail must be a status in 100-599, got {status}"
+                )
             self._drain_body()
             self._send(status, injected_body("X-Fauxbus-Fail header"))
             return True
@@ -291,8 +396,9 @@ class FauxbusHandler(BaseHTTPRequestHandler):
     def _drain_body(self) -> None:
         # Keep-alive hygiene: consume the request body even when injecting
         # a failure, or the unread bytes corrupt the next request on the
-        # connection.
-        length = int(self.headers.get("Content-Length") or 0)
+        # connection.  Same guarded length as the real read — draining is
+        # not a reason to trust a number we just refused to trust.
+        length = self._content_length()
         if length:
             self.rfile.read(length)
 
@@ -308,6 +414,26 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                     return route, True
                 saw_path = True
         return None, saw_path
+
+    def _control_allowed(self) -> bool:
+        """Whether this peer may speak to /_fauxbus/ at all.
+
+        Only consulted when --control-loopback-only is set.  The check is
+        on the peer address, which cannot be spoofed over a completed TCP
+        handshake the way a header can — that is the whole reason to
+        prefer it to a self-declared identity here.  Note that a
+        container's own healthcheck dials 127.0.0.1 from inside the
+        container, so it stays green under this flag.
+        """
+        if not self.server.control_loopback_only:
+            return True
+        try:
+            return ip_address(self.client_address[0]).is_loopback
+        except (ValueError, IndexError):
+            # Unparseable peer (a Unix socket, an exotic transport) —
+            # fail closed.  The flag exists to be strict; a peer we
+            # cannot identify is not one we can call local.
+            return False
 
     def _authenticate(self) -> Identity:
         token = parse_bearer(self.headers.get("Authorization"))
@@ -340,6 +466,7 @@ def make_server(
     allow_anonymous: bool = False,
     verbose: bool = False,
     canonical_seed: dict[str, Any] | None = None,
+    control_loopback_only: bool = False,
 ) -> FauxbusServer:
     from .control_api import register as register_control
     from .groups_api import register as register_groups
@@ -350,6 +477,7 @@ def make_server(
         allow_anonymous=allow_anonymous,
         verbose=verbose,
         canonical_seed=canonical_seed,
+        control_loopback_only=control_loopback_only,
     )
     register_groups(server)
     register_control(server)
