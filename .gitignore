@@ -8,3 +8,10 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .coverage
+
+# Internal review artifacts — findings land here for triage, not for
+# publication.  A security review is a working document: it names
+# weaknesses before they are fixed, which is precisely the thing not to
+# hand a stranger.  What survives triage becomes a commit, an issue, or
+# a SPEC entry — those are the public record.
+.reviews/
