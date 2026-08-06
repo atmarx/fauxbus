@@ -306,6 +306,17 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **Package release: fauxbus 0.1.1** (2026-08-06, tag `v0.1.1`) —
+  security patch, and the first release cut for a reason other than
+  "the surface is ready."  Supersedes v0.1.0, which carried a
+  response-header injection, a request-parsing flaw that could park
+  worker threads, and — found while fixing that one — a request
+  smuggling follow-on.  **Consumers on v0.1.0 should move.**  No API
+  changes, no behavior changes to the imitated surface: every existing
+  test that passed against v0.1.0 passes against v0.1.1.  New optional
+  `--control-loopback-only` flag, off by default.  Full detail in
+  v0.2.11 below.  PROVISIONAL inventory unchanged at 16 markers; the
+  batch-action response document remains recording target #1.
 - **v0.2.11** (2026-08-06) — first outside security review, and the
   hardening it bought.  An independent reviewer read the code cold:
   0 critical, 0 high, 3 medium, 3 low, 1 informational, every finding
