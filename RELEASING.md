@@ -17,24 +17,22 @@ So, until the first recording session is possible:
 - Every release ships with the **PROVISIONAL inventory** in its release
   notes.  Generate it: `grep -rn PROVISIONAL src/`.  The batch
   membership response document is the standing #1.
-- The moment a tenancy exists (first target: work's staging tenancy,
-  when creds flip), the recording session becomes **release-blocking
-  for every release after it becomes possible**.  A gate nobody can
-  run is worse than an honest gap — but a gate somebody could run and
-  didn't is just a gap.
+- The moment a sacrificial tenancy exists, the recording session
+  becomes **release-blocking for every release after it becomes
+  possible**.  A gate nobody can run is worse than an honest gap —
+  but a gate somebody could run and didn't is just a gap.
 
 ## 1. Green, current, coordinated
 
 - [ ] CI green on `main` — lint, conformance-enforced suite, and wheel
       across 3.11/3.12/3.13, plus the image build-and-boot step.
 - [ ] SPEC.md changelog carries an entry for this version.
-- [ ] **The re-pin handshake** (the first consumer's own protocol,
-      >>01KZ82F5ECFR8E75GN8162PRMJ): root-cellar pins fauxbus in two
-      places — the plane's pyproject and `deploy/rc/modules/fauxbus` —
-      and re-pins **both in one commit**.  Post the tag to
-      #root-cellar when it exists so they can.  Never let the two pins
-      drift; a half-repinned consumer tests two different fakes and
-      believes it tested one.
+- [ ] **The re-pin handshake.**  Downstream consumers may pin fauxbus
+      in more than one place (the first consumer pins it twice: once
+      as an application dependency, once in its deploy stack).  Hand
+      consumers the new tag so every pin moves **in one commit** —
+      never let pins drift, because a half-repinned consumer tests two
+      different fakes and believes it tested one.
 
 ## 2. Version and tag
 
@@ -77,6 +75,6 @@ So, until the first recording session is possible:
 
 ## 4. Tell the people
 
-- Post the release to #fauxbus with the PROVISIONAL inventory and the
-  re-pin pointer.  The first consumer learns about releases from the
-  channel, not from watching the repo.
+- Announce the release where consumers actually look, with the
+  PROVISIONAL inventory and the re-pin pointer.  Consumers learn about
+  releases from the announcement, not from watching the repo.
