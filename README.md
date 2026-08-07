@@ -59,8 +59,7 @@ to, with state behind it (think moto next to botocore's `Stubber`).
 ## Quick start
 
 ```sh
-# not on PyPI yet — install straight from the repo
-pipx install git+https://github.com/atmarx/fauxbus
+pipx install fauxbus
 fauxbus serve --port 9800
 ```
 
