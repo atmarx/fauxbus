@@ -306,6 +306,21 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **Package release: fauxbus 0.1.2** (2026-08-07, tag `v0.1.2`) — the
+  first release published to PyPI, and cut *because* of that: an
+  upload is burn-once, so release #1 under the reserved name had to be
+  one that identifies itself correctly.  v0.1.0 and v0.1.1 do not —
+  both report `0.1.0.dev0` on the wire and hand every 501 an issues
+  link on a private host.  Neither is on PyPI and neither will be; the
+  git tags carry that history.  A patch, not a minor: no API changes,
+  no imitated-surface changes, every test that passed against v0.1.1
+  passes here.  Note the version walks *backwards* from `main`'s
+  `0.2.0.dev0` — that marker was a guess that the next release would
+  be a minor, and the guess was wrong.  `main` returns to `0.2.0.dev0`
+  after the tag, where the next real surface work still points.
+  PROVISIONAL inventory unchanged at 16 markers; the batch-action
+  response document remains recording target #1.  Full detail in
+  v0.2.12 below.
 - **v0.2.12** (2026-08-07) — what the artifact says about itself, made
   true.  Found while checking the package over ahead of a first PyPI
   upload, and both defects shipped in v0.1.0 *and* v0.1.1.  **The

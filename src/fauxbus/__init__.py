@@ -11,7 +11,7 @@ deterministic failure on demand via the /_fauxbus/ control plane.
 # reports on the wire, which is why it has to be right: a consumer
 # debugging a conformance mismatch asks GET /_fauxbus/ what it is
 # talking to, and a stale answer sends them looking in the wrong place.
-__version__ = "0.2.0.dev0"
+__version__ = "0.1.2"
 
 # The globus-sdk version whose GroupsClient surface v0.1 imitates.
 # Response shapes marked "recorded" in this codebase come from fixtures
