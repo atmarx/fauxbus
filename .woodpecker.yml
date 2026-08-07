@@ -131,15 +131,16 @@ steps:
 # while we were thinking of it, so tag time never has to improvise.
 # The name is free (checked: fauxbus 404s on PyPI) and the v0.1.0
 # artifacts pass `twine check`; this step is the automation for v0.2
-# onward.  Restore when BOTH are true:
+# onward.  ONE condition left — was two:
 #
 #   1. A project-scoped PyPI token exists as the Woodpecker secret
 #      `pypi_token`.  (PyPI's OIDC trusted publishing doesn't cover
 #      Woodpecker, so token it is.)  Project-scoped implies the first,
 #      manual upload already happened — RELEASING.md has the sequence.
-#   2. pyproject's homepage/issues URLs point somewhere the public can
-#      reach (the mirror decision).  A package that tells strangers to
-#      file issues behind the VPN is a bad look.
+#   2. DONE 2026-08-07 — pyproject's homepage/issues URLs now point at
+#      github.com/atmarx/fauxbus, which is public with issues enabled.
+#      (Was: a package that tells strangers to file issues behind the
+#      VPN is a bad look.)
 #
 # The `event: tag` this hangs on is already live in the top-level when.
 #

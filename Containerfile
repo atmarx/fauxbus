@@ -30,7 +30,7 @@ FROM python:3.13-slim
 
 LABEL org.opencontainers.image.title="fauxbus" \
       org.opencontainers.image.description="A wire-level fake of the Globus API for E2E testing.  Independent test tool, not affiliated with Globus." \
-      org.opencontainers.image.source="https://git.dev.xram.net/atmarx/fauxbus" \
+      org.opencontainers.image.source="https://github.com/atmarx/fauxbus" \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1

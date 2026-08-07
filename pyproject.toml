@@ -4,7 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fauxbus"
-version = "0.2.0.dev0"
+# Derived from src/fauxbus/__init__.py — see [tool.hatch.version] below.
+dynamic = ["version"]
 description = "A wire-level fake of the Globus API for E2E testing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,8 +28,12 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://git.dev.xram.net/atmarx/fauxbus"
-Issues = "https://git.dev.xram.net/atmarx/fauxbus/issues"
+# Public, on purpose.  These become the sidebar links on the PyPI page
+# and the "Homepage" a stranger clicks.  They pointed at the private
+# Gitea through v0.1.0 and v0.1.1 — a host nobody outside the VPN can
+# reach.  Gitea is still where CI runs; GitHub is where the public is.
+Homepage = "https://github.com/atmarx/fauxbus"
+Issues = "https://github.com/atmarx/fauxbus/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -46,6 +51,20 @@ fauxbus = "fauxbus.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fauxbus"]
+
+# One literal, one place.  This used to be a static `version =` up in
+# [project], with a *second* copy of the same fact living in
+# src/fauxbus/__init__.py.  Nothing tied them together, so the release
+# ritual bumped one and forgot the other: v0.1.0 and v0.1.1 both shipped
+# telling anyone who asked — `fauxbus --version`, the startup banner,
+# GET /_fauxbus/ — that they were "0.1.0.dev0".
+#
+# Hatchling now reads the module's __version__ at build time, so the
+# wheel filename, the PyPI metadata, and the answer the running server
+# gives all come from the same string.  They can no longer disagree,
+# because there is nothing left to disagree with.
+[tool.hatch.version]
+path = "src/fauxbus/__init__.py"
 
 [tool.ruff]
 target-version = "py311"

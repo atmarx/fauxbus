@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from conftest import BOB, PINS
 
 TOKEN = "t-alice"
@@ -14,6 +15,38 @@ def test_index_names_itself(fx):
     assert status == 200
     assert doc["imitates"] == ["groups v2"]
     assert doc["sdk_pin"] == "4.8.1"
+
+
+def test_index_reports_the_version_it_was_actually_built_as(fx):
+    """The wire answer must match the package pip resolved.
+
+    This is the test that was missing.  `__version__` used to be a
+    second, hand-maintained copy of the version in pyproject.toml, and
+    nothing compared them — so v0.1.0 and v0.1.1 both shipped answering
+    "0.1.0.dev0" here.  The test right above this one is called
+    "names itself" and checked everything about itself except which one
+    it is.
+
+    Why this endpoint and this comparison: a consumer chasing a
+    conformance mismatch asks GET /_fauxbus/ what it is talking to, and
+    a stale answer sends them to the wrong changelog.  Comparing against
+    importlib.metadata means we check what pip *installed*, not what the
+    source tree says about itself — the two agreeing is the whole claim.
+
+    If this fails in a working tree right after a version bump, the
+    install is stale, not the code: re-run `pip install -e ".[dev]"`.
+    That is a real finding, not test noise — it means you have been
+    running your tests against a different build than you think.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        installed = version("fauxbus")
+    except PackageNotFoundError:  # pragma: no cover — source-tree-only run
+        pytest.skip("fauxbus is not installed; nothing to compare the wire answer to")
+
+    _, doc, _ = fx.get("/_fauxbus/")
+    assert doc["fauxbus"] == installed
 
 
 def test_state_starts_empty(fx):

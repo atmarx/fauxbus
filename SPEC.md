@@ -306,6 +306,31 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.12** (2026-08-07) — what the artifact says about itself, made
+  true.  Found while checking the package over ahead of a first PyPI
+  upload, and both defects shipped in v0.1.0 *and* v0.1.1.  **The
+  version was a lie.**  It lived in two places — `pyproject.toml` and
+  `__init__.py` — with nothing tying them together, so the release
+  ritual bumped one and forgot the other, and both tags answered
+  `--version`, the startup banner, and `GET /_fauxbus/` with
+  "0.1.0.dev0".  That is the exact question a consumer asks when a
+  conformance run changes behavior, and it was answering with a
+  pre-release of a version two tags stale.  Hatchling now reads the
+  module literal at build time, so the wheel name, the PyPI metadata,
+  and the wire answer are one string with nothing left to disagree
+  with; the test that would have caught it exists now, comparing the
+  control-plane index against `importlib.metadata` — what pip actually
+  installed, not what the source says about itself.  **The issues link
+  was a dead end.**  `ISSUES_URL` ships inside every 501 body, which
+  makes it principle 2's escape hatch, and it pointed at the private
+  Gitea — so every stranger who hit an unimplemented endpoint got a
+  loud, correct, actionable error and a link they could not open.
+  Homepage, Issues, and the image's `org.opencontainers.image.source`
+  now point at `github.com/atmarx/fauxbus`.  The pattern in both:
+  a claim nothing checked.  Same shape as the silently-skipping
+  conformance suite (v0.2.5) and the seed validation that promised
+  "loud and immediate" in its own comment (v0.2.11) — this project
+  keeps finding its own documentation used as evidence for itself.
 - **Package release: fauxbus 0.1.1** (2026-08-06, tag `v0.1.1`) —
   security patch, and the first release cut for a reason other than
   "the surface is ready."  Supersedes v0.1.0, which carried a

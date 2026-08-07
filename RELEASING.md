@@ -36,7 +36,17 @@ So, until the first recording session is possible:
 
 ## 2. Version and tag
 
-- [ ] `pyproject.toml`: drop the `.dev0` (e.g. `0.1.0.dev0` → `0.1.0`).
+- [ ] `src/fauxbus/__init__.py`: drop the `.dev0` from `__version__`
+      (e.g. `0.1.0.dev0` → `0.1.0`).  **That one line is the whole
+      bump** — pyproject reads it at build time.  It did not use to be:
+      the version lived in two files, this checklist named only one of
+      them, and v0.1.0 and v0.1.1 both shipped reporting `0.1.0.dev0`
+      to `--version`, the banner, and `GET /_fauxbus/`.  A checklist
+      that names one of two sources of truth is a checklist that walks
+      you confidently past the bug.
+- [ ] Confirm the artifact agrees before you tag: `python -m build`
+      then check `dist/` is named for the version you meant.  (CI's
+      tagged pipeline enforces this too, but after the tag exists.)
 - [ ] Commit `Release vX.Y.Z`, tag `vX.Y.Z`, push commit and tag.
 - [ ] Immediately follow with a bump to the next `.dev0` so `main` is
       never ambiguous about whether it is a release.
@@ -70,8 +80,9 @@ So, until the first recording session is possible:
      that isn't live.
 
   Prerequisite for all of it: public homepage/issues URLs in
-  pyproject (the mirror decision).  A container registry remains a
-  decision not yet taken.
+  pyproject (the mirror decision).  **Satisfied 2026-08-07** — they
+  point at `github.com/atmarx/fauxbus`, which is public and has issues
+  enabled.  A container registry remains a decision not yet taken.
 
 ## 4. Tell the people
 
