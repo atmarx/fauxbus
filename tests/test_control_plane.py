@@ -46,7 +46,17 @@ def test_index_reports_the_version_it_was_actually_built_as(fx):
         pytest.skip("fauxbus is not installed; nothing to compare the wire answer to")
 
     _, doc, _ = fx.get("/_fauxbus/")
-    assert doc["fauxbus"] == installed
+    # Say the remedy in the failure, not just in this docstring — pytest
+    # shows the assertion, and a bare `'0.2.0.dev0' == '0.1.2'` reads
+    # like a broken test rather than a stale venv.  Same principle as
+    # the empty-token guard in .woodpecker.yml: name the real cause.
+    assert doc["fauxbus"] == installed, (
+        f"the running server reports {doc['fauxbus']!r} but pip installed {installed!r}. "
+        "If you just bumped __version__, your install is stale — re-run "
+        'pip install -e ".[dev]". If you did not, the build is no longer '
+        "reading src/fauxbus/__init__.py and the published artifact will "
+        "misreport its own version, which is exactly what v0.1.0 and v0.1.1 did."
+    )
 
 
 def test_state_starts_empty(fx):
