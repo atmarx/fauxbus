@@ -306,6 +306,25 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.13** (2026-08-08) — tags publish themselves.  The
+  `publish-pypi` step written on 2026-08-05 and parked behind two
+  conditions is live: a project-scoped `pypi_token` exists as a
+  Woodpecker repo secret allowed for the `tag` event, and the public
+  URLs landed with v0.1.2.  **Pushing a tag is now an irreversible
+  public act** — RELEASING.md says so in a callout, because the ritual
+  changed shape and a checklist that describes the old shape is how
+  this project already walked past one bug twice.  Two decisions worth
+  the annotation they got in the step: no `--skip-existing`, because a
+  force-moved tag would then upload nothing and go green, and a silent
+  wrong answer is the one thing this codebase refuses to ship; and an
+  explicit empty-token guard, because Woodpecker delivers a
+  wrongly-scoped secret as an empty string and twine's resulting auth
+  error blames the credential instead of the scoping.  Caught while
+  arming it: the guard's own message contained a colon-space, which
+  ends a plain YAML scalar — the command list silently parsed as a
+  mapping and the step stopped being a step.  Found by parsing the
+  file and asserting every command is a string, which is now how any
+  change here gets checked.
 - **Package release: fauxbus 0.1.2** (2026-08-07, tag `v0.1.2`) — the
   first release published to PyPI, and cut *because* of that: an
   upload is burn-once, so release #1 under the reserved name had to be

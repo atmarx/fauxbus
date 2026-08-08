@@ -126,45 +126,59 @@ steps:
     depends_on:
       - test
 
-# ---------------------------------------------------------------------------
-# PARKED PENDING PUBLICATION — the PyPI publish step, written 2026-08-05
-# while we were thinking of it, so tag time never has to improvise.
-# The name is free (checked: fauxbus 404s on PyPI) and the v0.1.0
-# artifacts pass `twine check`; this step is the automation for v0.2
-# onward.  ONE condition left — was two:
-#
-#   1. A project-scoped PyPI token exists as the Woodpecker secret
-#      `pypi_token`.  (PyPI's OIDC trusted publishing doesn't cover
-#      Woodpecker, so token it is.)  Project-scoped implies the first,
-#      manual upload already happened — RELEASING.md has the sequence.
-#   2. DONE 2026-08-07 — pyproject's homepage/issues URLs now point at
-#      github.com/atmarx/fauxbus, which is public with issues enabled.
-#      (Was: a package that tells strangers to file issues behind the
-#      VPN is a bad look.)
-#
-# The `event: tag` this hangs on is already live in the top-level when.
-#
-#  - name: publish-pypi
-#    image: python:${PYTHON}-slim
-#    when:
-#      event: tag
-#      matrix:
-#        PYTHON: "3.13"
-#    environment:
-#      TWINE_USERNAME: __token__
-#      TWINE_PASSWORD:
-#        from_secret: pypi_token
-#    commands:
-#      - pip install --cache-dir /cache/pip build twine
-#      - python -m build
-#      # The tag names the version; the build had better agree.  A tag
-#      # pointing at a .dev0 commit must die here, not on PyPI —
-#      # uploads are burn-once.
-#      - test -f "dist/fauxbus-${CI_COMMIT_TAG#v}.tar.gz" || { echo "tag ${CI_COMMIT_TAG} does not match built version:"; ls dist/; exit 1; }
-#      - twine check dist/*
-#      - twine upload --non-interactive dist/*
-#    volumes:
-#      - /opt/cache/pip:/cache/pip
-#    depends_on:
-#      - test
-# ---------------------------------------------------------------------------
+  # Tags publish themselves, as of 2026-08-08.  Written 2026-08-05 and
+  # parked behind two conditions, both now met: pyproject's URLs point
+  # somewhere the public can reach, and `pypi_token` exists as a
+  # PROJECT-SCOPED token in this repo's Woodpecker secrets, allowed for
+  # the `tag` event.  (PyPI's OIDC trusted publishing doesn't cover
+  # Woodpecker, so a token it is.  Project-scoped means a leak costs
+  # one package rather than the whole account.)
+  #
+  # The 0.1.2 upload was manual, which is the only way a first upload
+  # can go: you cannot scope a token to a project that does not exist
+  # yet.  RELEASING.md carries that sequence for the next new package.
+  - name: publish-pypi
+    image: python:${PYTHON}-slim
+    when:
+      event: tag
+      matrix:
+        PYTHON: "3.13"
+    environment:
+      # PyPI's literal username for token auth — not a placeholder.
+      TWINE_USERNAME: __token__
+      TWINE_PASSWORD:
+        from_secret: pypi_token
+    commands:
+      - pip install --cache-dir /cache/pip build twine
+      # Woodpecker only injects a secret into events it is explicitly
+      # allowed for, and a secret that wasn't allowed for `tag` arrives
+      # as an empty string rather than an error.  Twine would then fail
+      # with an auth message that reads like a bad token, and you would
+      # go re-mint a perfectly good credential.  Name the real cause.
+      # Block scalar, not a plain one: a plain YAML scalar ends at the
+      # first colon-space, so an unquoted message containing ": " parses
+      # as a mapping and the step silently stops being a command list.
+      - |
+        test -n "$TWINE_PASSWORD" || {
+          echo "pypi_token did not reach this step."
+          echo "Check repo Settings -> Secrets: it must be allowed for the 'tag' event."
+          exit 1
+        }
+      - python -m build
+      # The tag names the version; the build had better agree.  A tag
+      # pointing at a .dev0 commit must die here, not on PyPI —
+      # uploads are burn-once.
+      - test -f "dist/fauxbus-${CI_COMMIT_TAG#v}.tar.gz" || { echo "tag ${CI_COMMIT_TAG} does not match built version:"; ls dist/; exit 1; }
+      - twine check dist/*
+      # Deliberately NO --skip-existing.  It looks like the safe flag and
+      # is the opposite: if a tag is ever force-moved to a new commit and
+      # re-pushed, --skip-existing would see the version already on PyPI,
+      # upload nothing, and go green — a silent wrong answer, which is
+      # the one thing this project refuses to ship.  Re-running a
+      # published tag's pipeline SHOULD go red and say "already exists",
+      # because that is exactly what happened.
+      - twine upload --non-interactive dist/*
+    volumes:
+      - /opt/cache/pip:/cache/pip
+    depends_on:
+      - test
