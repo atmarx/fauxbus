@@ -282,10 +282,40 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   placeholder files into a mounted volume when a task completes
   ("presto, a file appears"), so post-transfer filesystem checks can
   pass — strictly opt-in, because an API fake that writes to disks is
-  a different risk class.  Likely first slice, per principle 2: ACLs
-  and guest-collection permissions (group-membership-driven data
-  access), which is Groups-shaped CRUD — task lifecycle lands when a
-  pipeline consumer shows up.
+  a different risk class.  **First slice, per principle 2: task
+  monitoring** — reordered 2026-08-16 when the pipeline consumer this
+  bullet was waiting for actually showed up.  Root Cellar is dropping
+  the premium Globus iRODS Connector in favour of land-then-register:
+  Globus puts bytes on a POSIX path, their governance layer registers
+  them in place and writes the AVUs.  That design needs a
+  transfer-completion signal, and Globus offers no webhook — the Task
+  Management API has no push mechanism at all, and task events are
+  documented as being for human troubleshooting.  Polling is the
+  supported answer, so a poller is the consumer.  They chose the
+  Transfer API over Globus Flows deliberately: Flows sits *on top of*
+  Transfer and invokes it underneath, so faking Flows would mean faking
+  Transfer plus an orchestration state machine.  Transfer is the floor
+  either way.
+
+  The surface that buys, confirmed against globus-sdk 4.8.1 and *not*
+  guessed: `endpoint_manager_task_list`, `endpoint_manager_get_task`,
+  and `endpoint_manager_task_event_list` — the `endpoint_manager_*`
+  family, not the plain `task_list`.  The distinction is the whole
+  requirement.  `task_list` returns only tasks submitted by the calling
+  identity; Root Cellar's researchers submit their own transfers into
+  the DTN collections, so its service identity never sees them there.
+  Seeing another user's tasks needs the `activity_monitor` role on a
+  *subscribed* collection — confirmed on 2026-08-16 that Root Cellar
+  holds the subscription, the DTNs are subscribed, and the role grant is
+  available.  So the fake imitates the manager-scoped documents and the
+  role-gated auth posture, not the owner-scoped ones.
+
+  ACLs and guest-collection permissions (group-membership-driven data
+  access) were the previously-penciled first slice on the reasoning that
+  they are Groups-shaped CRUD.  They keep their place in the roadmap and
+  lose their place in the queue: nobody has filed for them, and
+  principle 2 orders by consumer need, not by implementation
+  convenience.
 - **Auth** — identities lookup, token introspection, dependent tokens; at
   that point the Groups auth posture can grow real introspection.
 - **Web interface** (penciled for v0.4) — a browser face at
@@ -305,6 +335,39 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.14** (2026-08-16) — the contract pin was a range, and Transfer
+  found its consumer.  Two findings, one of each kind this project keeps
+  producing.
+
+  **The pin didn't pin.** `globus-sdk>=4.8.1,<5` is a range; SPEC,
+  README, and the pyproject comment above it all said the contract was
+  4.8.1.  Resolved live on 2026-08-16 it installs **4.9.0**, so every CI
+  run since 4.9.0 reached PyPI had been conforming against an SDK the
+  spec never named — green the whole time, because nothing compared the
+  claim to the reality.  Now `==4.8.1`, with
+  `test_installed_sdk_is_the_stated_contract_version` asserting the
+  installed SDK matches `CONTRACT_SDK_VERSION` and naming the remedy in
+  its own failure message.  Bumping is a deliberate three-file act.
+  Worth recording that the suite passed against 4.9.0 — the Groups fake
+  evidently holds on both — but "it happened to work" and "we tested
+  what we said we tested" are different claims, and only one of them is
+  the tether's job.  This is the fourth honesty bug here after the
+  `importorskip` that deleted its own file, the seed validation that
+  promised loud failure, and the artifact that misreported its version.
+  The logic keeps being fine.  It is always the claims.
+
+  **Transfer's first slice is now task monitoring, not ACLs** — see the
+  roadmap above.  Root Cellar dropped the premium iRODS Connector after
+  a source-level review (the connector writes an epoch timestamp into
+  the AVU *unit* field for its checksum cache, propagates no metadata
+  across transfers, and would put a second writer on a catalog their
+  governance layer already owns), and the land-then-register design that
+  replaces it needs a completion signal that Globus only offers by
+  polling.  That makes a poller the pipeline consumer this bullet had
+  been parked on since 2026-08-05, and it wants `endpoint_manager_*`
+  documents rather than the owner-scoped `task_list`.  No implementation
+  yet — principle 2 says the door is open, not that the work is done.
 
 - **v0.2.13** (2026-08-08) — tags publish themselves.  The
   `publish-pypi` step written on 2026-08-05 and parked behind two

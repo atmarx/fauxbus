@@ -41,9 +41,23 @@ dev = [
     "ruff>=0.5,<1",
 ]
 # The conformance suite drives the real globus-sdk against Fauxbus.
-# The pin here IS the stated SDK contract version from SPEC.md.
+# The pin here IS the stated SDK contract version from SPEC.md — and it
+# has to be an *exact* pin for that sentence to be true.  It used to read
+# `>=4.8.1,<5`, which is a range: SPEC said the contract was 4.8.1 while
+# the resolver quietly installed whatever was newest under 5.  By
+# 2026-08-16 that was 4.9.0, so every CI run since 4.9.0 shipped had been
+# conforming against an SDK the spec never named, and nothing said so.
+# Principle 1 is "the SDK is the contract, pinned to a stated version" —
+# a floating pin means the contract changes without a commit.
+#
+# Bumping is now a deliberate act: change this literal, change the
+# CONTRACT_SDK_VERSION in tests/test_sdk_conformance.py to match, and let
+# the suite tell you whether the fake still holds.  The assertion there
+# fails loudly when the installed SDK and the stated contract disagree,
+# because this project has now shipped three separate bugs whose whole
+# shape was "the claim and the reality drifted and no test compared them."
 conformance = [
-    "globus-sdk>=4.8.1,<5",
+    "globus-sdk==4.8.1",
 ]
 
 [project.scripts]

@@ -36,6 +36,32 @@ from globus_sdk import (  # noqa: E402
 
 from fauxbus.ids import identity_id_for_token  # noqa: E402
 
+# The stated SDK contract version, as one literal.  SPEC.md and README
+# both say Fauxbus imitates globus-sdk 4.8.1; pyproject pins it exactly.
+# This is the third copy of that fact, and the only one a test can check
+# — which is the point.  Keep all three in step when bumping.
+CONTRACT_SDK_VERSION = "4.8.1"
+
+
+def test_installed_sdk_is_the_stated_contract_version():
+    """The tether is only honest if the SDK under it is the stated one.
+
+    This is the assertion that was missing on 2026-08-16, when the pin
+    read `globus-sdk>=4.8.1,<5` and resolved to 4.9.0.  The suite was
+    green, the SPEC said 4.8.1, and CI had been conforming against an
+    SDK nobody had named for however long 4.9.0 had been on PyPI.  A
+    conformance suite that does not check *which* SDK it conformed to is
+    describing a contract it cannot prove it tested.
+    """
+    assert globus_sdk.__version__ == CONTRACT_SDK_VERSION, (
+        f"conformance ran against globus-sdk {globus_sdk.__version__}, but the "
+        f"stated contract in SPEC.md and pyproject is {CONTRACT_SDK_VERSION}.  "
+        f"Remedy: either reinstall the pinned SDK "
+        f"(pip install -e '.[conformance]'), or — if this is a deliberate bump "
+        f"— change the pin in pyproject.toml, CONTRACT_SDK_VERSION here, and "
+        f"the version named in SPEC.md and README.md, together, in one commit."
+    )
+
 
 def sdk_client(base_url: str, token: str = "t-alice") -> GroupsClient:
     return GroupsClient(base_url=base_url, authorizer=AccessTokenAuthorizer(token))
