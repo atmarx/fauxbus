@@ -144,6 +144,21 @@ code says which:
    most prominent provisional today and the top priority for the first
    recording session.
 
+Auth's grades were audited on 2026-08-24 against the fixtures shipped in
+`globus_sdk/testing/data/auth/`, before any of it was built — cheaper to
+learn what can be grounded while the design is still prose.  Most of the
+token surface comes back **recorded**: the client-credentials and
+code-exchange responses, the identity object (`email`, `id`,
+`identity_provider`, `name`, `organization`, `status`, `username`, plus
+`identity_type` where present), and the 401/403 error documents for
+`userinfo`.  One thing does not.  **There is no success fixture for
+`userinfo` anywhere in the SDK** — only the two error cases — which
+leaves `identity_set`, the linked-identity list a consumer actually
+authorizes against, graded **provisional**.  That is an uncomfortable
+place for it: of every shape in the Auth slices, `identity_set` is the
+one a login design depends on most and the one the SDK can ground least.
+It joins the batch-action document at the top of the recording list.
+
 Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
 of its three error-format branches fires.
@@ -193,8 +208,12 @@ stable mapping, so `token-for-alice` is always the same caller — same
 UUID, same username, every run).  When a test needs to be picky, the seed
 document's `identities` section pins explicit token → identity mappings;
 because the state dump includes the same section, pinning is just seeding.
-Real token introspection is out of scope until an Auth API mock exists
-(roadmap).
+Real token introspection is out of scope until an Auth API mock exists —
+now scoped as Auth slice A's **issued-token mode** (roadmap).  When it
+lands it is opt-in, and the derive-from-the-string behavior above stays
+the default: every consumer written against Fauxbus so far assumes it,
+and a fake that silently starts rejecting tokens is a fake that broke
+its users to gain a feature they did not ask for.
 
 ## The control plane (`/_fauxbus/`)
 
@@ -249,7 +268,10 @@ test connects.
   a byte-identical round-trip test in CI.
 - Zero runtime dependencies — stdlib only, on purpose.  A test fake
   consumers add to their dev environments should not bring a supply
-  chain with it.
+  chain with it.  Tested against its hardest case on 2026-08-24: signing
+  RS256 ID tokens looks like it requires a crypto library and turns out
+  not to (roadmap → Auth).  The rule has not needed an exception yet,
+  and "we checked" is a stronger claim than "we intend to."
 - MIT (decided 2026-07-30).  We reviewed the Globus Connect source
   license first: it covers GCS/GCP source code only — not the APIs, not
   the Apache-2 SDK — and Fauxbus stays entirely outside its scope by
@@ -316,8 +338,99 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   lose their place in the queue: nobody has filed for them, and
   principle 2 orders by consumer need, not by implementation
   convenience.
-- **Auth** — identities lookup, token introspection, dependent tokens; at
-  that point the Groups auth posture can grow real introspection.
+- **Auth** — two slices, both with named consumers as of 2026-08-24.
+  This bullet used to read "identities lookup, token introspection,
+  dependent tokens."  Those keep their place in the roadmap and lose
+  their place in the queue, for the same reason ACLs did: principle 2
+  orders by consumer need, and a consumer arrived asking for something
+  else.  A WordPress fleet wants Globus login brokered through a real
+  identity broker, with a Globus group deciding who may sign in where.
+
+  **Slice A — `client_credentials` at `/v2/oauth2/token`.**  The grant a
+  service uses to act as *itself* rather than on behalf of a person.
+  Build it **resource-server-generic**, not bound to Groups: the same
+  grant is what Root Cellar's Transfer poller authenticates with (see
+  the Transfer bullet), and the SDK's own fixture for it happens to name
+  `transfer.api.globus.org`.  One endpoint, two consumers — which is
+  also the honest argument for building it first.  Recorded from
+  `globus_sdk/testing/data/auth/oauth2_client_credentials_tokens.py`:
+  `access_token`, `scope`, `expires_in`, `token_type`,
+  `resource_server`, `other_tokens`.  That last field is present
+  **unconditionally**, as `[]`, even when a single token is issued.
+  Multi-resource-server responses are a later slice; the *field* is not
+  optional, and omitting it would hand the SDK a document the real
+  service never sends.  With `openid` among the scopes the response also
+  carries `id_token`, and `resource_server` becomes `auth.globus.org`.
+
+  Slice A is also where **issued-token mode** arrives.  Today any bearer
+  token is accepted and its identity derived from the string (see Auth
+  posture).  That stays the default, because it is what every existing
+  consumer is written against.  Opt in, and Fauxbus checks that a token
+  was actually issued, to the right resource server, with sufficient
+  scope, and not yet expired — the four failure modes a consumer
+  currently cannot test at all, because the fake says yes to everything.
+
+  **Slice B — the OIDC authorization-code flow**, so a real identity
+  broker can authenticate a seeded account against Fauxbus.  Principle 1
+  survives this better than expected: `get_openid_configuration`,
+  `get_jwk`, `userinfo`, and `oauth2_exchange_code_for_tokens` are all
+  real methods on the pinned 4.8.1, so the SDK still drives most of the
+  surface.  But the **browser redirect leg is the first place where the
+  SDK is not the whole contract** — nothing in `globus-sdk` performs an
+  interactive authorization, because no library can.  There the contract
+  is OIDC itself plus what a broker actually does on the wire, and the
+  honest consequence is that Fauxbus cannot claim SDK-grade conformance
+  for `/v2/oauth2/authorize` the way it can everywhere else.  Say so
+  rather than let the grade be assumed.  The broker-in-a-container
+  acceptance test belongs to the consumer's repo: making a broker a
+  Fauxbus dev dependency would mean acquiring a second supply chain in
+  order to test a fake whose entire pitch is not having one.
+
+  Test control for the redirect leg stays out-of-band per principle 4.
+  No `fauxbus_*` query parameters on `/v2/oauth2/authorize` — an
+  unauthenticated authorize request redirects to a `/_fauxbus/` account
+  picker that establishes a Fauxbus-only session and resumes the pending
+  request.  The imitated surface keeps no knowledge that it is fake.
+
+  **Signing: stdlib, decided 2026-08-24.**  ID tokens have to be signed
+  with something a real broker will validate, which looks like it forces
+  a crypto dependency and a hole in the zero-dependency rule.  It does
+  not.  RS256 is RSASSA-PKCS1-v1_5 over SHA-256 — `hashlib`, a fixed DER
+  prefix, and one `pow(m, d, n)`, with Python's built-in bignums doing
+  the arithmetic.  Verified on 2026-08-24: roughly twenty lines of
+  stdlib produce a JWT that PyJWT and `cryptography` accept through a
+  real JWKS `kid` lookup, and reject when the payload is tampered with.
+  What makes hand-rolled JWT code acceptable here is an asymmetry —
+  **Fauxbus only ever signs, and never verifies.**  Verification is
+  where JWT implementations get dangerous (`alg: none`, key confusion,
+  padding oracles) and none of that surface exists in a signer.  The
+  fixture private key ships **published in the repo, on purpose**:
+  anyone can forge a Fauxbus token, so nobody can ever be tempted to
+  trust one.  That turns "don't point production at the fake" from a
+  sentence in a document into a property of the system.
+
+  **Clocks: signed tokens are the one exception to principle 3.**
+  Fauxbus has no wall-clock dependence; time advances when a test says
+  so.  That holds for everything *Fauxbus itself* validates —
+  authorization-code expiry, token expiry, membership state.  It cannot
+  hold for an ID token, because the thing checking `exp` and `iat` is an
+  outside verifier running on real time that never agreed to participate
+  in our logical clock.  A logical clock anchored at a fixed epoch mints
+  tokens that are permanently expired or permanently not-yet-valid, and
+  determinism does not rescue it, because the verifier is not playing.
+  Found on 2026-08-24 by a signing probe that failed on
+  `ImmatureSignatureError` before it ever reached a signature check.  So
+  `iat`/`exp` on signed tokens anchor to real time, and determinism is
+  preserved in the *offset* rather than the absolute value.  Worth
+  stating loudly: the symptom is "login just fails," which points
+  nowhere near the cause.
+
+  **Issuer.**  Auth mode requires an explicit public issuer, and every
+  surface must agree on it — discovery metadata, `iss`, the authorize
+  and token URLs, userinfo, JWKS.  Fauxbus must **refuse to start** if
+  the configured issuer names a real Globus domain.  Refuse, not warn:
+  the failure being prevented is a production client trusting a fake,
+  and that is not a thing to leave to whether someone read the output.
 - **Web interface** (penciled for v0.4) — a browser face at
   `app.fauxbus.local` (mocked in DNS) that lightly mirrors
   `app.globus.org`: browse groups and memberships, watch transfer tasks
@@ -335,6 +448,47 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.15** (2026-08-24) — Auth got a consumer and a design review, and
+  the grading happened before the code for once.
+
+  A proposal arrived from outside the project: a WordPress fleet wants
+  Globus login brokered through a real identity broker, with a Globus
+  group deciding who may sign in to which site.  It was a good proposal
+  — it respected principle 4 without being told, refused to claim
+  `auth.globus.org` as an issuer, and staged its own slices behind
+  consumers.  It has been answered rather than filed, and the settled
+  parts are in the roadmap above.
+
+  **The grounding audit ran first.**  Every prior finding in this
+  changelog was discovered after shipping: the `importorskip` that
+  deleted its own file, the seed validation that promised loud failure,
+  the artifact that misreported its version, the pin that did not pin.
+  Four bugs, all the same species — a claim nobody had compared to a
+  reality.  So this time the SDK's own fixtures were read *before* a
+  line of Auth was written, and the answer was worth having early: the
+  token surface grades **recorded**, and `identity_set` does not,
+  because `globus_sdk/testing/data/auth/userinfo.py` ships only its 401
+  and 403 cases.  The single field a login design leans on hardest is
+  the single field the SDK cannot ground.  Better to know that while the
+  design is still prose than to discover it in a conformance run.
+
+  **The zero-dependency rule survived its hardest test.**  Signed ID
+  tokens looked like they forced a crypto dependency.  RS256 is
+  `hashlib`, a DER constant, and one `pow(m, d, n)`; twenty lines of
+  stdlib produced a token that PyJWT and `cryptography` validated
+  through a JWKS `kid` lookup and rejected when tampered with.  Safe
+  because Fauxbus only ever signs and never verifies, and because the
+  private key is published on purpose — a forgeable token is one nobody
+  can be tempted to trust in production.
+
+  **Principle 3 gets its first stated exception.**  Determinism holds
+  for everything Fauxbus validates.  It cannot hold for `exp` and `iat`
+  on a token handed to an outside verifier running on real time, and the
+  probe that found this failed with `ImmatureSignatureError` before it
+  reached a signature check.  The exception is now written down, because
+  the symptom of getting it wrong is "login just fails," which points
+  nowhere near the clock.
 
 - **v0.2.14** (2026-08-16) — the contract pin was a range, and Transfer
   found its consumer.  Two findings, one of each kind this project keeps
