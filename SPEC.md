@@ -157,13 +157,10 @@ leaves `identity_set`, the linked-identity list a consumer actually
 authorizes against, graded **provisional**.  That is an uncomfortable
 place for it: of every shape in the Auth slices, `identity_set` is the
 one a login design depends on most and the one the SDK can ground least.
-It joins the batch-action document at the top of the recording list.
-Two identity-lifecycle questions belong on the same session, because
-they decide what the seed model above has to be able to stage: whether a
-Globus identity UUID survives a change to its underlying institutional
-username, and where exactly the manager/admin boundary sits for adding a
-member directly to the admin role (marked `PROVISIONAL` in
-`world.py` today).
+It joins the batch-action document at the top of the recording list,
+alongside one Groups question a consumer's self-serve model does lean
+on: where exactly the manager/admin boundary sits for adding a member
+directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
@@ -431,19 +428,20 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   stating loudly: the symptom is "login just fails," which points
   nowhere near the cause.
 
-  **The seed model must be able to express identity churn.**  Not just
-  "an identity exists" — the ways an identity *moves*.  An institutional
-  username changing while the Globus UUID holds; the UUID changing while
-  the username holds; the same username later appearing on a different
-  UUID.  A consumer authorizing on federated identity has to pick which
-  hop keys on what, and every one of those choices has a failure mode
-  that only shows up when an identity changes underneath it.  A fake
-  that can only produce a stable identity lets that consumer write
-  passing tests for the one case that was never in doubt — which is this
-  project's recurring failure shape, relocated into someone else's test
-  suite.  Staging a rename must be a control-plane operation, not a
-  restart with a different seed, because the interesting assertions are
-  about what happens to a session that already existed.
+  **Identity churn: a constraint, not a feature.**  This bullet briefly
+  required the seed model to *stage* renames through the control plane —
+  a username changing while the UUID holds, and the reverse.  It lasted
+  about an hour.  The consumer that motivated it decided to treat its
+  institutional usernames as stable and handle the rare rename by hand,
+  which leaves the requirement with nobody calling it, and principle 2
+  is unambiguous about what an uncalled feature is.  Out of the queue.
+
+  What stays costs nothing: **the identity model must not be shaped so
+  that a rename is impossible to represent.**  Keep the durable UUID and
+  the mutable username as separate things rather than collapsing them
+  into one identifier, because that distinction is free today and a
+  schema migration later.  Staging a rename live waits for a consumer
+  who needs it — which is the same answer ACLs got, for the same reason.
 
   **Issuer.**  Auth mode requires an explicit public issuer, and every
   surface must agree on it — discovery metadata, `iss`, the authorize
