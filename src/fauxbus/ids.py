@@ -44,3 +44,27 @@ def identity_id_for_token(token: str) -> str:
     UUID on your laptop, in CI, and in the shipped example seed.
     """
     return str(uuid.uuid5(FAUXBUS_NS, f"identity:{token}"))
+
+
+def access_token(counter: int) -> str:
+    """The Nth access token this world issues, spelled the same every run.
+
+    Deliberately readable and deliberately guessable, and both halves of
+    that need defending.
+
+    Readable, because a token that says ``fauxbus-at-0`` in a log, a
+    state dump, or a failing assertion tells you what it is and where it
+    came from.  A realistic-looking opaque blob would tell you nothing
+    and would invite someone to paste it somewhere it does not belong.
+
+    Guessable, because principle 3 leaves no alternative: a random token
+    would make every state dump differ from the last, and the round-trip
+    invariant (dump is a valid seed that reproduces the dump) would die
+    with it.  That is a real trade — under ``--require-issued-tokens``
+    an attacker who can reach the fake can guess ``fauxbus-at-0`` and it
+    will be a live token.  It is the right trade only because this is a
+    fake: SPEC already treats every token here as a fixture rather than
+    a credential, and the whole design leans on nobody ever being able
+    to mistake a Fauxbus token for a real one.  The name helps with that.
+    """
+    return f"fauxbus-at-{counter}"

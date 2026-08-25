@@ -25,6 +25,18 @@ services:
       #
       # It is also the fixed point: POST /_fauxbus/reset restores THIS
       # world, so tests mutate freely and come home between runs.
+      #
+      # The seed registers one confidential client — the "Night Owl
+      # dispatcher" — so a service in your stack can fetch a token the
+      # way it will in production:
+      #
+      #   curl -s http://localhost:9800/v2/oauth2/token \
+      #     -u 00000000-0000-4000-8000-0000000c11e7:dispatcher-secret-not-a-real-one \
+      #     -d grant_type=client_credentials \
+      #     -d scope=urn:globus:auth:scope:groups.api.globus.org:all
+      #
+      # That client is an active admin of the seeded group, because in
+      # Globus a client is an identity and its token acts as itself.
       - ./seed.json:/seed.json:ro
 
     # The image ships this same healthcheck; repeated here so

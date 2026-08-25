@@ -1,4 +1,11 @@
 {
+  "clients": {
+    "00000000-0000-4000-8000-0000000c11e7": {
+      "name": "Night Owl dispatcher",
+      "secret": "dispatcher-secret-not-a-real-one",
+      "username": "00000000-0000-4000-8000-0000000c11e7@clients.auth.globus.org"
+    }
+  },
   "clock": 0,
   "counters": {
     "group": 1
@@ -19,6 +26,11 @@
           "role": "member",
           "status": "active",
           "username": "bob@example.org"
+        },
+        "00000000-0000-4000-8000-0000000c11e7": {
+          "role": "admin",
+          "status": "active",
+          "username": "00000000-0000-4000-8000-0000000c11e7@clients.auth.globus.org"
         }
       },
       "name": "Night Owl Service",
@@ -49,5 +61,6 @@
     }
   },
   "preferences": {},
+  "tokens": {},
   "version": 0
 }

@@ -162,9 +162,35 @@ alongside one Groups question a consumer's self-serve model does lean
 on: where exactly the manager/admin boundary sits for adding a member
 directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
+Building slice A added four more to that list, and it is worth noticing
+that every one of them is a question the audit could not have asked
+before the code existed:
+
+1. **The status for a token presented to the wrong resource server.**
+   Fauxbus answers 403 — the token is genuine and introspects fine, it
+   simply is not good here, which reads as "authenticated, not
+   authorized."  No fixture covers it and the case is entirely
+   plausible as a 401.  `PROVISIONAL` in `world.require_issued`.
+2. **Which Groups operations each scope actually covers.**  The two
+   scope names are recorded; the mapping is not, which is why
+   per-operation enforcement was left out rather than guessed.
+3. **Whether the real endpoint answers a `client_credentials` request
+   carrying `openid` with an `id_token` at all** — there is no person
+   for an ID token to describe, so it may simply decline.  Fauxbus 501s
+   either way today, which is right until someone can say.
+4. **The token endpoint's error bodies beyond `invalid_grant`.**  One
+   fixture grounds one case; `invalid_client`, `invalid_request`, and
+   `unsupported_grant_type` follow RFC 6749 and the status pattern the
+   fixture set, which is inference dressed in a standard.
+
 Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
-of its three error-format branches fires.
+of its three error-format branches fires.  With one exception, added in
+v0.2: the OAuth2 token endpoint answers RFC 6749 §5.2's
+`{"error", "error_description"}`, because that is what the SDK's own
+fixture shows Globus sending from that path.  Two error dialects in one
+server is not a wart — it is the fake being faithful to a service that
+really does speak both.
 
 ### Control-plane reachability
 
@@ -211,12 +237,147 @@ stable mapping, so `token-for-alice` is always the same caller — same
 UUID, same username, every run).  When a test needs to be picky, the seed
 document's `identities` section pins explicit token → identity mappings;
 because the state dump includes the same section, pinning is just seeding.
-Real token introspection is out of scope until an Auth API mock exists —
-now scoped as Auth slice A's **issued-token mode** (roadmap).  When it
-lands it is opt-in, and the derive-from-the-string behavior above stays
-the default: every consumer written against Fauxbus so far assumes it,
-and a fake that silently starts rejecting tokens is a fake that broke
-its users to gain a feature they did not ask for.
+**Issued-token mode** arrived with Auth slice A (v0.2), and it is
+opt-in: `--require-issued-tokens`.  The derive-from-the-string behavior
+above stays the default, because every consumer written against Fauxbus
+so far assumes it, and a fake that silently starts rejecting tokens is a
+fake that broke its users to gain a feature they did not ask for.
+
+Turned on, Fauxbus checks three things a permissive fake structurally
+cannot: that the token was **issued here**, that it has **not expired**
+(on the logical clock — `/_fauxbus/tick` ages a token, never a sleep),
+and that it is good for **this resource server** (a Transfer token
+presented to Groups is refused).  Those are three real production
+failures a consumer currently cannot write a test for.
+
+A fourth check was considered and deliberately left out: **per-operation
+scope**, the rule that a token carrying only
+`view_my_groups_and_memberships` may not create a group.  The scope
+*names* are SDK-grounded (`globus_sdk/scopes/data/groups.py` lists
+exactly two), but which operations each one covers is not grounded
+anywhere, and the failure modes are not symmetric — a fake that rejects
+calls the real service allows breaks working consumer code, while one
+that permits too much merely fails to catch a bug.  It is on the
+recording list, and this paragraph exists because an earlier draft of
+this document promised four checks and the code shipped three.
+
+One divergence worth naming, because it will look like a bug.  The SDK
+computes `expires_at_seconds` as `int(time.time() + expires_in)` — real
+wall-clock time, in the consumer's process, outside anything Fauxbus
+controls.  So a consumer that caches by that field believes its token is
+good for the next 48 hours while Fauxbus, counting on the logical clock,
+may have expired it one `tick` ago.  Both are behaving correctly; they
+are simply keeping different time.
+
+## v0.2 — Auth slice A: the client-credentials grant
+
+**`POST /v2/oauth2/token`, `grant_type=client_credentials`** — the grant
+a service uses to act as *itself* rather than on behalf of a person.
+Built **resource-server-generic**: nothing in `auth_api.py` knows Groups
+exists.  The requested scope names the service, so the same endpoint
+that hands a WordPress provisioner a Groups token hands Root Cellar's
+poller a Transfer token.  One endpoint, two consumers.
+
+The load-bearing idea, and the one to carry away from this slice: **in
+Globus Auth a registered client is an identity.**  Its `client_id` is an
+identity UUID, and a token minted by this grant acts as that identity
+everywhere downstream — so a provisioner that fetches its own token and
+then calls Groups appears in the membership list under its own name,
+`<client_id>@clients.auth.globus.org`, exactly as a person would.
+`World.identity_for_token` therefore consults issued tokens *before* the
+seed pins and before the derive-from-the-string fallback.  Skipping that
+step would leave the fake disagreeing with itself about who just called.
+
+**Response** — RECORDED from
+`globus_sdk/testing/data/auth/oauth2_client_credentials_tokens.py`:
+`access_token`, `scope`, `expires_in` (172800), `token_type`,
+`resource_server`, `other_tokens`.  That last one is not decoration and
+not optional: `OAuthTokenResponse._init_rs_dict` indexes
+`self["other_tokens"]` with no `.get` and no default, so omitting it
+raises a `KeyError` *inside globus-sdk* — a traceback pointing at the
+library rather than at the fake that lied.
+
+**Client authentication** — both legal forms, because the two known
+consumers split across them.  HTTP Basic is what globus-sdk sends
+(`ConfidentialAppAuthClient` installs a `BasicAuthorizer`) and is
+RECORDED.  `client_id`/`client_secret` in the form body is DOCUMENTED
+(RFC 6749 §2.3.1) and is what identity brokers usually send — Keycloak
+calls it `client_secret_post`, and a broker is precisely the consumer
+slice B is being built for.  Sending both at once is refused: the RFC
+forbids it, and if the two disagree any choice the server makes is a
+security decision made by accident.
+
+**A form body, not JSON.**  RFC 6749 §4.4.2 requires it and the SDK
+sends it, so the transport learned to parse `Content-Type:
+application/x-www-form-urlencoded` and to record on `Ctx` which encoding
+arrived.  Recording it matters: a JSON body deserializes into a dict
+shaped exactly like a form dict, so without the check every field lookup
+would have succeeded and Fauxbus would have minted a token for a request
+the real service rejects outright — a fake teaching a habit that breaks
+in production.
+
+**Errors speak a different dialect here**, and it is the only place in
+Fauxbus that does.  Everywhere else the body is `{"code", "detail"}`,
+the shape `GlobusAPIError` parses.  The token endpoint answers RFC 6749
+§5.2's `{"error", "error_description"}`, because that is what the SDK's
+own fixture shows Globus sending from this path — 401 with
+`{"error": "invalid_grant"}` in
+`oauth2_exchange_code_for_tokens.py`.  Two things came out of that
+recording.  The status is a **401**, where RFC 6749 says `invalid_grant`
+is a 400; the recording wins, and the other credential-shaped failures
+match it.  And the body carries *nothing* the SDK's error parser
+recognizes, so `GlobusAPIError.code` and `.message` both come back
+`None` (measured against 4.8.1 on 2026-08-24) and a consumer is left
+with the status and the raw JSON.  Fauxbus reproduces that blindness
+rather than improving on it: a fake kinder than the service hides a
+rough edge the consumer meets in production anyway.  The one addition is
+`error_description`, which is free — RFC-optional, sent by Globus on
+other Auth endpoints, and surfaced by *none* of the SDK's message
+fields, so no test can come to depend on it while a human reading a
+`curl` still learns what went wrong.
+
+**Three ways to be refused, and whose fault each one is.**  This is
+principle 2 at its sharpest, because the grant type is where a fake is
+most tempted to lie on its own behalf:
+
+- A grant Globus supports *and Fauxbus has built* runs.
+- A grant Globus supports and **Fauxbus has not built** — `authorization_code`,
+  `refresh_token`, the dependent-token grant — is **our** gap and gets a
+  loud 501 with a tracker link.  Answering `unsupported_grant_type` there
+  would be Fauxbus slandering the real service to cover its own absence.
+- A grant **Globus does not offer** gets RFC 6749's
+  `unsupported_grant_type`, which is what the real endpoint would say.
+
+The same instinct governs scopes.  Scopes spanning two resource servers
+are legal at the real service, which answers with a primary token plus
+the rest in `other_tokens`; Fauxbus does not build that yet, and the
+tempting shortcut — issue for whichever service parsed first and quietly
+drop the other scopes — is the exact silent wrong answer principle 2
+forbids, because the consumer would get a token that looks fine and
+fails later against a service it was never good for.  501, naming both
+services.  A scope form Fauxbus cannot parse is likewise a 501 rather
+than a guess.  And a request carrying `openid` is refused rather than
+answered without an `id_token`: this document promises that field,
+signing waits for slice B, and a missing key would surface as a
+`KeyError` in the consumer's code pointing nowhere near the cause.
+
+**Token strings are readable and guessable**, both on purpose.
+`fauxbus-at-0` says what it is in a log or a failing assertion, where an
+opaque blob would say nothing and would invite someone to paste it
+somewhere it does not belong.  Guessable is what principle 3 costs: a
+random token would break the round-trip invariant and make every state
+dump differ from the last.  Under `--require-issued-tokens` that means
+an attacker who can reach the fake can guess a live token — an
+acceptable trade only because this is a fake, where SPEC already treats
+every token as a fixture rather than a credential, and the whole design
+leans on nobody being able to mistake a Fauxbus token for a real one.
+The name helps with that.
+
+**New world state**, both round-tripping through dump/seed like
+everything else: `clients` (a registry of `client_id` → secret, name,
+username) and `tokens` (what each issued token authorizes).  Seeding a
+token directly means a harness can start with an already-expired one
+without performing the grant and ticking the clock first.
 
 ## The control plane (`/_fauxbus/`)
 
@@ -349,29 +510,21 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   else.  A WordPress fleet wants Globus login brokered through a real
   identity broker, with a Globus group deciding who may sign in where.
 
-  **Slice A — `client_credentials` at `/v2/oauth2/token`.**  The grant a
-  service uses to act as *itself* rather than on behalf of a person.
-  Build it **resource-server-generic**, not bound to Groups: the same
-  grant is what Root Cellar's Transfer poller authenticates with (see
-  the Transfer bullet), and the SDK's own fixture for it happens to name
-  `transfer.api.globus.org`.  One endpoint, two consumers — which is
-  also the honest argument for building it first.  Recorded from
-  `globus_sdk/testing/data/auth/oauth2_client_credentials_tokens.py`:
-  `access_token`, `scope`, `expires_in`, `token_type`,
-  `resource_server`, `other_tokens`.  That last field is present
-  **unconditionally**, as `[]`, even when a single token is issued.
-  Multi-resource-server responses are a later slice; the *field* is not
-  optional, and omitting it would hand the SDK a document the real
-  service never sends.  With `openid` among the scopes the response also
-  carries `id_token`, and `resource_server` becomes `auth.globus.org`.
+  **Slice A shipped in v0.2** — `client_credentials` at
+  `/v2/oauth2/token`, resource-server-generic, plus issued-token mode.
+  It has its own section above; what remains here is what it *deferred*,
+  each item a deliberate refusal rather than an oversight:
 
-  Slice A is also where **issued-token mode** arrives.  Today any bearer
-  token is accepted and its identity derived from the string (see Auth
-  posture).  That stays the default, because it is what every existing
-  consumer is written against.  Opt in, and Fauxbus checks that a token
-  was actually issued, to the right resource server, with sufficient
-  scope, and not yet expired — the four failure modes a consumer
-  currently cannot test at all, because the fake says yes to everything.
+  - **Multi-resource-server responses** — the primary token plus the
+    rest in `other_tokens`.  Requesting scopes across two services is a
+    loud 501 today.
+  - **`id_token` on an `openid` request**, which needs slice B's signing.
+    Refused rather than answered without the field.
+  - **Dependent scopes** (`scope[dependent]`) and the dependent-token
+    grant.
+  - **`refresh_token`** as a grant, and refresh tokens in the response.
+  - **Per-operation scope enforcement** — see Auth posture for why this
+    one is a considered omission rather than a queue position.
 
   **Slice B — the OIDC authorization-code flow**, so a real identity
   broker can authenticate a seeded account against Fauxbus.  Principle 1
@@ -466,6 +619,57 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.16** (2026-08-24) — **Auth slice A shipped**: the
+  client-credentials grant at `POST /v2/oauth2/token`, built
+  resource-server-generic, plus opt-in issued-token mode.  Full write-up
+  in the v0.2 section above; what belongs in a changelog is what the
+  building taught, and it was mostly about temptation.
+
+  **Every interesting decision here was a chance to lie helpfully.**
+  Multi-resource-server scopes could have issued for whichever service
+  parsed first and dropped the rest — the consumer would have received a
+  token that looked perfectly valid and failed later somewhere else.  An
+  `openid` request could have been answered without the `id_token` this
+  document promises, surfacing as a `KeyError` in the consumer's code
+  pointing nowhere near the cause.  `authorization_code` could have been
+  refused with `unsupported_grant_type`, which is a real OAuth error and
+  a slander: Globus supports that grant fine, Fauxbus is the one that
+  hasn't built it.  Each of those is now a loud 501 naming whose gap it
+  is.  Principle 2 turns out not to be about unrouted paths at all — it
+  is about the moment a fake could plausibly answer and shouldn't.
+
+  **The fake had to be less helpful than it wanted to be.**  The token
+  endpoint's error body carries nothing `GlobusAPIError` parses, so
+  `.code` and `.message` come back `None` and a consumer is left with a
+  status and raw JSON.  Adding a `detail` would have fixed that in five
+  characters and made the fake kinder than the service, which is how a
+  consumer ships error handling that only works in CI.  The blindness is
+  reproduced deliberately and pinned by a conformance test, because a
+  claim no test checks is the species of bug this changelog is mostly
+  made of.
+
+  **A promise in this document turned out to be wrong, and the code was
+  right.**  The v0.2.15 entry above said issued-token mode would check
+  four things, scope among them.  Three shipped.  Per-operation scope
+  enforcement was left out because the two Groups scope *names* are
+  SDK-grounded while the mapping from operations to scopes is not, and
+  the failure modes are not symmetric: a fake that rejects calls the real
+  service allows breaks working consumer code, where one that permits too
+  much merely fails to catch a bug.  The honest fix was to correct the
+  spec rather than build the guess — noted here because the reflex runs
+  the other way.
+
+  **Two error dialects in one server**, which looked like a wart and is
+  not.  Everything answers `{"code", "detail"}`; the token endpoint
+  answers RFC 6749's `{"error", "error_description"}`.  Globus really
+  does speak both, and its own fixture proves it — including a 401 for
+  `invalid_grant` where the RFC says 400.  The recording wins over the
+  standard the service was implementing, every time.
+
+  33 new tests, 126 total.  Building the thing added four fresh entries
+  to the recording list, all of them questions the pre-build audit had no
+  way to ask.
 
 - **v0.2.15** (2026-08-24) — Auth got a consumer and a design review, and
   the grading happened before the code for once.

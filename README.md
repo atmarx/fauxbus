@@ -34,12 +34,14 @@ fails the way the real service partially fails.
 
 **Status: early but real.**  The complete `GroupsClient` surface of
 globus-sdk 4.8.1 is implemented — all fourteen methods, all eleven
-batch membership verbs — and the conformance suite drives every one of
-the fourteen through the actual globus-sdk, unmodified, including the
-SDK's retry layer recovering through an injected 429.  Response shapes
-not yet backed by a recording are marked `PROVISIONAL` in code and
-tracked as conformance obligations.  Nothing is stable yet — see
-[SPEC.md](SPEC.md) for the full design.
+batch membership verbs — plus the OAuth2 **client-credentials grant** at
+`POST /v2/oauth2/token`, so a service can fetch a token as itself and
+then spend it.  The conformance suite drives all of it through the
+actual globus-sdk, unmodified, including the SDK's retry layer
+recovering through an injected 429.  Response shapes not yet backed by a
+recording are marked `PROVISIONAL` in code and tracked as conformance
+obligations.  Nothing is stable yet — see [SPEC.md](SPEC.md) for the
+full design.
 
 ## Fake, not mock
 
@@ -66,6 +68,38 @@ fauxbus serve --port 9800
 Point `globus_sdk.GroupsClient(...)` at that port instead of the real
 service host and run your existing test suite.  Other Globus clients
 will meet honest `501`s until their surfaces exist — see below.
+
+## Tokens
+
+By default any bearer token works, and its identity is a stable function
+of the token string — `t-alice` is the same caller on every run, on
+every machine.  That is usually what you want in a test.
+
+When you need the real thing, register a confidential client in the seed
+document and fetch a token the way your service will in production:
+
+```python
+from globus_sdk import ConfidentialAppAuthClient, AccessTokenAuthorizer, GroupsClient
+
+auth = ConfidentialAppAuthClient(CLIENT_ID, SECRET, base_url="http://localhost:9800")
+tokens = auth.oauth2_client_credentials_tokens(
+    "urn:globus:auth:scope:groups.api.globus.org:all"
+)
+access_token = tokens.by_resource_server["groups.api.globus.org"]["access_token"]
+
+groups = GroupsClient(base_url="http://localhost:9800",
+                      authorizer=AccessTokenAuthorizer(access_token))
+```
+
+A Globus client *is* an identity, so that token acts as the client
+itself — create a group with it and the client shows up as its own
+`admin`, exactly as it would against the real service.
+
+Start with `--require-issued-tokens` and Fauxbus stops accepting
+made-up tokens: it checks that a token was issued here, hasn't expired
+(on the logical clock — `POST /_fauxbus/tick` ages it, no sleeping), and
+is good for the service being called.  Three production failures you
+otherwise cannot write a test for.
 
 ## In a compose stack
 

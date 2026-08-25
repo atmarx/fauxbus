@@ -23,7 +23,8 @@ def index(ctx: Ctx) -> tuple[int, Any]:
     return 200, {
         "fauxbus": __version__,
         "sdk_pin": SDK_PIN,
-        "imitates": ["groups v2"],
+        "imitates": ["groups v2", "auth v2 (client_credentials)"],
+        "require_issued_tokens": ctx.server.require_issued_tokens,
         "control": [
             "GET  /_fauxbus/state",
             'POST /_fauxbus/reset (to canonical seed; body {"to": "empty"} for blank)',

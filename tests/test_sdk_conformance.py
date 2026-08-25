@@ -25,9 +25,12 @@ if os.environ.get("FAUXBUS_REQUIRE_CONFORMANCE"):
 else:
     globus_sdk = pytest.importorskip("globus_sdk")
 
+from conftest import CLIENT_ID, CLIENT_SECRET, GROUPS_SCOPE  # noqa: E402
 from globus_sdk import (  # noqa: E402
     AccessTokenAuthorizer,
     BatchMembershipActions,
+    ClientCredentialsAuthorizer,
+    ConfidentialAppAuthClient,
     GroupPolicies,
     GroupsAPIError,
     GroupsClient,
@@ -245,3 +248,82 @@ def test_sdk_retry_layer_survives_an_injected_429(fx, client):
 
     _, armed, _ = fx.get("/_fauxbus/failures")
     assert armed["failures"] == []  # the injected failure was really served
+
+
+# --------------------------------------------- auth slice A: client_credentials
+
+
+def confidential_client(base_url: str, secret: str = CLIENT_SECRET):
+    return ConfidentialAppAuthClient(CLIENT_ID, secret, base_url=base_url)
+
+
+def test_client_credentials_grant_drives_end_to_end(registered):
+    """The tether's newest strand: real SDK, real grant, real token, real call.
+
+    Nothing is monkeypatched and nothing is hand-assembled.  The SDK
+    builds the form POST and the Basic header, Fauxbus mints a token, and
+    the same SDK then spends that token against Groups — which is the
+    only way to prove the two halves of the fake agree about who the
+    caller is.  A response the SDK could parse but whose identity was
+    wrong would pass every wire-level test and fail here.
+    """
+    client = confidential_client(registered.base_url)
+    tokens = client.oauth2_client_credentials_tokens(GROUPS_SCOPE)
+
+    # by_resource_server is the SDK's own view of the document, and
+    # building it is what would have raised KeyError on a missing
+    # 'other_tokens'.
+    token_data = tokens.by_resource_server["groups.api.globus.org"]
+    assert token_data["token_type"] == "Bearer"
+    assert token_data["scope"] == GROUPS_SCOPE
+
+    groups = GroupsClient(
+        base_url=registered.base_url,
+        authorizer=AccessTokenAuthorizer(token_data["access_token"]),
+    )
+    created = groups.create_group({"name": "SDK round trip", "description": ""})
+    (membership,) = created["my_memberships"]
+    assert membership["identity_id"] == CLIENT_ID
+    assert membership["username"] == f"{CLIENT_ID}@clients.auth.globus.org"
+
+
+def test_by_scopes_indexes_the_response_too(registered):
+    # The SDK offers two views of the same document; both are built from
+    # fields Fauxbus has to get right, so both are worth touching.
+    tokens = confidential_client(registered.base_url).oauth2_client_credentials_tokens(GROUPS_SCOPE)
+    assert tokens.by_scopes[GROUPS_SCOPE]["resource_server"] == "groups.api.globus.org"
+
+
+def test_client_credentials_authorizer_fetches_its_own_token(registered):
+    """The way a service actually uses this grant in production.
+
+    ClientCredentialsAuthorizer takes the confidential client and the
+    scopes, then goes and gets a token when the first request needs one
+    — no explicit grant call in the consumer's code at all.  If Fauxbus
+    only satisfied the explicit path, this is where that would show.
+    """
+    authorizer = ClientCredentialsAuthorizer(confidential_client(registered.base_url), GROUPS_SCOPE)
+    groups = GroupsClient(base_url=registered.base_url, authorizer=authorizer)
+    groups.create_group({"name": "Self-serve", "description": ""})
+    assert [g["name"] for g in groups.get_my_groups()] == ["Self-serve"]
+
+
+def test_the_token_endpoints_errors_really_are_that_opaque(registered):
+    """Pinning an unflattering fact so a later SDK bump cannot hide it.
+
+    The token endpoint answers RFC 6749's ``{"error": ...}`` body, which
+    carries none of the fields GlobusAPIError parses — so ``.code`` and
+    ``.message`` come back as None and a consumer is left with the status
+    and the raw body.  Fauxbus deliberately does not improve on this (see
+    errors.OAuthError): a fake that is kinder than the service hides a
+    rough edge the consumer meets in production anyway.  The assertion
+    exists because that claim is written in a docstring, and a claim no
+    test checks is the kind this project has already shipped three of.
+    """
+    client = confidential_client(registered.base_url, secret="wrong")
+    with pytest.raises(globus_sdk.GlobusAPIError) as exc:
+        client.oauth2_client_credentials_tokens(GROUPS_SCOPE)
+    assert exc.value.http_status == 401
+    assert exc.value.code is None
+    assert exc.value.message is None
+    assert exc.value.raw_json["error"] == "invalid_client"

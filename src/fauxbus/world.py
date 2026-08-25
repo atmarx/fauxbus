@@ -1,4 +1,5 @@
-"""The in-memory world: groups, memberships, policies, preferences.
+"""The in-memory world: groups, memberships, policies, preferences,
+plus the OAuth2 client registry and the tokens it has issued.
 
 Truth grades (see SPEC.md "Recorded, documented, provisional"):
 - Document shapes for groups, my_groups entries, policies, and DELETE
@@ -15,9 +16,21 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from .auth import Identity, derive_identity, placeholder_username
-from .errors import ApiError, group_not_found, validation_error
-from .ids import sequential_id
+from .auth import (
+    Identity,
+    client_username,
+    derive_identity,
+    placeholder_username,
+    resource_server_for_scope,
+)
+from .errors import (
+    ApiError,
+    group_not_found,
+    invalid_client,
+    not_implemented,
+    validation_error,
+)
+from .ids import access_token, sequential_id
 
 ROLES = ("member", "manager", "admin")
 STATUSES = ("active", "declined", "invited", "left", "pending", "rejected", "removed")
@@ -140,6 +153,82 @@ class Group:
         return identity_id in self.memberships
 
 
+# RECORDED (globus_sdk/testing/data/auth/oauth2_client_credentials_tokens.py
+# and oauth2_exchange_code_for_tokens.py, 4.8.1): both fixtures answer
+# with expires_in 172800 — 48 hours.  Fauxbus uses the same number so a
+# consumer that hard-codes an expectation from the fixture still passes.
+DEFAULT_EXPIRES_IN = 172800
+
+# The grant types Globus Auth actually supports.  This list is the hinge
+# of a distinction principle 2 cares about: a grant on this list that
+# Fauxbus has not built yet is a *Fauxbus* gap and gets a loud 501, while
+# a grant that is not on it is a *client* error and gets the RFC 6749
+# answer, unsupported_grant_type.  Answering "unsupported_grant_type" for
+# authorization_code would be a lie about the real service — it supports
+# that grant perfectly well; we are the ones who don't yet.
+#
+# DOCUMENTED: authorization_code, client_credentials, and refresh_token
+# appear together in the SDK's client-registration examples
+# (globus_sdk/services/auth/client/service_client.py); the dependent-token
+# grant URN is named in OAuthDependentTokenResponse's docstring.
+GLOBUS_GRANT_TYPES = (
+    "authorization_code",
+    "client_credentials",
+    "refresh_token",
+    "urn:globus:auth:grant_type:dependent_token",
+)
+
+# Which of those Fauxbus can actually perform today.  Everything else in
+# GLOBUS_GRANT_TYPES hits the 501 wall with a pointer to the tracker.
+IMPLEMENTED_GRANT_TYPES = ("client_credentials",)
+
+
+@dataclass
+class OAuthClient:
+    """A registered confidential client — a piece of software with credentials.
+
+    The thing to internalize: in Globus Auth a client *is an identity*.
+    ``client_id`` is an identity UUID, and a token minted for this client
+    acts as that identity everywhere downstream — so a provisioner
+    service that fetches its own token and then calls Groups appears in
+    the membership list under its own name, exactly like a person would.
+    That is why ``identity_id`` here is not a separate field: it would
+    only ever be a second copy of ``client_id``.
+    """
+
+    client_id: str
+    secret: str
+    name: str
+    username: str
+
+
+@dataclass
+class IssuedToken:
+    """One access token this world has minted, and everything it authorizes.
+
+    Only consulted in two places, and they are worth telling apart:
+
+    - ``identity_for_token`` looks here first *always*, so a token
+      Fauxbus issued resolves to the client it was issued to instead of
+      falling through to the derive-from-the-string default.  Without
+      this, a service could fetch a token as itself and then be seen by
+      Groups as some hash of the token text — a fake disagreeing with
+      itself about who just called.
+    - ``require_issued`` consults it only under
+      ``--require-issued-tokens``, where the absence of a record is what
+      makes an unknown token a 401.
+    """
+
+    token: str
+    client_id: str
+    identity_id: str
+    username: str
+    resource_server: str
+    scopes: list[str]
+    grant_type: str
+    expires_at: int  # logical clock, not wall clock — see World.clock
+
+
 class World:
     """All mutable state, plus its (de)serialization for seed/state.
 
@@ -160,6 +249,8 @@ class World:
         self.groups: dict[str, Group] = {}
         self.pinned_identities: dict[str, dict[str, str]] = {}  # token -> {identity_id, username}
         self.preferences: dict[str, dict[str, Any]] = {}  # identity_id -> prefs doc
+        self.clients: dict[str, OAuthClient] = {}  # client_id -> registration
+        self.tokens: dict[str, IssuedToken] = {}  # access token -> what it authorizes
 
     # ------------------------------------------------------------------ ids
 
@@ -175,10 +266,22 @@ class World:
     # ----------------------------------------------------------- identities
 
     def identity_for_token(self, token: str) -> Identity:
-        # Pins win over derivation: a seed's ``identities`` section maps
-        # chosen tokens to chosen UUIDs (how tests pin alice); any other
-        # token falls through to the hash-derived identity.  Either way
-        # the answer never changes between calls — that's the contract.
+        # Three layers, most specific first.
+        #
+        # 1. A token Fauxbus *issued* knows exactly who it belongs to,
+        #    and that beats everything: the token endpoint already
+        #    decided this question when it minted the thing.  Skipping
+        #    this layer would let a service fetch a token as itself and
+        #    then be seen by Groups as a hash of the token text.
+        # 2. Pins win over derivation: a seed's ``identities`` section
+        #    maps chosen tokens to chosen UUIDs (how tests pin alice).
+        # 3. Anything else falls through to the hash-derived identity.
+        #
+        # Either way the answer never changes between calls — that's the
+        # contract.
+        issued = self.tokens.get(token)
+        if issued is not None:
+            return Identity(identity_id=issued.identity_id, username=issued.username)
         pin = self.pinned_identities.get(token)
         if pin is not None:
             return Identity(identity_id=pin["identity_id"], username=pin["username"])
@@ -190,7 +293,204 @@ class World:
         for pin in self.pinned_identities.values():
             if pin["identity_id"] == identity_id:
                 return pin["username"]
+        # A registered client is an identity too (see OAuthClient), so a
+        # service added to a group by its client_id renders under its own
+        # name rather than as a bare UUID placeholder.
+        client = self.clients.get(identity_id)
+        if client is not None:
+            return client.username
         return placeholder_username(identity_id)
+
+    # ------------------------------------------------------- oauth2 clients
+
+    def authenticate_client(self, client_id: str, secret: str) -> OAuthClient:
+        """Prove a confidential client is itself, or raise invalid_client.
+
+        Two deliberate choices here.
+
+        The comparison is a plain ``!=``.  A real service must use
+        ``secrets.compare_digest``, because a byte-at-a-time comparison
+        leaks the secret through timing.  Fauxbus does not, and says so
+        rather than performing the ritual: the secrets in this registry
+        arrive from a seed file that lives in the consumer's repository,
+        there is nothing here worth stealing, and dressing a fake in
+        security-grade primitives invites someone to mistake it for one.
+        If you are copying this loop into something real, that is the
+        line to change.
+
+        The *error code* is the same either way — an unknown client and a
+        wrong secret both answer ``invalid_client`` — because that is
+        what the real service does and a consumer's error handling should
+        meet the same wall against the fake.  Only the human-facing
+        ``error_description`` distinguishes them, which is safe precisely
+        because the SDK surfaces it nowhere (see errors.OAuthError): a
+        test cannot come to depend on the distinction, and a developer
+        curling the endpoint still learns whether they mistyped the id or
+        the secret.
+        """
+        client = self.clients.get(client_id)
+        if client is None:
+            raise invalid_client(
+                f"no client is registered with id {client_id!r}. Register one in the "
+                f"seed document's 'clients' section."
+            )
+        if client.secret != secret:
+            raise invalid_client(f"the secret presented for client {client_id!r} does not match")
+        return client
+
+    def resource_server_for_request(self, scopes: list[str]) -> str:
+        """Which single service these scopes are asking for.
+
+        A Globus access token belongs to exactly one resource server, and
+        the request names it only indirectly — inside the scope strings.
+        So this is the function that decides what the token endpoint is
+        about to mint, and every way it can fail is a loud one.
+
+        Asking for scopes across *two* services is legal at the real
+        service: it answers with a primary token plus the rest in
+        ``other_tokens``.  Fauxbus does not build that yet, and the
+        tempting shortcut — issue for whichever resource server appeared
+        first and quietly drop the other scopes — is the exact silent
+        wrong answer principle 2 forbids.  The consumer would get a token
+        that looks fine and fails later against a service it was never
+        good for.  501 instead, with the tracker link.
+        """
+        by_server: dict[str, list[str]] = {}
+        for scope in scopes:
+            if "[" in scope or "]" in scope:
+                raise not_implemented(
+                    f"Fauxbus does not implement dependent scopes, and {scope!r} declares "
+                    f"one. Real client code needs them?"
+                )
+            resource_server = resource_server_for_scope(scope)
+            if resource_server is None:
+                raise not_implemented(
+                    f"Fauxbus cannot tell which resource server the scope {scope!r} belongs "
+                    f"to, so it will not guess which service to mint a token for. Real "
+                    f"client code uses this scope form?"
+                )
+            by_server.setdefault(resource_server, []).append(scope)
+        if len(by_server) > 1:
+            raise not_implemented(
+                f"Fauxbus issues one token per request, and these scopes span "
+                f"{sorted(by_server)}. The real service answers multi-resource-server "
+                f"requests with a primary token plus 'other_tokens'; that is a later "
+                f"slice. Real client code needs it?"
+            )
+        return next(iter(by_server))
+
+    def issue_token(
+        self,
+        client: OAuthClient,
+        *,
+        resource_server: str,
+        scopes: list[str],
+        grant_type: str,
+        expires_in: int = DEFAULT_EXPIRES_IN,
+    ) -> IssuedToken:
+        """Mint one access token and remember what it authorizes.
+
+        The expiry is on the *logical* clock (World.clock), not the wall
+        clock — so a test expires a token by POSTing to
+        ``/_fauxbus/tick``, deterministically, rather than by sleeping
+        for two days.  SPEC principle 3 holds here without an exception,
+        because Fauxbus is the only thing that will ever validate this
+        token.  Signed ID tokens are the one place it cannot hold, and
+        that is a Slice B problem.
+        """
+        counter = self.counters.get("access_token", 0)
+        self.counters["access_token"] = counter + 1
+        issued = IssuedToken(
+            token=access_token(counter),
+            client_id=client.client_id,
+            identity_id=client.client_id,  # a client IS its identity — see OAuthClient
+            username=client.username,
+            resource_server=resource_server,
+            scopes=list(scopes),
+            grant_type=grant_type,
+            expires_at=self.clock + expires_in,
+        )
+        self.tokens[issued.token] = issued
+        return issued
+
+    def token_response(self, issued: IssuedToken) -> dict[str, Any]:
+        """The token document, field for field as globus-sdk expects it.
+
+        RECORDED from
+        ``globus_sdk/testing/data/auth/oauth2_client_credentials_tokens.py``
+        (4.8.1).  ``other_tokens`` is the field to be careful about: it is
+        present unconditionally, as ``[]``, even when a single token is
+        issued.  That is not decoration — the SDK's
+        ``OAuthTokenResponse._init_rs_dict`` indexes ``self["other_tokens"]``
+        with no ``.get`` and no default, so omitting it raises a KeyError
+        inside the SDK before the consumer's code ever sees the response.
+
+        ``expires_in`` is computed against the current clock rather than
+        stored, so a token fetched, then aged with ``/_fauxbus/tick``,
+        then re-rendered still reports the truth.
+        """
+        return {
+            "access_token": issued.token,
+            "scope": " ".join(issued.scopes),
+            "expires_in": max(0, issued.expires_at - self.clock),
+            "token_type": "Bearer",
+            "resource_server": issued.resource_server,
+            "other_tokens": [],
+        }
+
+    def require_issued(self, token: str, resource_server: str | None) -> IssuedToken:
+        """Issued-token mode: the three checks the permissive default cannot make.
+
+        Off by default (``--require-issued-tokens`` turns it on), because
+        every consumer written against Fauxbus so far assumes any bearer
+        token works and a fake that silently starts rejecting them broke
+        its users to gain a feature nobody asked for.
+
+        Turned on, it catches what the derive-from-the-string model
+        structurally cannot: a token nobody issued, a token that has
+        aged out, and a token minted for a different service.  Those are
+        three real production failures that a consumer currently cannot
+        write a test for, because the fake says yes to everything.
+
+        What is deliberately *not* checked is per-operation scope — that
+        a token carrying only ``view_my_groups_and_memberships`` may not
+        create a group.  The scope names are SDK-grounded, but which
+        operations each one covers is not, and a fake that rejects calls
+        the real service allows is worse than one that permits too much:
+        the first breaks working consumer code, the second only fails to
+        catch a bug.  It is on the recording list.
+        """
+        issued = self.tokens.get(token)
+        if issued is None:
+            raise ApiError(
+                401,
+                "UNAUTHORIZED",
+                "This Fauxbus runs with --require-issued-tokens, and no token by that "
+                "name was issued here. Get one from POST /v2/oauth2/token, or seed it "
+                "into the state document's 'tokens' section.",
+            )
+        if issued.expires_at <= self.clock:
+            raise ApiError(
+                401,
+                "UNAUTHORIZED",
+                f"Token expired at logical clock {issued.expires_at}; the clock now reads "
+                f"{self.clock}. Fauxbus expires tokens on POST /_fauxbus/tick, never on "
+                f"real time.",
+            )
+        if resource_server is not None and issued.resource_server != resource_server:
+            # PROVISIONAL: 403 rather than 401.  The token is genuine and
+            # introspects fine — it simply is not good at this service —
+            # which reads as "authenticated, not authorized."  Real Globus
+            # services have not been observed answering this case, so the
+            # status is an inference and the recording list says so.
+            raise ApiError(
+                403,
+                "FORBIDDEN",
+                f"That token was issued for {issued.resource_server}, and this endpoint "
+                f"belongs to {resource_server}. A Globus access token is good at exactly "
+                f"one resource server.",
+            )
+        return issued
 
     # --------------------------------------------------------------- groups
 
@@ -656,6 +956,26 @@ class World:
             "counters": dict(sorted(self.counters.items())),
             "identities": {t: dict(p) for t, p in sorted(self.pinned_identities.items())},
             "preferences": {i: dict(p) for i, p in sorted(self.preferences.items())},
+            "clients": {
+                cid: {"secret": c.secret, "name": c.name, "username": c.username}
+                for cid, c in sorted(self.clients.items())
+            },
+            # Issued tokens are world state, so they round-trip like
+            # everything else — which also means a test can *seed* one,
+            # including an already-expired one, without performing the
+            # grant first.
+            "tokens": {
+                tok: {
+                    "client_id": t.client_id,
+                    "identity_id": t.identity_id,
+                    "username": t.username,
+                    "resource_server": t.resource_server,
+                    "scopes": list(t.scopes),
+                    "grant_type": t.grant_type,
+                    "expires_at": t.expires_at,
+                }
+                for tok, t in sorted(self.tokens.items())
+            },
             "groups": {
                 gid: {
                     "name": g.name,
@@ -707,6 +1027,48 @@ class World:
             self.preferences[_require_uuid(str(identity_id), "identity_id")] = {
                 "allow_add": bool(prefs.get("allow_add", True))
             }
+        for client_id, c in _require_mapping(doc.get("clients"), "clients").items():
+            # A client id must be a UUID because a Globus client is an
+            # identity, and identities are UUIDs everywhere else in this
+            # world.  Letting "my-test-client" through here would produce
+            # a group membership whose identity_id fails the same check
+            # one call later, which is a confusing place to learn it.
+            client_id = _require_uuid(str(client_id), "client_id")
+            c = _require_mapping(c, f"clients[{client_id!r}]")
+            if not c.get("secret"):
+                raise validation_error(f"client {client_id} requires a non-empty 'secret'")
+            self.clients[client_id] = OAuthClient(
+                client_id=client_id,
+                secret=str(c["secret"]),
+                name=str(c.get("name") or client_id),
+                username=str(c.get("username") or client_username(client_id)),
+            )
+        for tok, t in _require_mapping(doc.get("tokens"), "tokens").items():
+            # Deliberately *not* checked: that client_id names a client in
+            # the registry above.  A harness that only wants a working
+            # token — or an already-expired one — should not have to
+            # register a client it will never authenticate as.  The
+            # token record carries everything authorization needs on its
+            # own, so a dangling client_id costs nothing but a name.
+            t = _require_mapping(t, f"tokens[{tok!r}]")
+            for required in ("client_id", "resource_server", "expires_at"):
+                if required not in t:
+                    raise validation_error(f"token {tok!r} requires {required!r}")
+            client_id = _require_uuid(str(t["client_id"]), "client_id")
+            identity_id = _require_uuid(str(t.get("identity_id") or client_id), "identity_id")
+            scopes = t.get("scopes") or []
+            if not isinstance(scopes, list) or not all(isinstance(x, str) for x in scopes):
+                raise validation_error(f"token {tok!r} 'scopes' must be a list of strings")
+            self.tokens[str(tok)] = IssuedToken(
+                token=str(tok),
+                client_id=client_id,
+                identity_id=identity_id,
+                username=str(t.get("username") or client_username(client_id)),
+                resource_server=str(t["resource_server"]),
+                scopes=list(scopes),
+                grant_type=str(t.get("grant_type", "client_credentials")),
+                expires_at=_require_int(t["expires_at"], f"token {tok!r} expires_at"),
+            )
         for gid, g in _require_mapping(doc.get("groups"), "groups").items():
             gid = _require_uuid(str(gid), "group id")
             if not isinstance(g, dict) or not g.get("name"):
@@ -772,3 +1134,9 @@ class World:
         self.groups = {}
         self.pinned_identities = {}
         self.preferences = {}
+        # Tokens go with the world.  A reset that left live tokens behind
+        # would leak authorization across the test boundary the reset
+        # exists to draw — and the token counter is in `counters`, so the
+        # next issued token is `fauxbus-at-0` again, as determinism wants.
+        self.clients = {}
+        self.tokens = {}

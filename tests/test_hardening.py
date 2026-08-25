@@ -13,6 +13,7 @@ import socket
 import threading
 
 import pytest
+from conftest import CLIENT_ID, CLIENT_SECRET, GROUPS_SCOPE
 
 from fauxbus.server import MAX_BODY_BYTES, make_server
 
@@ -280,3 +281,57 @@ def test_non_loopback_peer_is_refused(restricted):
     assert verdict("10.10.1.10") is False
     assert verdict("192.168.1.50") is False
     assert verdict("") is False  # unparseable peer fails closed
+
+
+# ------------------------------------------- form bodies (the token endpoint)
+
+
+def test_charset_parameter_does_not_defeat_the_form_parser(registered):
+    """Content-Type is a media type plus parameters, and clients send both.
+
+    ``application/x-www-form-urlencoded; charset=UTF-8`` is the same
+    encoding as the bare type, and a parser that compares the whole
+    header string would decide otherwise — then fall through to the JSON
+    branch and answer "not valid JSON" to a perfectly good form.
+    """
+    status, doc, _ = registered.form_post(
+        "/v2/oauth2/token",
+        {"grant_type": "client_credentials", "scope": GROUPS_SCOPE},
+        basic=(CLIENT_ID, CLIENT_SECRET),
+        content_type="application/x-www-form-urlencoded; charset=UTF-8",
+    )
+    assert status == 200
+    assert doc["resource_server"] == "groups.api.globus.org"
+
+
+def test_a_form_body_that_is_not_utf8_is_blamed_not_crashed(fx):
+    # Bytes that cannot be text at all: an unpaired UTF-16 surrogate's
+    # worth of garbage in a body that claims to be a form.  This must be
+    # a 400 naming the body, never the 500 that says Fauxbus itself broke.
+    host, port = fx.base_url.removeprefix("http://").split(":")
+    payload = b"\xff\xfe\x00scope=x"
+    raw = raw_exchange(
+        fx,
+        b"POST /v2/oauth2/token HTTP/1.1\r\nHost: %s\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\n"
+        b"Content-Length: %d\r\nConnection: close\r\n\r\n%s"
+        % (host.encode(), len(payload), payload),
+    )
+    assert b"400" in raw.split(b"\r\n")[0]
+    assert b"UTF-8" in raw
+
+
+def test_failure_injection_reaches_the_token_endpoint(registered):
+    """The new surface is under /v2/, so the control plane owns it too.
+
+    Worth an explicit test rather than an assumption: a consumer's whole
+    reason for wanting a token endpoint in a fake is to rehearse what
+    happens when Globus Auth is having a bad day.
+    """
+    registered.post("/_fauxbus/failures", {"method": "POST", "path": "/v2/oauth2/*", "status": 503})
+    status, _, _ = registered.form_post(
+        "/v2/oauth2/token",
+        {"grant_type": "client_credentials", "scope": GROUPS_SCOPE},
+        basic=(CLIENT_ID, CLIENT_SECRET),
+    )
+    assert status == 503

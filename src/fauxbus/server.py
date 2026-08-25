@@ -13,7 +13,7 @@ import re
 import sys
 import threading
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +31,11 @@ from .world import World
 # "buffer whatever you're told to."
 MAX_BODY_BYTES = 32 * 1024 * 1024
 
+# The one non-JSON body shape Fauxbus accepts, and only at the OAuth2
+# token endpoint.  RFC 6749 §4.4.2 requires it there; globus-sdk sends it
+# (``AuthLoginClient.oauth2_token`` posts with ``encoding="form"``).
+FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+
 
 @dataclass
 class Ctx:
@@ -42,6 +47,19 @@ class Ctx:
     match: re.Match[str]
     query: dict[str, str]
     body: Any
+    # How the body arrived: "json", "form", or "none".  Every handler but
+    # the token endpoint can ignore this — but the OAuth2 token endpoint
+    # is defined to take a form POST (RFC 6749 §4.4.2), and a consumer who
+    # sends JSON there should be told so by the fake rather than by the
+    # real service in production.
+    body_encoding: str = "json"
+    # The raw request headers.  Handlers normally have no business
+    # reading these — auth is resolved before dispatch and handed over as
+    # ``identity``.  The token endpoint is the exception: it authenticates
+    # a *client* out of an Authorization: Basic header, which is a
+    # different question than "who is the caller", asked at a different
+    # layer.
+    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 Handler = Callable[[Ctx], tuple[int, Any] | tuple[int, Any, dict[str, str]]]
@@ -53,6 +71,12 @@ class Route:
     pattern: re.Pattern[str]
     handler: Handler
     requires_auth: bool
+    # Which Globus service this path belongs to, e.g.
+    # "groups.api.globus.org".  Only consulted under
+    # --require-issued-tokens, where it is what lets Fauxbus reject a
+    # Transfer token presented to Groups.  None means "no resource server
+    # owns this path" — the control plane, and the token endpoint itself.
+    resource_server: str | None = None
 
 
 @dataclass
@@ -132,11 +156,18 @@ class FauxbusServer(ThreadingHTTPServer):
         verbose: bool = False,
         canonical_seed: dict[str, Any] | None = None,
         control_loopback_only: bool = False,
+        require_issued_tokens: bool = False,
     ) -> None:
         super().__init__(address, FauxbusHandler)
         self.world = world or World()
         self.lock = threading.Lock()
         self.allow_anonymous = allow_anonymous
+        # Off by default, and that default is a promise: every consumer
+        # written against Fauxbus so far assumes any bearer token works
+        # (see auth.py).  Turning this on opts into the stricter world
+        # where a token must have been issued here, must not have aged
+        # out, and must be good at the service being called.
+        self.require_issued_tokens = require_issued_tokens
         self.verbose = verbose
         # Off by default, deliberately.  Fauxbus stands in for a service
         # that answers the whole network, and the harness driving it is
@@ -154,11 +185,21 @@ class FauxbusServer(ThreadingHTTPServer):
         # Set at boot (--seed) or via POST /_fauxbus/seed?canonical=true.
         self.canonical_seed = canonical_seed
 
-    def add_route(self, method: str, pattern: str, handler: Handler, *, auth: bool) -> None:
+    def add_route(
+        self,
+        method: str,
+        pattern: str,
+        handler: Handler,
+        *,
+        auth: bool,
+        resource_server: str | None = None,
+    ) -> None:
         # Patterns are anchored ^...$ so "/v2/groups" can never match
         # "/v2/groups/anything" by prefix.  First registered match wins
         # — see groups_api.register for why its order is deliberate.
-        self.routes.append(Route(method, re.compile(f"^{pattern}$"), handler, auth))
+        self.routes.append(
+            Route(method, re.compile(f"^{pattern}$"), handler, auth, resource_server)
+        )
 
     def arm_failure(self, doc: dict[str, Any]) -> FailureRule:
         status = doc.get("status")
@@ -278,13 +319,42 @@ class FauxbusHandler(BaseHTTPRequestHandler):
         """
         self.close_connection = True
 
-    def _read_body(self) -> Any:
+    def _read_body(self) -> tuple[Any, str]:
+        """Read the body and say, honestly, how it was encoded.
+
+        Fauxbus spoke only JSON until the OAuth2 token endpoint arrived,
+        and that endpoint does not: RFC 6749 §4.4.2 defines it as a form
+        POST, and globus-sdk sends one (``oauth2_token`` passes
+        ``encoding="form"``).  So the body parser now dispatches on
+        Content-Type.
+
+        JSON stays the default for a body with no Content-Type at all,
+        which keeps every existing caller working — including tests and
+        curl one-liners that never bothered to set the header.  The
+        *encoding* is returned alongside the parsed body rather than
+        thrown away, because "you sent JSON to an endpoint that takes a
+        form" is a specific mistake worth naming, and by the time a
+        handler sees a dict there is no way left to tell.
+        """
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
         if not raw:
-            return None
+            return None, "none"
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type == FORM_CONTENT_TYPE:
+            try:
+                decoded = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ApiError(400, "BAD_REQUEST", "form body is not valid UTF-8") from None
+            # keep_blank_values so ``scope=`` survives as an empty string
+            # rather than vanishing: "you sent an empty scope" and "you
+            # sent no scope" deserve different answers.  First value wins
+            # on repeats, exactly as the query-string parsing does.
+            return {
+                k: v[0] for k, v in parse_qs(decoded, keep_blank_values=True).items()
+            }, "form"
         try:
-            return json.loads(raw)
+            return json.loads(raw), "json"
         except json.JSONDecodeError:
             raise ApiError(400, "BAD_REQUEST", "request body is not valid JSON") from None
 
@@ -319,7 +389,7 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                 # to clean up after the test that did it (principle 4).
                 if self._maybe_inject(method, path):
                     return
-            body = self._read_body()
+            body, body_encoding = self._read_body()
             route, saw_path = self._find_route(method, path)
             if route is None:
                 if saw_path:
@@ -332,11 +402,20 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                     f"needs it? File an issue: {ISSUES_URL}",
                 )
             with self.server.lock:
-                identity = self._authenticate() if route.requires_auth else None
+                identity = self._authenticate(route) if route.requires_auth else None
                 match = route.pattern.match(path)
                 assert match is not None
                 result = route.handler(
-                    Ctx(self.server.world, self.server, identity, match, query, body)
+                    Ctx(
+                        self.server.world,
+                        self.server,
+                        identity,
+                        match,
+                        query,
+                        body,
+                        body_encoding,
+                        self.headers,
+                    )
                 )
             if len(result) == 2:
                 status, doc = result
@@ -435,12 +514,22 @@ class FauxbusHandler(BaseHTTPRequestHandler):
             # cannot identify is not one we can call local.
             return False
 
-    def _authenticate(self) -> Identity:
+    def _authenticate(self, route: Route) -> Identity:
+        """Turn a bearer token into a caller, or refuse.
+
+        The strict check runs *before* identity resolution and only under
+        --require-issued-tokens.  Note what happens when that flag meets
+        --allow-anonymous: the anonymous token was never issued, so it is
+        rejected.  The two flags pull in opposite directions and strict
+        wins, which is the safe way for a contradiction to resolve.
+        """
         token = parse_bearer(self.headers.get("Authorization"))
         if token is None:
             if not self.server.allow_anonymous:
                 raise unauthorized()
             token = ANONYMOUS_TOKEN
+        if self.server.require_issued_tokens:
+            self.server.world.require_issued(token, route.resource_server)
         return self.server.world.identity_for_token(token)
 
     # ----------------------------------------------------------- verb hooks
@@ -467,7 +556,9 @@ def make_server(
     verbose: bool = False,
     canonical_seed: dict[str, Any] | None = None,
     control_loopback_only: bool = False,
+    require_issued_tokens: bool = False,
 ) -> FauxbusServer:
+    from .auth_api import register as register_auth
     from .control_api import register as register_control
     from .groups_api import register as register_groups
 
@@ -478,7 +569,9 @@ def make_server(
         verbose=verbose,
         canonical_seed=canonical_seed,
         control_loopback_only=control_loopback_only,
+        require_issued_tokens=require_issued_tokens,
     )
+    register_auth(server)
     register_groups(server)
     register_control(server)
     return server
@@ -488,7 +581,9 @@ def boot_line(server: FauxbusServer) -> str:
     from . import SDK_PIN
 
     host, port = server.server_address[:2]
+    strict = " [--require-issued-tokens]" if server.require_issued_tokens else ""
     return (
         f"fauxbus {__version__} listening on http://{host}:{port} — "
-        f"imitating: groups v2 (globus-sdk {SDK_PIN} surface); control plane at /_fauxbus/"
+        f"imitating: groups v2, auth v2 client_credentials (globus-sdk {SDK_PIN} "
+        f"surface){strict}; control plane at /_fauxbus/"
     )

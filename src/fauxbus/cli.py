@@ -38,6 +38,15 @@ def main(argv: list[str] | None = None) -> int:
         "host is shared — the control plane is the surface that can "
         "rewrite the world and forge responses",
     )
+    serve.add_argument(
+        "--require-issued-tokens",
+        action="store_true",
+        help="only accept bearer tokens this server issued, unexpired, and good "
+        "for the service being called. Off by default: Fauxbus's standing "
+        "behavior is to accept any token and derive an identity from the "
+        "string, and every consumer written so far assumes it. Turn this on "
+        "to test the three failures the permissive model cannot produce",
+    )
     serve.add_argument("--verbose", action="store_true", help="log every request")
 
     sub.add_parser("version", help="print version and imitated SDK pin")
@@ -45,7 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "version":
-        print(f"fauxbus {__version__} (imitating the globus-sdk {SDK_PIN} GroupsClient surface)")
+        print(
+            f"fauxbus {__version__} (imitating the globus-sdk {SDK_PIN} GroupsClient "
+            f"and client-credentials token surface)"
+        )
         return 0
 
     world = World()
@@ -70,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         verbose=args.verbose,
         canonical_seed=canonical_seed,
         control_loopback_only=args.control_loopback_only,
+        require_issued_tokens=args.require_issued_tokens,
     )
     # Boot chatter goes to stderr, like all of it — stdout belongs to
     # whoever wants to pipe this process.

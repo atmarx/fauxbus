@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from .auth import GROUPS_RESOURCE_SERVER
 from .errors import validation_error
-from .server import Ctx, FauxbusServer
+from .server import Ctx, FauxbusServer, Handler
 from .world import GET_GROUP_INCLUDES, STATUSES
 
 
@@ -132,7 +133,17 @@ SEG = r"([^/]+)"
 
 
 def register(server: FauxbusServer) -> None:
-    add = server.add_route
+    # Every path below belongs to the Groups resource server, and saying
+    # so is what lets --require-issued-tokens reject a Transfer token
+    # presented here.  The value is threaded through the route table
+    # rather than inferred from the "/v2/groups" prefix because the
+    # imitated surface will eventually hold more than one service, and a
+    # prefix rule would quietly mis-assign the first path that broke it.
+    def add(method: str, pattern: str, handler: Handler, *, auth: bool) -> None:
+        server.add_route(
+            method, pattern, handler, auth=auth, resource_server=GROUPS_RESOURCE_SERVER
+        )
+
     add("GET", "/v2/groups/my_groups", get_my_groups, auth=True)
     add("POST", "/v2/groups", create_group, auth=True)
     add("GET", f"/v2/groups/{SEG}/policies", get_policies, auth=True)
