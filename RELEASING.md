@@ -17,8 +17,13 @@ load-bearing for its first consumer).
 So, until the first recording session is possible:
 
 - Every release ships with the **PROVISIONAL inventory** in its release
-  notes.  Generate it: `grep -rn PROVISIONAL src/`.  The batch
-  membership response document is the standing #1.
+  notes.  Generate it: `grep -rn PROVISIONAL src/ | wc -l`.  The batch
+  membership response document is the standing #1.  Pipe to `wc -l`
+  rather than counting the listing by eye: cutting 0.2.0 turned up a
+  count of "10" that was really the length of a `| head`, reported
+  twice before the release notes forced it to be checked.  Sanity-check
+  it against the previous release's number too — markers do not fall
+  off a codebase unrecorded, so a count that dropped is a miscount.
 - The moment a sacrificial tenancy exists, the recording session
   becomes **release-blocking for every release after it becomes
   possible**.  A gate nobody can run is worse than an honest gap —
