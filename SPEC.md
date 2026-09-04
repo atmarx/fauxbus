@@ -620,6 +620,47 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **Package release: fauxbus 0.2.0** (2026-09-04, tag `v0.2.0`) — Auth
+  slice A reaches consumers.  **A minor, not a patch**, and for once the
+  `.dev0` marker on `main` guessed right: this release adds imitated
+  surface (`POST /v2/oauth2/token`), a new CLI flag
+  (`--require-issued-tokens`), and a transport the server did not speak
+  before (form-encoded request bodies).  New surface is a minor even
+  when nothing existing changed shape — and nothing existing did, which
+  is the other half of the claim: every test that passed against v0.1.2
+  passes here, and 126 pass with `FAUXBUS_REQUIRE_CONFORMANCE=1`.
+
+  It also carries the contract-pin fix from v0.2.14, which is the part a
+  consumer feels without reading a changelog.  `[conformance]` now pins
+  `globus-sdk==4.8.1` exactly rather than `>=4.8.1,<5`, so installing
+  the extra gets the SDK version SPEC actually names.  Anyone who
+  installed the extra between 4.9.0's release and v0.2.14 was conforming
+  against an SDK this document never claimed.
+
+  Cut eleven days after the code was finished, which is eleven days too
+  many — both named Auth consumers were waiting on a `pipx install` for
+  work that was already green.  Noted because the gap was invisible:
+  nothing on the board and nothing in CI reports "finished but
+  unreleased," and a release ritual this careful has no trigger telling
+  anyone to start it.
+
+  **PROVISIONAL inventory: 17 markers**, up one from v0.1.2's 16.  The
+  addition is `world.require_issued` answering 403 rather than 401 for a
+  token presented to the wrong resource server — genuine token,
+  introspects fine, simply not good here, which reads as
+  "authenticated, not authorized."  No fixture covers it and 401 is
+  entirely plausible.  The batch membership response document remains
+  recording target #1.  Slice A added four questions to the recording
+  list in total; only this one is code-marked, because the other three
+  are about surfaces deliberately not built.  Generate the inventory
+  with `grep -rn PROVISIONAL src/` — and count it with `wc -l`, not by
+  eye off a truncated listing.
+
+  The real Globus leg of the conformance tether remains unrun.  No
+  sacrificial tenancy exists anywhere; that absence is why this project
+  is load-bearing for its first consumer, and it is the single item
+  that would retire all 17 markers at once.
+
 - **v0.2.16** (2026-08-24) — **Auth slice A shipped**: the
   client-credentials grant at `POST /v2/oauth2/token`, built
   resource-server-generic, plus opt-in issued-token mode.  Full write-up
