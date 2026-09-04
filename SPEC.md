@@ -496,6 +496,15 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   available.  So the fake imitates the manager-scoped documents and the
   role-gated auth posture, not the owner-scoped ones.
 
+  **Queue position held 2026-09-04**, by operator decision: Groups and
+  Auth were the larger needs, so Transfer waits.  Recorded rather than
+  silently reordered, because the consumer need behind this bullet has
+  not gone anywhere — Root Cellar has already dropped the iRODS
+  Connector for land-then-register, so the completion signal is load-
+  bearing for a design that exists, and the wait is a scheduling
+  decision rather than a reassessment.  Nothing here needs redesigning
+  when it resumes; the surface below is confirmed and still current.
+
   ACLs and guest-collection permissions (group-membership-driven data
   access) were the previously-penciled first slice on the reasoning that
   they are Groups-shaped CRUD.  They keep their place in the roadmap and
