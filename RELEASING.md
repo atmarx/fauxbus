@@ -7,10 +7,12 @@ time in the world.
 ## 0. The tether posture, stated honestly
 
 SPEC's conformance tether has two legs: Fauxbus on every CI run (live
-since v0.2.5), and the real Globus service, env-gated, before each
-release.  The second leg needs a sacrificial tenancy, and **none
-exists anywhere yet** — dev deliberately has no Globus tenancy (that
-absence is why fauxbus is load-bearing for its first consumer).
+since SPEC v0.2.5 — the *spec's* version counter, not a package tag,
+and this file names both kinds within a few lines of each other), and
+the real Globus service, env-gated, before each release.  The second
+leg needs a sacrificial tenancy, and **none exists anywhere yet** —
+dev deliberately has no Globus tenancy (that absence is why fauxbus is
+load-bearing for its first consumer).
 
 So, until the first recording session is possible:
 
