@@ -261,6 +261,39 @@ that permits too much merely fails to catch a bug.  It is on the
 recording list, and this paragraph exists because an earlier draft of
 this document promised four checks and the code shipped three.
 
+**Issued-token mode is a fidelity feature, not an access control**, and
+the difference matters enough to state before someone leans on it.  The
+tokens it checks are minted on the same deterministic counter as
+everything else in Fauxbus: the first access token of a run is always
+the literal string `fauxbus-at-0`, the second `fauxbus-at-1`, and a
+world reset returns the counter to zero so the next one is
+`fauxbus-at-0` again.  That is principle 3 working as designed — a test
+that asserts on a token value has to get the same value every run — and
+it is not going to change, because randomness here would cost more than
+it buys.
+
+What follows from it is the part to be explicit about: **an issued
+token is a known constant, not a secret.**  The three checks above stop
+a token Fauxbus never minted, one the logical clock has aged out, and
+one belonging to another resource server.  They do not stop anyone who
+can reach the port, because that person does not have to guess
+`fauxbus-at-0` — they can read it here.  Do not read "the token was
+issued here" as "the caller is authorized"; it means "this token is one
+of ours," which is a statement about bookkeeping.
+
+This is worth its own paragraph because of one configuration in
+particular.  `--control-loopback-only` closes `/_fauxbus/` to the
+network while deliberately leaving the imitated surface open, and
+`--require-issued-tokens` is the only gate left on that surface.  A
+neighbour on a shared dev host who cannot reach the control plane can
+still send `Authorization: Bearer fauxbus-at-0` and be admitted as
+whichever client minted it.  The flag combination narrows the blast
+radius from "rewrite the world" to "act as a client inside it," which
+is a real improvement and is not the same as a boundary.  The
+paragraph above about the control plane still governs: a tool whose
+whole value is being believed can be attacked by being made to lie, and
+no token check changes that.
+
 One divergence worth naming, because it will look like a bug.  The SDK
 computes `expires_at_seconds` as `int(time.time() + expires_in)` — real
 wall-clock time, in the consumer's process, outside anything Fauxbus

@@ -335,3 +335,80 @@ def test_failure_injection_reaches_the_token_endpoint(registered):
         basic=(CLIENT_ID, CLIENT_SECRET),
     )
     assert status == 503
+
+
+# ---------------------------------------------------------------------------
+# v0.2 blue-team pass: issued-token mode is bookkeeping, not a boundary
+#
+# The 2026-08-06 review predates Auth entirely, so nothing had ever read
+# --require-issued-tokens adversarially.  It reads like an access control
+# — "the token was issued here", "a Transfer token presented to Groups is
+# refused" — and the three checks it makes are real.  What it never said
+# is that the token being checked is a known constant.
+#
+# These tests pin the reality, not a wish.  Fauxbus should NOT start
+# minting unguessable tokens: principle 3 is load-bearing, and a test
+# that asserts on a token value has to get the same value every run.  So
+# the fix for the finding was a SPEC paragraph, and this is the thing
+# that keeps the paragraph honest — if someone ever "hardens" the token
+# generator, these fail and point at the docs that would then be wrong.
+# ---------------------------------------------------------------------------
+
+
+def _mint(client, scope=GROUPS_SCOPE):
+    status, doc, _ = client.form_post(
+        "/v2/oauth2/token",
+        {"grant_type": "client_credentials", "scope": scope},
+        basic=(CLIENT_ID, CLIENT_SECRET),
+    )
+    assert status == 200, doc
+    return doc["access_token"]
+
+
+def test_the_first_issued_token_is_a_documented_constant(strict):
+    """SPEC's Auth posture says the first token of a run is `fauxbus-at-0`.
+
+    If this fails, the SPEC paragraph headed "Issued-token mode is a
+    fidelity feature, not an access control" is now describing something
+    the code no longer does — fix the prose or revert the generator, but
+    do not leave them disagreeing.  That disagreement is this project's
+    single most repeated bug.
+    """
+    strict.delete("/_fauxbus/seed")
+    strict.post("/_fauxbus/reset")
+    strict.post("/_fauxbus/seed", {"clients": {CLIENT_ID: {"secret": CLIENT_SECRET}}})
+    assert _mint(strict) == "fauxbus-at-0"
+
+
+def test_a_stranger_who_knows_the_constant_is_admitted(strict):
+    """The security consequence, stated as an executable fact.
+
+    Nobody has to steal this token or guess it — it is in the
+    documentation.  Under --control-loopback-only the imitated surface
+    stays open while /_fauxbus/ closes, and this is the only gate left on
+    it.  The test asserts 200 deliberately: that is the current, intended,
+    documented behaviour, and someone proposing to change it should have
+    to change this test and read why it exists first.
+    """
+    strict.delete("/_fauxbus/seed")
+    strict.post("/_fauxbus/reset")
+    strict.post("/_fauxbus/seed", {"clients": {CLIENT_ID: {"secret": CLIENT_SECRET}}})
+    _mint(strict)  # minted by the legitimate client; the stranger never sees it
+
+    status, _, _ = strict.get(
+        "/v2/groups/my_groups", headers={"Authorization": "Bearer fauxbus-at-0"}
+    )
+    assert status == 200
+
+
+def test_issued_mode_still_refuses_a_token_it_never_minted(strict):
+    """The half that IS load-bearing, so the pair reads honestly together.
+
+    "Not an access control" must not be misread as "does nothing."  A
+    token Fauxbus never issued is refused, and that is the check a
+    consumer cannot write a test for against a permissive fake.
+    """
+    status, _, _ = strict.get(
+        "/v2/groups/my_groups", headers={"Authorization": "Bearer never-minted-here"}
+    )
+    assert status == 401
