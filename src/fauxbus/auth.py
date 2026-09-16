@@ -50,8 +50,38 @@ _URL_PREFIX = "https://auth.globus.org/scopes/"
 # they are plain words, and Globus Auth itself is what answers for them.
 # RECORDED for ``openid`` (the SDK's own openid token fixture names
 # auth.globus.org as the resource server); ``profile`` and ``email`` are
-# OIDC Core §5.4, ``offline_access`` is OIDC Core §11.
-OIDC_SCOPES = frozenset({"openid", "profile", "email", "offline_access"})
+# OIDC Core §5.4.
+OIDC_SCOPES = frozenset({"openid", "profile", "email"})
+
+# ``offline_access`` (OIDC Core §11) is OIDC too, and it used to sit in
+# the set above.  Taking it out is a bug fix, and the bug is worth
+# keeping as a lesson: those three scopes name a *service* — Globus Auth
+# is what answers for them, so mapping them to auth.globus.org is the
+# same move as parsing a resource server out of a URN.  offline_access
+# names no service at all.  It is a modifier on the request, meaning
+# "and also give me a refresh token."
+#
+# Filing it with the others meant that ``offline_access <groups scope>``
+# — an entirely ordinary thing for a broker to send — looked to Fauxbus
+# like a request spanning two resource servers, and earned a 501 that
+# named the wrong gap and pointed the reader at the wrong issue.  Asked
+# on its own it was worse: a 200, for a token minted against
+# auth.globus.org, carrying no refresh token and no hint that the thing
+# the caller asked for had quietly not happened.
+#
+# The kind-confusion is the general lesson.  A scope grammar has more
+# than one kind of word in it, and a parser that knows only one kind
+# will answer confidently about the others.
+REFRESH_SCOPE = "offline_access"
+
+# The other way the same question gets asked.  globus-sdk does not use
+# the scope at all — its flow managers and its dependent-token call send
+# ``access_type=offline`` instead (globus_sdk/services/auth/
+# flow_managers/authorization_code.py and native_app.py, 4.8.1), which
+# is Google's OAuth2 dialect that Globus adopted.  Two spellings, one
+# request, and a fake that honours neither had better say so for both —
+# otherwise the SDK's own spelling is the one that fails silently.
+OFFLINE_ACCESS_TYPE = "offline"
 
 
 @dataclass(frozen=True)

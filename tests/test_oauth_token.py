@@ -310,6 +310,48 @@ def test_openid_refuses_rather_than_omit_the_id_token(registered):
     assert "id_token" in doc["detail"] or "ID token" in doc["detail"]
 
 
+def test_a_request_for_a_refresh_token_names_the_right_gap(registered):
+    """The same lesson as ``openid``, one field over — and it used to lie.
+
+    ``offline_access`` asks for a ``refresh_token`` field. Fauxbus has no
+    refresh-token grant, so the honest answer is the 501.
+
+    What makes this a regression test and not just a feature test is what
+    it used to do instead. ``offline_access`` was filed with the other
+    OIDC scopes, all of which map to auth.globus.org — so asked next to a
+    Groups scope it looked like a request spanning two resource servers,
+    and the 501 that came back described a multi-token gap that had
+    nothing to do with anything. Asked alone it was worse: a 200, for an
+    auth.globus.org token, silently missing the field the caller asked
+    for. Both are fixed here, and both assertions are load-bearing.
+    """
+    status, doc, _ = fetch(registered, scope=f"offline_access {GROUPS_SCOPE}")
+    assert status == 501
+    assert "refresh" in doc["detail"]
+    assert "other_tokens" not in doc["detail"]  # the gap it used to name
+
+    status, doc, _ = fetch(registered, scope="offline_access")
+    assert status == 501, doc  # was a 200 with no refresh_token in it
+
+
+def test_the_sdk_spelling_of_offline_access_is_refused_too(registered):
+    """globus-sdk does not send the scope — it sends access_type=offline.
+
+    RECORDED: globus_sdk/services/auth/flow_managers/authorization_code.py
+    and native_app.py (4.8.1) both build ``"access_type": (self.refresh_
+    tokens and "offline") or "online"``. Two spellings of one request,
+    and catching only the broker's would mean the SDK — the thing
+    principle 1 calls the contract — is the caller Fauxbus fails quietly.
+    """
+    status, doc, _ = fetch(registered, access_type="offline")
+    assert status == 501
+    assert "refresh" in doc["detail"]
+
+    # "online" is the same parameter saying the opposite thing, and it
+    # must not trip the wire.
+    assert fetch(registered, access_type="online")[0] == 200
+
+
 # ------------------------------------------------- issued-token mode (opt-in)
 
 
@@ -439,6 +481,92 @@ def test_a_seeded_token_authenticates_without_ever_calling_the_grant(strict):
     assert strict.get("/v2/groups/my_groups", token="handmade")[0] == 200
     strict.post("/_fauxbus/tick", {"seconds": 100})
     assert strict.get("/v2/groups/my_groups", token="handmade")[0] == 401
+
+
+def test_a_seeded_token_may_not_wear_a_name_the_mint_has_not_reached(strict):
+    """The collision that used to happen silently, on every run.
+
+    A harness reads the docs, learns that the first token of a world is
+    ``fauxbus-at-0``, and seeds that name with an already-expired record
+    to test its refresh path. Then something performs a grant. The mint
+    hands out ``fauxbus-at-0`` — the same string — and writes straight
+    over the seeded record: the expired token comes back alive, and a
+    token seeded as one identity comes back as another.
+
+    Determinism is what made this certain rather than rare. Two things
+    were guessable by design, so they guessed each other.
+
+    The seed door is where it gets caught, which is the same rule every
+    other check in ``World.load`` follows: a bad document fails the seed
+    call, not three tests later as an inexplicable 200.
+    """
+    status, doc, _ = strict.post(
+        "/_fauxbus/seed",
+        {
+            "clients": {CLIENT_ID: {"secret": CLIENT_SECRET}},
+            "tokens": {
+                "fauxbus-at-0": {
+                    "client_id": CLIENT_ID,
+                    "resource_server": "groups.api.globus.org",
+                    "expires_at": 0,
+                }
+            },
+        },
+    )
+    assert status == 422
+    assert doc["code"] == "VALIDATION_ERROR"
+    # The message has to carry the way out, not just the complaint.
+    assert "counters.access_token" in doc["detail"]
+
+
+def test_the_counter_is_the_line_not_the_name_shape(strict):
+    """Which is what keeps a dump reloadable.
+
+    A state dump carries ``fauxbus-at-0`` in ``tokens`` *and*
+    ``access_token: 1`` in ``counters`` — the token is behind the mint,
+    so there is nothing left to collide with and reloading it is safe.
+    Drawing the line at the counter rather than at the ``fauxbus-at-N``
+    name shape is the difference between a check and a papercut.
+    """
+    status, _, _ = strict.post(
+        "/_fauxbus/seed",
+        {
+            "counters": {"access_token": 1},
+            "clients": {CLIENT_ID: {"secret": CLIENT_SECRET}},
+            "tokens": {
+                "fauxbus-at-0": {
+                    "client_id": CLIENT_ID,
+                    "resource_server": "groups.api.globus.org",
+                    "expires_at": 100,
+                }
+            },
+        },
+    )
+    assert status == 200
+    assert strict.get("/v2/groups/my_groups", token="fauxbus-at-0")[0] == 200
+    # And the next grant really does start past it, rather than trusting
+    # the seed's word for it.
+    _, doc, _ = fetch(strict)
+    assert doc["access_token"] == "fauxbus-at-1"
+
+
+def test_a_name_the_mint_can_never_produce_is_the_harness_to_use(strict):
+    # ``access_token`` emits no leading zeros, so ``fauxbus-at-007`` is
+    # not a name it will ever reach — and a harness may have it.
+    status, _, _ = strict.post(
+        "/_fauxbus/seed",
+        {
+            "clients": {CLIENT_ID: {"secret": CLIENT_SECRET}},
+            "tokens": {
+                "fauxbus-at-007": {
+                    "client_id": CLIENT_ID,
+                    "resource_server": "groups.api.globus.org",
+                    "expires_at": 100,
+                }
+            },
+        },
+    )
+    assert status == 200
 
 
 def test_a_client_id_that_is_not_a_uuid_fails_the_seed_loudly(fx):

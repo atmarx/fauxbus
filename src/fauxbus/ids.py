@@ -46,6 +46,9 @@ def identity_id_for_token(token: str) -> str:
     return str(uuid.uuid5(FAUXBUS_NS, f"identity:{token}"))
 
 
+ACCESS_TOKEN_PREFIX = "fauxbus-at-"
+
+
 def access_token(counter: int) -> str:
     """The Nth access token this world issues, spelled the same every run.
 
@@ -67,4 +70,25 @@ def access_token(counter: int) -> str:
     a credential, and the whole design leans on nobody ever being able
     to mistake a Fauxbus token for a real one.  The name helps with that.
     """
-    return f"fauxbus-at-{counter}"
+    return f"{ACCESS_TOKEN_PREFIX}{counter}"
+
+
+def access_token_number(token: str) -> int | None:
+    """Invert ``access_token``: the N in ``fauxbus-at-N``, or None.
+
+    Lives next to the generator on purpose.  This is the function that
+    answers "is this a name the mint will one day produce?", and the only
+    way it can answer wrongly is by drifting from the line above it — so
+    the two share a file, a prefix constant, and a docstring's worth of
+    attention.
+
+    It parses rather than pattern-matches, and the difference is not
+    pedantry: ``fauxbus-at-007`` and ``fauxbus-at-1x`` are shaped like
+    mint names but ``access_token`` will never emit either, so they are
+    nobody's to collide with and a harness may use them freely.  Only
+    names the mint can actually reach are claimed.
+    """
+    rest = token.removeprefix(ACCESS_TOKEN_PREFIX)
+    if rest == token or not rest.isdigit() or str(int(rest)) != rest:
+        return None
+    return int(rest)

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .auth import parse_basic, split_scopes
+from .auth import OFFLINE_ACCESS_TYPE, REFRESH_SCOPE, parse_basic, split_scopes
 from .errors import (
     invalid_client,
     invalid_request,
@@ -134,6 +134,33 @@ def _require_grant(form: dict[str, str]) -> str:
     )
 
 
+def _refuse_refresh_requests(form: dict[str, str], scopes: list[str]) -> None:
+    """A request for a refresh token gets the 501, not a token without one.
+
+    Exactly the same shape of gap as the ``openid`` check below, one
+    field over.  Both scopes are promises about the *response document*:
+    ``openid`` promises an ``id_token``, ``offline_access`` promises a
+    ``refresh_token``, and Fauxbus can honour neither yet.  Answering 200
+    without the field would move the failure into the consumer's own
+    ``response["refresh_token"]`` — a KeyError wearing a traceback that
+    points at the wrong repository.
+
+    Both spellings are checked because both are in live use and they
+    come from different callers.  A broker sends the scope; globus-sdk
+    sends ``access_type=offline``.  Honouring neither is fine — that is
+    a slice not built.  Catching only one would mean the SDK, the thing
+    principle 1 calls the contract, is the caller Fauxbus fails quietly.
+    """
+    if REFRESH_SCOPE in scopes or form.get("access_type") == OFFLINE_ACCESS_TYPE:
+        raise not_implemented(
+            f"this request asks for a refresh token — {REFRESH_SCOPE!r} in 'scope', or "
+            f"access_type={OFFLINE_ACCESS_TYPE!r} — and Fauxbus does not issue them yet, "
+            f"so it will not answer with a token document that quietly lacks the "
+            f"'refresh_token' field. Drop the request for offline access to get an access "
+            f"token today. Real client code needs to refresh?"
+        )
+
+
 def token(ctx: Ctx) -> tuple[int, Any]:
     form = _require_form(ctx)
     client = _authenticate_client(ctx, form)
@@ -168,6 +195,8 @@ def token(ctx: Ctx) -> tuple[int, Any]:
             "id_tokens arrive with Auth slice B (the authorization-code flow), where "
             "there is an authenticated person for an ID token to describe."
         )
+
+    _refuse_refresh_requests(form, scopes)
 
     resource_server = ctx.world.resource_server_for_request(scopes)
     issued = ctx.world.issue_token(

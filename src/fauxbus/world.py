@@ -30,7 +30,7 @@ from .errors import (
     not_implemented,
     validation_error,
 )
-from .ids import access_token, sequential_id
+from .ids import access_token, access_token_number, sequential_id
 
 ROLES = ("member", "manager", "admin")
 STATUSES = ("active", "declined", "invited", "left", "pending", "rejected", "removed")
@@ -1043,7 +1043,35 @@ class World:
                 name=str(c.get("name") or client_id),
                 username=str(c.get("username") or client_username(client_id)),
             )
+        # What the mint has not yet reached, the mint still owns.  Read
+        # before the loop because the loop must not move it.
+        mints_next = self.counters.get("access_token", 0)
         for tok, t in _require_mapping(doc.get("tokens"), "tokens").items():
+            # A seeded token may not wear a name the mint will later
+            # produce.  Before this check, seeding ``fauxbus-at-0`` and
+            # then performing one grant produced the same string twice:
+            # issue_token wrote over the seeded record in place, without
+            # a word.  A token seeded as already-expired came back alive;
+            # a token seeded as alice came back as the client.  And
+            # because ids here are deterministic, that was not a rare
+            # race — it happened on every run, to anyone who read the
+            # docs and seeded the token name the docs name.
+            #
+            # The line is drawn at the *counter*, not at the name shape,
+            # and that is what keeps the round trip legal: a dump carries
+            # ``fauxbus-at-0`` alongside ``counters.access_token: 1``, so
+            # that token is already behind the mint and reloading it is
+            # exactly as safe as it looks.
+            reserved = access_token_number(str(tok))
+            if reserved is not None and reserved >= mints_next:
+                raise validation_error(
+                    f"token {tok!r} is a name this world's token endpoint has not handed "
+                    f"out yet — the next grant mints {access_token(mints_next)!r} — so the "
+                    f"first grant would silently overwrite this record. Either name the "
+                    f"token something outside the {access_token(0)[:-1]}N space, or set "
+                    f"counters.access_token to {reserved + 1} or more so the mint starts "
+                    f"past it."
+                )
             # Deliberately *not* checked: that client_id names a client in
             # the registry above.  A harness that only wants a working
             # token — or an already-expired one — should not have to
