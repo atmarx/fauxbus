@@ -36,7 +36,10 @@ fails the way the real service partially fails.
 globus-sdk 4.8.1 is implemented — all fourteen methods, all eleven
 batch membership verbs — plus the OAuth2 **client-credentials grant** at
 `POST /v2/oauth2/token`, so a service can fetch a token as itself and
-then spend it.  The conformance suite drives all of it through the
+then spend it, and the **introspection** and **revocation** endpoints
+that go with it, so the service on the receiving end can ask whether
+the token it was handed is real and the service that issued one can
+take it back.  The conformance suite drives all of it through the
 actual globus-sdk, unmodified, including the SDK's retry layer
 recovering through an injected 429.  Response shapes not yet backed by a
 recording are marked `PROVISIONAL` in code and tracked as conformance

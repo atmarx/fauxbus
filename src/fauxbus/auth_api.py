@@ -41,6 +41,8 @@ from .server import Ctx, FauxbusServer
 from .world import GLOBUS_GRANT_TYPES, IMPLEMENTED_GRANT_TYPES, OAuthClient
 
 TOKEN_PATH = "/v2/oauth2/token"
+INTROSPECT_PATH = "/v2/oauth2/token/introspect"
+REVOKE_PATH = "/v2/oauth2/token/revoke"
 
 
 def _require_form(ctx: Ctx) -> dict[str, str]:
@@ -211,6 +213,88 @@ def token(ctx: Ctx) -> tuple[int, Any]:
     return 200, ctx.world.token_response(issued)
 
 
+def _require_token_field(form: dict[str, str]) -> str:
+    """The one field introspection and revocation both take."""
+    token = form.get("token")
+    if not token:
+        raise invalid_request(
+            "'token' is required — the access token being asked about, as a raw string."
+        )
+    # ``token_type_hint`` (RFC 7009 §2.1, RFC 7662 §2.1) is deliberately
+    # ignored rather than validated.  Both RFCs call it a hint the server
+    # MAY use to speed a lookup, and Fauxbus keeps its tokens in one
+    # dict, so there is nothing to speed up.  Rejecting a hint the real
+    # service tolerates would be a fake failing a call that works in
+    # production — the worse direction to be wrong in.
+    return token
+
+
+def introspect(ctx: Ctx) -> tuple[int, Any]:
+    """RFC 7662: the question a *resource server* asks about a token.
+
+    This is the other half of the story slice A started.  The token
+    endpoint is where a service gets a credential; this is where the
+    service on the receiving end asks Globus Auth whether the credential
+    it was just handed is real, who it belongs to, and what it is good
+    for.  Fauxbus has held all three answers since slice A — in
+    ``IssuedToken`` — and had no way for anyone outside to ask.
+
+    Note who is *not* checked: whether the calling client has anything to
+    do with the token.  That is deliberate and it is the difference
+    between this endpoint and revocation next door.  Introspection exists
+    for resource servers, which by definition did not issue the token
+    they are holding; scoping it to the issuing client would make it
+    useless to its only real audience.  Revocation is the opposite — the
+    caller is the owner, and a stranger gets nothing.
+
+    One more thing this endpoint quietly does, which is worth knowing
+    before it surprises you: it makes ``--require-issued-tokens``
+    visible from outside.  Under the permissive default the imitated
+    surface accepts any bearer string at all, but introspection answers
+    only about tokens this Auth *issued*, because that is what the real
+    service can answer about.  So ``t-alice`` works fine against Groups
+    and introspects as ``{"active": false}``, and the fake looks like it
+    is contradicting itself.  It isn't: permissive bearer handling is
+    how Fauxbus decides who is calling, not a claim that Globus minted
+    anything.  If your consumer introspects the tokens it holds, hand it
+    tokens from the token endpoint — which is what the strict flag is
+    for, and this is the endpoint that makes the difference show.
+    """
+    form = _require_form(ctx)
+    _authenticate_client(ctx, form)
+    token = _require_token_field(form)
+    if form.get("include"):
+        # ``include=identity_set`` asks for the caller's linked
+        # identities.  Fauxbus does not model identity linking at all —
+        # there is no way to seed a second identity onto anyone — so the
+        # only answer it could give is a list of one, every time, for
+        # everybody.  That is exactly the plausible-looking answer to an
+        # unanswerable question that principle 2 exists to forbid: a
+        # consumer testing "this user has three linked identities" would
+        # get a passing test against a world that cannot have them.
+        raise not_implemented(
+            f"Fauxbus does not model linked identities, so it will not answer "
+            f"include={form['include']!r} with an identity set of one and let that pass "
+            f"for the real thing. Drop the parameter for the rest of the document. Real "
+            f"client code needs identity sets?"
+        )
+    return 200, ctx.world.introspect(token)
+
+
+def revoke(ctx: Ctx) -> tuple[int, Any]:
+    """RFC 7009: retire a token you issued.
+
+    RECORDED response (``oauth2_revoke_token.py``, 4.8.1): ``{"active":
+    false}``, and the same document comes back whether anything was
+    revoked or not — see ``World.revoke`` for why "nothing happened" and
+    "it's gone" deliberately look identical from out here.
+    """
+    form = _require_form(ctx)
+    client = _authenticate_client(ctx, form)
+    ctx.world.revoke(client, _require_token_field(form))
+    return 200, {"active": False}
+
+
 def register(server: FauxbusServer) -> None:
     # auth=False: this endpoint authenticates a client from a Basic
     # header, not a caller from a Bearer token — see _authenticate_client.
@@ -218,3 +302,9 @@ def register(server: FauxbusServer) -> None:
     # none: the token endpoint is where tokens come *from*, so it cannot
     # require one.
     server.add_route("POST", TOKEN_PATH, token, auth=False)
+    # Both for the same reason as the token endpoint: these authenticate
+    # a *client* from a Basic header, not a caller from a Bearer token.
+    # The token in their body is the subject of the question, never the
+    # credential for asking it.
+    server.add_route("POST", INTROSPECT_PATH, introspect, auth=False)
+    server.add_route("POST", REVOKE_PATH, revoke, auth=False)

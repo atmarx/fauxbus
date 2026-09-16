@@ -162,9 +162,9 @@ alongside one Groups question a consumer's self-serve model does lean
 on: where exactly the manager/admin boundary sits for adding a member
 directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
-Building slice A added four more to that list, and it is worth noticing
-that every one of them is a question the audit could not have asked
-before the code existed:
+Building slice A added four more to that list, and slice A.2 three
+more — and it is worth noticing that every one of them is a question the
+audit could not have asked before the code existed:
 
 1. **The status for a token presented to the wrong resource server.**
    Fauxbus answers 403 — the token is genuine and introspects fine, it
@@ -182,6 +182,22 @@ before the code existed:
    fixture grounds one case; `invalid_client`, `invalid_request`, and
    `unsupported_grant_type` follow RFC 6749 and the status pattern the
    fixture set, which is inference dressed in a standard.
+5. **Introspection's `aud`.**  The fixture shows
+   `[resource server, client_id]` for a token whose resource server
+   happened to be `auth.globus.org` — the one case where the
+   generalization cannot be distinguished from a constant.  Fauxbus
+   generalizes; a recording session settles it in one call.
+6. **`email` and `name` for a client identity.**  The introspection
+   fixture's subject is a person with a mailbox.  A registered client
+   has neither, and both keys are present-and-null rather than absent,
+   on the same reasoning that keeps `other_tokens` present-and-empty:
+   a consumer should meet the same key set every time and learn the
+   answer from the value.  Whether the real service omits them instead
+   is unobserved.
+7. **What revocation tells a client that does not own the token.**
+   Fauxbus answers the same `{"active": false}` it gives for a string
+   that never existed, refusing to become an oracle.  RFC 7009 permits
+   this reading and does not require it.
 
 Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
@@ -410,7 +426,102 @@ The name helps with that.
 everything else: `clients` (a registry of `client_id` → secret, name,
 username) and `tokens` (what each issued token authorizes).  Seeding a
 token directly means a harness can start with an already-expired one
-without performing the grant and ticking the clock first.
+without performing the grant and ticking the clock first — but **not
+under a name the mint has not reached yet.**  Seeding `fauxbus-at-0` and
+then performing one grant used to produce that same string twice, with
+the mint writing over the seeded record in place: a token seeded as
+expired came back alive, a token seeded as one identity came back as
+another, silently and on every run.  Determinism did that — two values
+that were both guessable by design guessed each other.  The seed door
+refuses it now, and draws the line at `counters.access_token` rather
+than at the `fauxbus-at-N` name shape, which is what keeps a state dump
+reloadable: a dump carries `fauxbus-at-0` alongside `access_token: 1`,
+so that token is already behind the mint.
+
+## v0.2 — Auth slice A.2: introspection and revocation
+
+`POST /v2/oauth2/token/introspect` (RFC 7662) and
+`POST /v2/oauth2/token/revoke` (RFC 7009) — the other end of the story
+slice A started.  The token endpoint is where a service *gets* a
+credential; these are where the service on the receiving end asks
+whether the credential it was handed is real, and where the service that
+issued one takes it back.  Fauxbus has held every answer introspection
+needs since slice A, inside `IssuedToken`, and had no way for anyone
+outside to ask.
+
+They were picked as the next slice for a reason worth stating: of
+everything left unbuilt in Auth, **introspection is the shape the SDK
+grounds best.**  `oauth2_token_introspect.py` is a complete recorded
+document, key for key, and the revoke fixture is the bare
+`{"active": false}`.  Slice B's surface, by contrast, is the one place
+the SDK cannot be the whole contract.  Building the recorded thing first
+is what principle 1 means when there is a choice.
+
+**Who may ask differs between the two, and the difference is the
+design.**  Introspection is *not* scoped to the issuing client:
+introspection exists for resource servers, which by definition did not
+issue the token they are holding, so scoping it would make it useless to
+its only audience.  Revocation is the opposite — RFC 7009 §2.1 says
+verify the token was issued to the caller.  Fauxbus verifies, and a
+stranger gets `{"active": false}` with nothing revoked, identical to the
+answer for a string that never existed.  Refusing with an error would
+have turned the endpoint into an oracle: 200 means "never existed," an
+error means "exists, belongs to someone else."  PROVISIONAL — the real
+service has not been observed here.
+
+**Inactive says nothing else.**  Never issued, expired, revoked, and
+issued-to-someone-else all answer the same bare `{"active": false}`
+(RFC 7662 §2.2).  That is correct and it is an annoying afternoon for
+anyone debugging a harness, so: every reason is in `GET /_fauxbus/state`,
+which is out-of-band per principle 4 and under no obligation to be
+discreet.  The imitated surface keeps the secret; the control plane
+does not have one.
+
+**A revoked token keeps its record.**  Deleting it would drop the token
+back through `identity_for_token` to the hash-derived default, where it
+would come back to life as a *different* caller — the fake disagreeing
+with itself about who just called, which is the same failure
+`identity_for_token`'s ordering exists to prevent.  So revocation sets a
+flag, and the flag round-trips through dump/seed like everything else.
+Note what revocation does under the permissive default: nothing visible.
+That surface checks no tokens at all, which is what makes it permissive,
+so it ignores revocation for the same reason it ignores expiry.
+
+**Introspection makes `--require-issued-tokens` visible from outside**,
+and this will look like a contradiction before it looks like a feature.
+Under the permissive default, `t-alice` is a perfectly good caller
+against Groups *and* introspects as inactive, because introspection
+answers about tokens this Auth issued — which is what the real service
+can answer about.  Permissive bearer handling is how Fauxbus decides who
+is calling, not a claim that Globus minted anything.  A consumer whose
+resource-server code introspects the tokens it holds should be handed
+tokens from the token endpoint, which is what the strict flag is for.
+
+**Timestamps: the logical clock reaches the wire as an instant.**  This
+is the first endpoint where it does.  `expires_in` was a duration and
+read the same against either clock; `exp` is a point in time and has to
+pick one.  It picks Fauxbus's — `iat` is the clock at minting, `exp` is
+that plus the lifetime, `/_fauxbus/tick` moves neither but moves *now* —
+which means a fresh world introspects as 1970 and consumer code doing
+`if exp < time.time()` calls every token expired.
+
+The knob for that already existed and only needed saying aloud: **seed
+`"clock": 1767225600`** and every timestamp on this endpoint is a real
+2026 second.  It stays deterministic because the harness chose the
+number.  Fauxbus will not pick a plausible-looking epoch on its own,
+because a fixed epoch that satisfies `exp > now` and `iat < now` at the
+same time does not exist, and one that reads the real clock to find it
+is a wall clock wearing a disguise.
+
+**`include=identity_set` is a loud 501.**  Fauxbus does not model
+identity linking — there is no way to seed a second identity onto
+anyone — so the only answer it could give is a list of one, every time,
+for everybody.  That is exactly the plausible-looking answer to an
+unanswerable question principle 2 forbids: a consumer testing "this user
+has three linked identities" would get a passing test against a world
+that cannot have them.  It is the same `identity_set` the grading audit
+already calls the most consequential provisional in Auth, which is why
+it gets refused rather than guessed twice.
 
 ## The control plane (`/_fauxbus/`)
 
@@ -559,14 +670,29 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
 
   - **Multi-resource-server responses** — the primary token plus the
     rest in `other_tokens`.  Requesting scopes across two services is a
-    loud 501 today.
+    loud 501 today, and it is now the **largest remaining fidelity gap
+    in Auth**: asking for Transfer and Groups in one call is ordinary
+    Globus client code, not an edge case.  Next in this bullet.
   - **`id_token` on an `openid` request**, which needs slice B's signing.
     Refused rather than answered without the field.
   - **Dependent scopes** (`scope[dependent]`) and the dependent-token
     grant.
   - **`refresh_token`** as a grant, and refresh tokens in the response.
+    Requesting one is a loud 501 as of slice A.2, in **both** spellings:
+    the `offline_access` scope that a broker sends, and
+    `access_type=offline`, which is what globus-sdk actually sends
+    (`flow_managers/authorization_code.py`, 4.8.1).  Catching only the
+    first would have left the pinned SDK — the thing principle 1 calls
+    the contract — as the caller Fauxbus failed quietly.
   - **Per-operation scope enforcement** — see Auth posture for why this
     one is a considered omission rather than a queue position.
+
+  **Slice A.2 shipped** — token introspection and revocation, chosen
+  next because they are the best-recorded shapes left in Auth (see their
+  section above).  What this bullet used to promise and now delivers:
+  "token introspection" is built; **identities lookup** and **dependent
+  tokens** keep their place in the roadmap and still have no consumer
+  asking.
 
   **Slice B — the OIDC authorization-code flow**, so a real identity
   broker can authenticate a seeded account against Fauxbus.  Principle 1
@@ -661,6 +787,85 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.17** (2026-09-15) — **Auth slice A.2: introspection and
+  revocation**, plus two bugs found by reading slice A adversarially
+  rather than by a failing test.
+
+  The bugs first, because they are the same species and the species is
+  the lesson: **a value that was deterministic on one side of the code
+  met a value that was deterministic on the other, and nobody checked
+  whether they were the same value.**
+
+  *The mint overwrote seeded tokens, silently, every run.*  `dump()`
+  advertises that a harness may seed an already-issued token "without
+  performing the grant first."  Take it up on that with the name the
+  docs name — `fauxbus-at-0` — and the first grant hands out that string
+  and writes over the record in place.  A token seeded as expired came
+  back alive; a token seeded as one identity came back as another.  Not
+  a race: determinism made it *certain*.  The existing test dodged it by
+  naming its seeded token `"handmade"`, which is why 129 tests never saw
+  it.  Refused at the seed door now, where every other bad-document
+  check lives, with the line drawn at `counters.access_token` so a state
+  dump stays reloadable.
+
+  *`offline_access` was filed as if it named a service.*  It sat in
+  `OIDC_SCOPES` beside `openid`/`profile`/`email`, all of which really
+  do map to `auth.globus.org`.  It names no service at all — it is a
+  modifier meaning "and also give me a refresh token."  So
+  `offline_access <groups scope>`, ordinary broker client code, looked
+  like a two-resource-server request and earned a 501 describing a gap
+  it had nothing to do with, pointing the reader at the wrong issue to
+  file.  Asked alone it was worse: **200**, an `auth.globus.org` token,
+  no refresh token, no hint that the thing the caller asked for had
+  quietly not happened — principle 2's silent wrong answer, live on the
+  endpoint.  Now it gets `openid`'s 501, for `openid`'s reason: both
+  scopes are promises about the response *document*.  `access_type=
+  offline` is refused alongside it, because that is the spelling
+  globus-sdk actually sends.
+
+  The general lesson, and why both got this much comment: **a scope
+  grammar has more than one kind of word in it, and a parser that knows
+  only one kind will answer confidently about the others.**
+
+  Then the slice.  `POST /v2/oauth2/token/introspect` (RFC 7662) and
+  `POST /v2/oauth2/token/revoke` (RFC 7009), chosen next because of
+  everything left unbuilt in Auth they are **the shapes the SDK grounds
+  best** — a complete recorded introspection document, key for key,
+  against a slice B whose authorize leg the SDK cannot ground at all.
+  Building the recorded thing first is what principle 1 means when there
+  is a choice.  Their own section above has the design; the three
+  decisions worth carrying are that introspection is deliberately *not*
+  scoped to the issuing client (resource servers are its only audience,
+  and they never issued anything), that revocation flags rather than
+  deletes (a deleted token would rise again as a hash-derived stranger),
+  and that `{"active": false}` says nothing else at all, with every
+  reason available out-of-band in `/_fauxbus/state` instead.
+
+  It is also the first endpoint where the logical clock reaches the wire
+  as an *instant* rather than a duration, which needed an answer rather
+  than a shrug.  The answer: `exp`/`iat`/`nbf` ride the logical clock, a
+  fresh world therefore introspects as 1970, and the fix for a consumer
+  comparing against `time.time()` is to seed `"clock": 1767225600` —
+  a knob that already existed and only needed saying aloud.  Fauxbus
+  will not pick a plausible epoch on its own: no fixed epoch satisfies
+  `exp > now` and `iat < now` at once, and one that reads the real clock
+  to find one is a wall clock wearing a disguise.
+
+  155 tests, 19 of them through the real globus-sdk — including
+  `oauth2_revoke_token` followed by `oauth2_token_introspect`, which is
+  the confirmation loop the SDK's own docstring tells consumers to use.
+
+  **PROVISIONAL inventory: 21 markers**, up four from v0.2.16's 17 —
+  but **three obligations**, not four.  Introspection's `aud`
+  generalization carries two markers, one in the docstring that explains
+  it and one on the field itself, because a reader who lands on the
+  field should not have to go looking.  The other two are the
+  present-and-null `email`/`name` for a client identity, and what
+  revocation tells a stranger.  All three are listed under "Recorded,
+  documented, provisional" above, and the gap between 4 and 3 is
+  recorded here because this project has shipped a wrong marker count
+  before and the count is exactly the kind of number nobody re-derives.
 
 - **Package release: fauxbus 0.2.0** (2026-09-04, tag `v0.2.0`) — Auth
   slice A reaches consumers.  **A minor, not a patch**, and for once the

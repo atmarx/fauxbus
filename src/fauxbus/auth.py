@@ -39,6 +39,14 @@ ANONYMOUS_TOKEN = ""
 AUTH_RESOURCE_SERVER = "auth.globus.org"
 GROUPS_RESOURCE_SERVER = "groups.api.globus.org"
 
+# RECORDED (globus_sdk/testing/data/auth/oauth2_token_introspect.py,
+# 4.8.1): the ``iss`` an introspection document carries.  It is an https
+# URL and the resource server above is a bare hostname, which looks like
+# an inconsistency and is not — ``iss`` is an OIDC issuer identifier
+# (OIDC Core §2), a URL by specification, while a resource server name
+# is just a name.  Two different kinds of string that happen to rhyme.
+AUTH_ISSUER = "https://auth.globus.org"
+
 # RECORDED (globus_sdk/scopes/data/groups.py, 4.8.1): the URN form is
 # what the SDK's own scope constants expand to, e.g.
 # "urn:globus:auth:scope:groups.api.globus.org:all".

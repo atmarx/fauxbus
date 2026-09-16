@@ -17,6 +17,7 @@ from typing import Any
 from uuid import UUID
 
 from .auth import (
+    AUTH_ISSUER,
     Identity,
     client_username,
     derive_identity,
@@ -226,7 +227,9 @@ class IssuedToken:
     resource_server: str
     scopes: list[str]
     grant_type: str
-    expires_at: int  # logical clock, not wall clock — see World.clock
+    issued_at: int  # logical clock, not wall clock — see World.clock
+    expires_at: int  # same clock
+    revoked: bool = False
 
 
 class World:
@@ -408,6 +411,7 @@ class World:
             resource_server=resource_server,
             scopes=list(scopes),
             grant_type=grant_type,
+            issued_at=self.clock,
             expires_at=self.clock + expires_in,
         )
         self.tokens[issued.token] = issued
@@ -460,23 +464,9 @@ class World:
         the first breaks working consumer code, the second only fails to
         catch a bug.  It is on the recording list.
         """
-        issued = self.tokens.get(token)
+        issued = self.active_token(token)
         if issued is None:
-            raise ApiError(
-                401,
-                "UNAUTHORIZED",
-                "This Fauxbus runs with --require-issued-tokens, and no token by that "
-                "name was issued here. Get one from POST /v2/oauth2/token, or seed it "
-                "into the state document's 'tokens' section.",
-            )
-        if issued.expires_at <= self.clock:
-            raise ApiError(
-                401,
-                "UNAUTHORIZED",
-                f"Token expired at logical clock {issued.expires_at}; the clock now reads "
-                f"{self.clock}. Fauxbus expires tokens on POST /_fauxbus/tick, never on "
-                f"real time.",
-            )
+            raise self._why_not_active(token)
         if resource_server is not None and issued.resource_server != resource_server:
             # PROVISIONAL: 403 rather than 401.  The token is genuine and
             # introspects fine — it simply is not good at this service —
@@ -491,6 +481,185 @@ class World:
                 f"one resource server.",
             )
         return issued
+
+    def active_token(self, token: str) -> IssuedToken | None:
+        """The record for a token that is good *right now*, or None.
+
+        One predicate, three callers, so they cannot drift: strict-mode
+        authentication turns None into a 401, introspection turns it into
+        ``active: false``, and revocation uses it to decide there is
+        nothing to revoke.  Before this existed the expiry rule was
+        spelled out inside ``require_issued`` alone; the moment a second
+        surface needed the same question asked, a copy of that rule would
+        have been a bug waiting for someone to fix only one of them.
+
+        "Good right now" is three things: issued by this world, not
+        revoked, and not aged past its expiry on the logical clock.  What
+        it deliberately does *not* ask is which resource server the token
+        is for — that is a question about a particular call, not about
+        the token, and it belongs to the caller that knows the endpoint.
+        """
+        issued = self.tokens.get(token)
+        if issued is None or issued.revoked or issued.expires_at <= self.clock:
+            return None
+        return issued
+
+    def _why_not_active(self, token: str) -> ApiError:
+        """The same no, said three different ways, because the fix differs.
+
+        ``active_token`` answers yes or no; this answers "and here is
+        what to do about it."  A token nobody issued means seed one or
+        fetch one.  An expired token means tick, or don't.  A revoked
+        token means the harness already did this on purpose and has
+        forgotten.  Three very different afternoons, and a single
+        "unauthorized" would have sent all of them to the same wrong
+        place.
+        """
+        issued = self.tokens.get(token)
+        if issued is None:
+            return ApiError(
+                401,
+                "UNAUTHORIZED",
+                "This Fauxbus runs with --require-issued-tokens, and no token by that "
+                "name was issued here. Get one from POST /v2/oauth2/token, or seed it "
+                "into the state document's 'tokens' section.",
+            )
+        if issued.revoked:
+            return ApiError(
+                401,
+                "UNAUTHORIZED",
+                "That token was revoked through POST /v2/oauth2/token/revoke. Revocation "
+                "is world state, so POST /_fauxbus/reset undoes it along with everything "
+                "else.",
+            )
+        return ApiError(
+            401,
+            "UNAUTHORIZED",
+            f"Token expired at logical clock {issued.expires_at}; the clock now reads "
+            f"{self.clock}. Fauxbus expires tokens on POST /_fauxbus/tick, never on "
+            f"real time.",
+        )
+
+    def introspect(self, token: str) -> dict[str, Any]:
+        """RFC 7662 introspection: what this Auth will say about a token.
+
+        The document is RECORDED, key for key, from
+        ``globus_sdk/testing/data/auth/oauth2_token_introspect.py``
+        (4.8.1).  Two of the values in it are not.
+
+        **The timestamps are on the logical clock.**  This is the first
+        place the clock from principle 3 reaches the wire as an
+        *instant* rather than a duration — ``expires_in`` was 172800
+        against either clock, but ``exp`` is a point in time and has to
+        pick one.  It picks Fauxbus's: ``iat`` is the clock when the
+        token was minted, ``exp`` is that plus its lifetime, and
+        ``/_fauxbus/tick`` is what moves them.  A fresh world starts at
+        zero, so out of the box these read as 1970, and consumer code
+        that compares ``exp`` against ``time.time()`` will call every
+        token expired.
+
+        The knob for that already exists and needed only to be said
+        aloud: seed ``"clock": 1767225600`` and every timestamp on this
+        endpoint is a real 2026 second.  It stays deterministic because
+        *you* chose the number — which is the whole difference between a
+        logical clock and a wall clock, and the reason Fauxbus will not
+        pick a plausible-looking epoch on your behalf.
+
+        **``aud`` is PROVISIONAL.**  The fixture shows
+        ``[resource server, client_id]`` for a token whose resource
+        server happened to be auth.globus.org, so the generalization to
+        any resource server is an inference, not a recording.  It is on
+        the list.
+        """
+        issued = self.active_token(token)
+        if issued is None:
+            # RFC 7662 §2.2, and recorded besides — the SDK's *revoke*
+            # fixture is the bare ``{"active": False}``.  Nothing else
+            # belongs in this document: not a reason, not an error code,
+            # not a hint.  A caller asking about a token is not entitled
+            # to learn whether it ever existed, when it died, or why.
+            #
+            # Which means this one answer covers four different worlds —
+            # never issued, expired, revoked, and issued to someone else
+            # entirely — and a harness debugging "why is my token
+            # inactive" gets nothing from this endpoint.  That is the
+            # correct behaviour and an annoying afternoon, so: the
+            # answers are all in GET /_fauxbus/state, which is out-of-band
+            # (principle 4) and under no obligation to be discreet.
+            return {"active": False}
+        client = self.clients.get(issued.client_id)
+        return {
+            "active": True,
+            "token_type": "Bearer",
+            "scope": " ".join(issued.scopes),
+            "client_id": issued.client_id,
+            # The subject is an identity, and for a client_credentials
+            # token that identity IS the client (see OAuthClient) — so
+            # ``sub`` and ``client_id`` are the same UUID here, and that
+            # is faithful rather than lazy.  They come apart the moment
+            # slice B lands an authorization-code token, where a person
+            # is the subject and the client is only the requester.
+            "sub": issued.identity_id,
+            "username": issued.username,
+            # PROVISIONAL: a client identity has no mailbox, and the
+            # fixture's subject was a person.  The key is present and
+            # null rather than absent, on the same reasoning that keeps
+            # ``other_tokens`` present and empty: a consumer should meet
+            # the same key set every time, and learn the answer from the
+            # value.  A seeded token may name a client that was never
+            # registered — deliberately allowed — which is the other way
+            # ``name`` arrives as null.
+            "name": client.name if client is not None else None,
+            "email": None,
+            "exp": issued.expires_at,
+            "iat": issued.issued_at,
+            # RFC 7662 §2.2: ``nbf`` is when the token becomes valid.
+            # Fauxbus has no not-yet-valid tokens — a minted token works
+            # immediately — so it equals ``iat``, which is also what the
+            # recorded fixture shows.
+            "nbf": issued.issued_at,
+            # PROVISIONAL generalization; see the docstring.
+            "aud": [issued.resource_server, issued.client_id],
+            "iss": AUTH_ISSUER,
+        }
+
+    def revoke(self, client: OAuthClient, token: str) -> None:
+        """Retire a token, if it is this client's to retire.
+
+        Three decisions worth reading, because none is obvious.
+
+        **A token nobody issued is not an error.**  RFC 7009 §2.2 is
+        explicit: the endpoint answers 200 whether or not the token
+        existed.  Revocation is idempotent by design, so a client
+        cleaning up need not first find out what it holds.
+
+        **Another client's token is invisible, not forbidden.**  RFC 7009
+        §2.1 says a server MUST verify the token was issued to the client
+        doing the asking, and refusing with an error would be the obvious
+        reading.  It would also turn this endpoint into an oracle: ask
+        about a string, and a 200 means "never existed" while an error
+        means "exists, belongs to someone else."  So the answer is the
+        same 200 and nothing happens — indistinguishable from the token
+        never having been there, which is what a stranger is entitled to
+        know.  PROVISIONAL: the real service has not been observed here.
+
+        **The record survives, flagged.**  Deleting it would drop the
+        token back through ``identity_for_token`` to the hash-derived
+        default, where it would come back to life as a *different*
+        caller — the fake disagreeing with itself about who just called.
+        A ``revoked`` flag keeps one answer to that question.
+
+        Note what this does not do in the permissive default: nothing
+        visible.  A revoked token still authenticates, because the
+        permissive surface checks no tokens at all — the same reason an
+        expired one does.  Revocation bites under
+        ``--require-issued-tokens``, which is the mode where "issued
+        here" is a question anyone is asking.
+        """
+        issued = self.tokens.get(token)
+        if issued is None or issued.client_id != client.client_id:
+            return
+        issued.revoked = True
 
     # --------------------------------------------------------------- groups
 
@@ -972,7 +1141,9 @@ class World:
                     "resource_server": t.resource_server,
                     "scopes": list(t.scopes),
                     "grant_type": t.grant_type,
+                    "issued_at": t.issued_at,
                     "expires_at": t.expires_at,
+                    "revoked": t.revoked,
                 }
                 for tok, t in sorted(self.tokens.items())
             },
@@ -1095,7 +1266,14 @@ class World:
                 resource_server=str(t["resource_server"]),
                 scopes=list(scopes),
                 grant_type=str(t.get("grant_type", "client_credentials")),
+                # ``issued_at`` defaults to the world's own clock rather
+                # than to zero: a hand-written seed that gives only
+                # ``expires_at`` means "this token is live now," and zero
+                # would have introspection report it as minted before the
+                # world began.
+                issued_at=_require_int(t.get("issued_at", self.clock), f"token {tok!r} issued_at"),
                 expires_at=_require_int(t["expires_at"], f"token {tok!r} expires_at"),
+                revoked=bool(t.get("revoked", False)),
             )
         for gid, g in _require_mapping(doc.get("groups"), "groups").items():
             gid = _require_uuid(str(gid), "group id")

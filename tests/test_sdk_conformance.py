@@ -327,3 +327,61 @@ def test_the_token_endpoints_errors_really_are_that_opaque(registered):
     assert exc.value.code is None
     assert exc.value.message is None
     assert exc.value.raw_json["error"] == "invalid_client"
+
+
+# ------------------------------------- auth slice A.2: introspection, revocation
+
+
+def test_introspection_round_trips_through_the_sdk(registered):
+    """The tether on the endpoint whose whole job is being believed.
+
+    A resource server introspects a token to decide whether to serve a
+    request. If Fauxbus's document were shaped wrong, the consumer's
+    ``data["sub"]`` would be the thing that broke — in their code, at
+    runtime, against a fake that had already told them everything was
+    fine. So the SDK does the asking here, not urllib.
+    """
+    client = confidential_client(registered.base_url)
+    token = client.oauth2_client_credentials_tokens(GROUPS_SCOPE)["access_token"]
+
+    data = client.oauth2_token_introspect(token)
+    assert data["active"] is True
+    assert data["sub"] == CLIENT_ID
+    assert data["scope"] == GROUPS_SCOPE
+    assert data["iss"] == "https://auth.globus.org"
+    # The same UUID the Groups half of the fake will report for this
+    # caller. Two surfaces, one answer — which is the only thing that
+    # makes introspection worth having.
+    groups = GroupsClient(
+        base_url=registered.base_url, authorizer=AccessTokenAuthorizer(token)
+    )
+    (membership,) = groups.create_group({"name": "Assayed", "description": ""})[
+        "my_memberships"
+    ]
+    assert membership["identity_id"] == data["sub"]
+
+
+def test_revoke_then_introspect_is_the_loop_the_sdk_documents(registered):
+    """``oauth2_revoke_token``'s own docstring describes this sequence.
+
+    "You can check the 'active' status of the token after revocation if
+    you want to confirm that it was revoked" (base_login_client.py,
+    4.8.1). A consumer following that advice against Fauxbus has to get
+    the same answer it would get against Globus, which means both halves
+    have to agree — and they only agree because revocation is world
+    state rather than a deletion.
+    """
+    client = confidential_client(registered.base_url)
+    token = client.oauth2_client_credentials_tokens(GROUPS_SCOPE)["access_token"]
+    assert client.oauth2_token_introspect(token)["active"] is True
+
+    assert client.oauth2_revoke_token(token)["active"] is False
+    assert client.oauth2_token_introspect(token)["active"] is False
+
+
+def test_introspecting_a_token_the_sdk_never_got_is_not_an_error(registered):
+    # RFC 7662 §2.2: inactive is an answer, not a failure. A consumer
+    # that wrapped this in try/except would never see the except branch
+    # against the real service either.
+    data = confidential_client(registered.base_url).oauth2_token_introspect("t-alice")
+    assert data["active"] is False
