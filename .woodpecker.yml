@@ -103,7 +103,7 @@ steps:
       # explicit rather than trusting the daemon's default.
       DOCKER_BUILDKIT: "1"
     commands:
-      - docker build -f Containerfile -t fauxbus:ci-${CI_PIPELINE_NUMBER} .
+      - docker build --pull -f Containerfile -t fauxbus:ci-${CI_PIPELINE_NUMBER} .
       - docker run -d --name fauxbus-ci-${CI_PIPELINE_NUMBER} fauxbus:ci-${CI_PIPELINE_NUMBER}
       - |
         for i in $(seq 1 30); do
