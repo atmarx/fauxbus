@@ -200,17 +200,28 @@ def token(ctx: Ctx) -> tuple[int, Any]:
 
     _refuse_refresh_requests(form, scopes)
 
-    resource_server = ctx.world.resource_server_for_request(scopes)
-    issued = ctx.world.issue_token(
-        client,
-        resource_server=resource_server,
-        scopes=scopes,
-        grant_type=grant_type,
-    )
+    # Parse everything first, mint second — two statements on purpose.
+    # A 501 on the third scope must not leave two orphan tokens behind in
+    # the world state, and keeping the parse on its own line makes that
+    # ordering something you can see rather than something you have to
+    # know about when Python evaluates a comprehension.
+    by_server = ctx.world.scopes_by_resource_server(scopes)
+    # One token per service, minted in first-named order, so the primary
+    # is always the lowest-numbered token and a given request produces
+    # the same strings on every run.
+    issued = [
+        ctx.world.issue_token(
+            client,
+            resource_server=resource_server,
+            scopes=server_scopes,
+            grant_type=grant_type,
+        )
+        for resource_server, server_scopes in by_server.items()
+    ]
     # RECORDED: 200 with the six-field token document.  See
     # World.token_response for the field-by-field grounding, and in
     # particular why ``other_tokens`` is not optional.
-    return 200, ctx.world.token_response(issued)
+    return 200, ctx.world.token_response(issued[0], issued[1:])
 
 
 def _require_token_field(form: dict[str, str]) -> str:

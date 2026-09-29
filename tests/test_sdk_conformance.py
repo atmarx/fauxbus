@@ -25,7 +25,7 @@ if os.environ.get("FAUXBUS_REQUIRE_CONFORMANCE"):
 else:
     globus_sdk = pytest.importorskip("globus_sdk")
 
-from conftest import CLIENT_ID, CLIENT_SECRET, GROUPS_SCOPE  # noqa: E402
+from conftest import CLIENT_ID, CLIENT_SECRET, GROUPS_SCOPE, TRANSFER_SCOPE  # noqa: E402
 from globus_sdk import (  # noqa: E402
     AccessTokenAuthorizer,
     BatchMembershipActions,
@@ -285,6 +285,32 @@ def test_client_credentials_grant_drives_end_to_end(registered):
     (membership,) = created["my_memberships"]
     assert membership["identity_id"] == CLIENT_ID
     assert membership["username"] == f"{CLIENT_ID}@clients.auth.globus.org"
+
+
+def test_a_multi_service_grant_lands_in_by_resource_server(registered):
+    """The SDK's view of ``other_tokens``, which is the one that matters.
+
+    ``by_resource_server`` folds the primary and every ``other_tokens``
+    entry into one dict keyed by service — which is also why the
+    PROVISIONAL primary-token rule cannot reach an SDK consumer who looks
+    tokens up by name, the way this test does.  Each entry must survive
+    ``_convert_token_info_dict``, and the Groups token must still be good
+    for a real Groups call.
+    """
+    tokens = confidential_client(registered.base_url).oauth2_client_credentials_tokens(
+        [TRANSFER_SCOPE, GROUPS_SCOPE]
+    )
+    assert set(tokens.by_resource_server) == {
+        "transfer.api.globus.org",
+        "groups.api.globus.org",
+    }
+    assert tokens.by_scopes[TRANSFER_SCOPE]["resource_server"] == "transfer.api.globus.org"
+    groups_token = tokens.by_resource_server["groups.api.globus.org"]["access_token"]
+    groups = GroupsClient(
+        base_url=registered.base_url, authorizer=AccessTokenAuthorizer(groups_token)
+    )
+    created = groups.create_group({"name": "Two tokens, one call", "description": ""})
+    assert created["my_memberships"][0]["identity_id"] == CLIENT_ID
 
 
 def test_by_scopes_indexes_the_response_too(registered):

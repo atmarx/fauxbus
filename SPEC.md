@@ -162,8 +162,8 @@ alongside one Groups question a consumer's self-serve model does lean
 on: where exactly the manager/admin boundary sits for adding a member
 directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
-Building slice A added four more to that list, and slice A.2 three
-more — and it is worth noticing that every one of them is a question the
+Building slice A added four more to that list, slice A.2 three more,
+and multi-resource-server responses two — and it is worth noticing that every one of them is a question the
 audit could not have asked before the code existed:
 
 1. **The status for a token presented to the wrong resource server.**
@@ -198,6 +198,20 @@ audit could not have asked before the code existed:
    Fauxbus answers the same `{"active": false}` it gives for a string
    that never existed, refusing to become an oracle.  RFC 7009 permits
    this reading and does not require it.
+8. **Which token is primary when a request spans services.**  Every
+   token document the SDK records has `other_tokens: []`, so no fixture
+   shows the real service choosing.  Fauxbus puts the first-named
+   service on top — the one rule a consumer can predict from its own
+   request.  An SDK consumer looking tokens up by service name in
+   `by_resource_server` never sees the choice; code reading
+   `response["access_token"]` raw, or taking that dict's first entry,
+   does.
+   `PROVISIONAL` in `world.scopes_by_resource_server`.
+9. **The shape of an `other_tokens` entry.**  Unrecorded, but pinned
+   from the reader's side: the SDK runs each entry through the same
+   `_convert_token_info_dict` as the top level, so an entry carries the
+   top level's five token fields and no nested `other_tokens`.
+   `PROVISIONAL` in `world.token_response`.
 
 Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
@@ -399,13 +413,15 @@ most tempted to lie on its own behalf:
 
 The same instinct governs scopes.  Scopes spanning two resource servers
 are legal at the real service, which answers with a primary token plus
-the rest in `other_tokens`; Fauxbus does not build that yet, and the
-tempting shortcut — issue for whichever service parsed first and quietly
-drop the other scopes — is the exact silent wrong answer principle 2
-forbids, because the consumer would get a token that looks fine and
-fails later against a service it was never good for.  501, naming both
-services.  A scope form Fauxbus cannot parse is likewise a 501 rather
-than a guess.  And a request carrying `openid` is refused rather than
+the rest in `other_tokens`.  Slice A shipped refusing that with a 501,
+because the tempting shortcut — issue for whichever service parsed
+first and quietly drop the other scopes — is the exact silent wrong
+answer principle 2 forbids.  As of v0.2.18 it is built: one token per
+service, each carrying only its own service's scopes, the first-named
+service on top (see the recording list for why that order is
+provisional).  A scope form Fauxbus cannot parse is a 501 rather than a
+guess, and it mints *nothing* — a refusal on the third scope does not
+leave two orphan tokens behind.  And a request carrying `openid` is refused rather than
 answered without an `id_token`: this document promises that field,
 signing waits for slice B, and a missing key would surface as a
 `KeyError` in the consumer's code pointing nowhere near the cause.
@@ -668,11 +684,11 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   It has its own section above; what remains here is what it *deferred*,
   each item a deliberate refusal rather than an oversight:
 
-  - **Multi-resource-server responses** — the primary token plus the
-    rest in `other_tokens`.  Requesting scopes across two services is a
-    loud 501 today, and it is now the **largest remaining fidelity gap
-    in Auth**: asking for Transfer and Groups in one call is ordinary
-    Globus client code, not an edge case.  Next in this bullet.
+  - ~~**Multi-resource-server responses**~~ — **built in v0.2.18.**  It
+    was the largest remaining fidelity gap in Auth, and it turned out
+    to be slice B's floor as well: a broker that signs people in and
+    checks their groups asks for `openid` and a Groups scope in one
+    request, which is two services.
   - **`id_token` on an `openid` request**, which needs slice B's signing.
     Refused rather than answered without the field.
   - **Dependent scopes** (`scope[dependent]`) and the dependent-token
@@ -787,6 +803,49 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.18** (2026-09-28) — **Multi-resource-server token responses.**
+  Scopes spanning two services now get what the real service sends:
+  one token per service, the primary at the top of the document and the
+  rest in `other_tokens`, each carrying only its own service's scopes.
+  It was a 501 through slice A and A.2, and SPEC called it the largest
+  remaining fidelity gap in Auth.
+
+  Chosen next for a reason that only became visible on a second look:
+  **it is slice B's prerequisite.**  The WordPress broker that slice B
+  exists for wants to know who someone is *and* which groups they are
+  in, which means `openid` plus a Groups scope in one authorization
+  request — `auth.globus.org` and `groups.api.globus.org`.  Slice B
+  built on a token endpoint that refuses two services would have hit
+  this wall on its first real request.
+
+  **Less recorded than SPEC implied, and said so.**  The roadmap called
+  this well grounded.  It is half grounded.  globus-sdk 4.8.1 records
+  four token documents and every one has `other_tokens: []` — there is
+  no fixture anywhere showing a populated list.  What is recorded is
+  the *reader*: `OAuthTokenResponse._init_rs_dict` runs every entry
+  through the same `_convert_token_info_dict` as the top level, which
+  pins the entry shape from the consuming side.  Which token the real
+  service puts on top is not pinned by anything; Fauxbus uses
+  first-named.  Both are new entries on the recording list (8 and 9),
+  and the order question is softer than it sounds — the SDK folds both
+  into `by_resource_server`, and a consumer that looks tokens up there
+  by service name, which is what it is for, never sees the order.  (A
+  first draft of this entry said *no* SDK consumer could see it, on the
+  theory that a dict has no first.  A Python dict keeps insertion
+  order, so `next(iter(...))` sees it fine.  Caught before commit.)
+
+  All-or-nothing minting: every scope parses before any token is
+  minted, so a 501 on the last scope cannot leave orphans in
+  `/_fauxbus/state` or shift the numbering of every token after them.
+
+  161 tests, 20 through the real globus-sdk — the new one requests
+  Transfer and Groups together and then spends the Groups token on a
+  real `create_group`.
+
+  **PROVISIONAL inventory: 23 markers**, up two, **two obligations** —
+  one marker each this time, the primary rule and the entry shape.
+  Counted with `grep -rn PROVISIONAL src/ | wc -l`.
 
 - **v0.2.17** (2026-09-15) — **Auth slice A.2: introspection and
   revocation**, plus two bugs found by reading slice A adversarially

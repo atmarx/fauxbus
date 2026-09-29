@@ -183,7 +183,7 @@ def resource_server_for_scope(scope: str) -> str | None:
     Fauxbus does not recognize is a gap in Fauxbus, and principle 2 says
     a gap gets a loud 501 with a place to file it — never a token issued
     for a resource server we picked because it seemed likely.  The
-    caller (world.resource_server_for_request) is what turns None into
+    caller (world.scopes_by_resource_server) is what turns None into
     that 501.
     """
     # A leading '*' marks an optional dependent scope in Globus's scope

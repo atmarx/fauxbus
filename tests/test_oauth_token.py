@@ -276,19 +276,78 @@ def test_a_grant_globus_does_not_have_is_the_clients_mistake(registered):
     assert doc["error"] == "unsupported_grant_type"
 
 
-def test_scopes_spanning_two_services_refuse_rather_than_drop_one(registered):
-    """The silent wrong answer this endpoint could most easily have given.
+def test_scopes_spanning_two_services_get_one_token_each(registered):
+    """What the real service does, and what the fake used to refuse.
 
-    Issuing for whichever resource server parsed first and quietly
-    dropping the rest would hand back a token that looks perfectly valid
-    and fails later, somewhere else, against a service it was never good
-    for. Multi-resource-server responses are a later slice; until then
-    the honest answer is a refusal that names both services.
+    Asking for Groups and Transfer in one call is ordinary Globus client
+    code. The answer is two tokens — a primary at the top of the
+    document and the other in ``other_tokens`` — each carrying only its
+    own service's scopes. A token whose ``scope`` listed the other
+    service's scope too would be claiming an authority it does not have.
     """
     status, doc, _ = fetch(registered, scope=f"{GROUPS_SCOPE} {TRANSFER_SCOPE}")
+    assert status == 200
+    assert doc["resource_server"] == "groups.api.globus.org"
+    assert doc["scope"] == GROUPS_SCOPE
+    (other,) = doc["other_tokens"]
+    assert other["resource_server"] == "transfer.api.globus.org"
+    assert other["scope"] == TRANSFER_SCOPE
+    assert other["access_token"] != doc["access_token"]
+
+
+def test_an_other_tokens_entry_is_a_token_not_a_document(registered):
+    """PROVISIONAL shape, pinned from the reader's side.
+
+    No recorded fixture has a non-empty ``other_tokens``. What *is*
+    recorded is the SDK code that reads it: every entry goes through the
+    same ``_convert_token_info_dict`` as the top level. So an entry has
+    the top level's token fields and nothing else — in particular no
+    nested ``other_tokens`` of its own.
+    """
+    _, doc, _ = fetch(registered, scope=f"{GROUPS_SCOPE} {TRANSFER_SCOPE}")
+    (other,) = doc["other_tokens"]
+    assert set(other) == set(doc) - {"other_tokens"}
+    assert other["token_type"] == "Bearer"
+    assert other["expires_in"] == doc["expires_in"]
+
+
+def test_the_first_named_service_is_primary(registered):
+    """PROVISIONAL: the rule for which token sits at the top.
+
+    Unrecorded, so Fauxbus picks the one rule a consumer can predict from
+    its own request — first named, first minted — and keeps it stable.
+    Reversing the request reverses the document, and the token strings
+    follow the same order, so the primary is always the lower number.
+    """
+    _, doc, _ = fetch(registered, scope=f"{TRANSFER_SCOPE} {GROUPS_SCOPE}")
+    assert doc["resource_server"] == "transfer.api.globus.org"
+    assert doc["other_tokens"][0]["resource_server"] == "groups.api.globus.org"
+    assert doc["access_token"] == "fauxbus-at-0"
+    assert doc["other_tokens"][0]["access_token"] == "fauxbus-at-1"
+
+
+def test_scopes_for_one_service_stay_together_however_they_are_interleaved(registered):
+    # Grouping is by service, not by adjacency: two Groups scopes with a
+    # Transfer scope between them are still one Groups token.
+    second_groups_scope = "urn:globus:auth:scope:groups.api.globus.org:view_my_groups_and_memberships"
+    _, doc, _ = fetch(registered, scope=f"{GROUPS_SCOPE} {TRANSFER_SCOPE} {second_groups_scope}")
+    assert doc["scope"] == f"{GROUPS_SCOPE} {second_groups_scope}"
+    assert len(doc["other_tokens"]) == 1
+
+
+def test_a_bad_scope_anywhere_mints_nothing(registered):
+    """All or nothing, so a refusal cannot leave orphans in the world.
+
+    A 501 on the last scope must not have already minted tokens for the
+    first two — they would sit in the state dump, issued to nobody, and
+    shift every token number after them.
+    """
+    status, _, _ = fetch(registered, scope=f"{GROUPS_SCOPE} {TRANSFER_SCOPE} wat")
     assert status == 501
-    assert "groups.api.globus.org" in doc["detail"]
-    assert "transfer.api.globus.org" in doc["detail"]
+    _, state, _ = registered.get("/_fauxbus/state")
+    assert state["tokens"] == {}
+    _, doc, _ = fetch(registered)
+    assert doc["access_token"] == "fauxbus-at-0"
 
 
 def test_an_unparseable_scope_refuses_to_guess(registered):
@@ -424,6 +483,25 @@ def test_strict_mode_rejects_a_token_meant_for_another_service(strict):
     assert status == 403
     assert "transfer.api.globus.org" in doc["detail"]
     assert "groups.api.globus.org" in doc["detail"]
+
+
+def test_each_token_of_a_multi_service_grant_is_good_only_at_its_own_service(strict):
+    """The reason ``other_tokens`` exists, checked where it bites.
+
+    Two tokens from one request are still two tokens. The Groups one
+    works at Groups; the Transfer one riding beside it is refused there,
+    exactly as it would be if it had been fetched on its own.
+    """
+    strict.post("/_fauxbus/seed", {"clients": {CLIENT_ID: {"secret": CLIENT_SECRET}}})
+    _, doc, _ = strict.form_post(
+        TOKEN,
+        {"grant_type": "client_credentials", "scope": f"{TRANSFER_SCOPE} {GROUPS_SCOPE}"},
+        basic=CREDS,
+    )
+    transfer_token = doc["access_token"]
+    groups_token = doc["other_tokens"][0]["access_token"]
+    assert strict.get("/v2/groups/my_groups", token=groups_token)[0] == 200
+    assert strict.get("/v2/groups/my_groups", token=transfer_token)[0] == 403
 
 
 def test_the_token_endpoint_itself_stays_reachable_in_strict_mode(strict):

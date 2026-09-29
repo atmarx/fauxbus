@@ -341,22 +341,31 @@ class World:
             raise invalid_client(f"the secret presented for client {client_id!r} does not match")
         return client
 
-    def resource_server_for_request(self, scopes: list[str]) -> str:
-        """Which single service these scopes are asking for.
+    def scopes_by_resource_server(self, scopes: list[str]) -> dict[str, list[str]]:
+        """Sort a request's scopes by the service each one is good at.
 
         A Globus access token belongs to exactly one resource server, and
         the request names it only indirectly — inside the scope strings.
-        So this is the function that decides what the token endpoint is
-        about to mint, and every way it can fail is a loud one.
+        A request may name several, and the real service answers that
+        with one token per service: a primary at the top of the document
+        and the rest in ``other_tokens``.  So this is the function that
+        decides how many tokens the endpoint is about to mint and what
+        each one is for, and every way it can fail is a loud one.
 
-        Asking for scopes across *two* services is legal at the real
-        service: it answers with a primary token plus the rest in
-        ``other_tokens``.  Fauxbus does not build that yet, and the
-        tempting shortcut — issue for whichever resource server appeared
-        first and quietly drop the other scopes — is the exact silent
-        wrong answer principle 2 forbids.  The consumer would get a token
-        that looks fine and fails later against a service it was never
-        good for.  501 instead, with the tracker link.
+        The dict keeps the order in which each resource server was first
+        named, and that order is the answer to "which token is primary."
+        It is PROVISIONAL: every token document globus-sdk 4.8.1 records
+        has ``other_tokens: []``, so no fixture shows the real service
+        choosing.  First-named is the rule a consumer can predict from
+        its own request, which is the most a fake can honestly offer
+        while it waits for a recording.  It matters less than it sounds:
+        the SDK folds primary and others into ``by_resource_server``,
+        which consumers index by service name, and a lookup by name never
+        sees the order.  Code that reads ``response["access_token"]`` raw
+        off a multi-service request — or takes the first entry of that
+        dict, which Python's insertion order will happily hand it — is
+        depending on a choice nobody has recorded, against the fake *or*
+        the real thing.
         """
         by_server: dict[str, list[str]] = {}
         for scope in scopes:
@@ -373,14 +382,7 @@ class World:
                     f"client code uses this scope form?"
                 )
             by_server.setdefault(resource_server, []).append(scope)
-        if len(by_server) > 1:
-            raise not_implemented(
-                f"Fauxbus issues one token per request, and these scopes span "
-                f"{sorted(by_server)}. The real service answers multi-resource-server "
-                f"requests with a primary token plus 'other_tokens'; that is a later "
-                f"slice. Real client code needs it?"
-            )
-        return next(iter(by_server))
+        return by_server
 
     def issue_token(
         self,
@@ -417,7 +419,9 @@ class World:
         self.tokens[issued.token] = issued
         return issued
 
-    def token_response(self, issued: IssuedToken) -> dict[str, Any]:
+    def token_response(
+        self, issued: IssuedToken, others: list[IssuedToken] | None = None
+    ) -> dict[str, Any]:
         """The token document, field for field as globus-sdk expects it.
 
         RECORDED from
@@ -429,17 +433,34 @@ class World:
         with no ``.get`` and no default, so omitting it raises a KeyError
         inside the SDK before the consumer's code ever sees the response.
 
+        When a request spans services, each extra token rides in
+        ``other_tokens`` as a document of its own.  The *entry* shape is
+        PROVISIONAL — no recorded fixture has a non-empty list — but it is
+        pinned from the reader's side: ``_init_rs_dict`` runs every entry
+        through the same ``_convert_token_info_dict`` as the top level,
+        which requires ``scope``, ``access_token`` and ``resource_server``
+        and reads ``expires_in`` and ``token_type``.  So an entry carries
+        the same five token fields the top level does, and not
+        ``other_tokens`` itself — a token nested inside a token's list of
+        other tokens would be a recursion nobody reads.
+
         ``expires_in`` is computed against the current clock rather than
         stored, so a token fetched, then aged with ``/_fauxbus/tick``,
         then re-rendered still reports the truth.
         """
+        return {
+            **self._token_fields(issued),
+            "other_tokens": [self._token_fields(other) for other in others or []],
+        }
+
+    def _token_fields(self, issued: IssuedToken) -> dict[str, Any]:
+        """The five fields every token in a token document carries."""
         return {
             "access_token": issued.token,
             "scope": " ".join(issued.scopes),
             "expires_in": max(0, issued.expires_at - self.clock),
             "token_type": "Bearer",
             "resource_server": issued.resource_server,
-            "other_tokens": [],
         }
 
     def require_issued(self, token: str, resource_server: str | None) -> IssuedToken:
