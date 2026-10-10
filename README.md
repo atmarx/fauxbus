@@ -119,6 +119,13 @@ services:
     volumes: ["./seed.json:/seed.json:ro"]
 ```
 
+Build it with `--pull` (`docker compose build --pull`), and rebuild it
+now and then.  Fauxbus publishes no image of its own, so the base layer
+is whatever your builder cached the first time — and a cached base
+stops collecting security fixes the day it was pulled.  The final stage
+is Alpine for a related reason: a pure-stdlib app needs little more than
+the interpreter, so less distro means fewer CVEs nobody can patch.
+
 The image ships a healthcheck on the control-plane index, so
 `depends_on: { fauxbus: { condition: service_healthy } }` does the
 waiting for you.  A runnable example — sibling-service pattern, seed

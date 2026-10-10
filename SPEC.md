@@ -587,7 +587,10 @@ test connects.
   `/seed.json` and it loads on boot; the healthcheck probes the
   control-plane index, so `depends_on: service_healthy` just works;
   runtime args pass through to `fauxbus serve`.  Runs unprivileged
-  (uid 9800 — yes, the port).  `examples/compose.yaml` is the copyable
+  (uid 9800 — yes, the port), on an Alpine final stage: with a
+  pure-stdlib app the distro *is* the attack surface, and Debian slim
+  carried 55 unfixable Highs Fauxbus never touches (see the comment in
+  `Containerfile` for the measurements).  `examples/compose.yaml` is the copyable
   pattern, and `examples/seed.json` is a real state dump kept honest by
   a byte-identical round-trip test in CI.
 - Zero runtime dependencies — stdlib only, on purpose.  A test fake
@@ -803,6 +806,27 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.19** (2026-10-10) — **The container's final stage moves to
+  Alpine**, after @xram asked about CVEs.  A fresh `--pull` of the old
+  `python:3.13-slim` image scanned (grype) at 161 findings: 0 Critical,
+  55 High, and every High marked `wont-fix` or `not-fixed` by Debian —
+  util-linux, perl, ncurses, glibc, the gcc runtime.  No rebuild would
+  ever clear them, and Fauxbus calls none of them.  `python:3.13-alpine`
+  plus `apk upgrade` scans at **5 Medium and nothing above**, at half
+  the size.  For a pure-stdlib app the base image *is* the security
+  decision; musl versus glibc does not matter to code that links
+  against neither.  uid stays 9800, and gains a matching gid 9800
+  instead of busybox's shared `nogroup`.
+
+  Worth recording what the scan *also* showed, because it was the
+  bigger number.  A consumer-built image four weeks old carried **14
+  Critical**, every one already fixed upstream (openssl, glibc, perl,
+  Python 3.13.15).  That is not a Containerfile problem — it is a
+  stale base layer, the same failure the `--pull` fix in CI exists
+  for.  Fauxbus publishes no image; consumers build it, so the advice
+  ships in the README: build with `--pull`, and rebuild on a schedule
+  rather than when a scanner complains.
 
 - **v0.2.18** (2026-09-28) — **Multi-resource-server token responses.**
   Scopes spanning two services now get what the real service sends:
