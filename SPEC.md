@@ -807,6 +807,34 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **v0.2.20** (2026-10-10) — **CI scans the image, and CVEs get acked
+  rather than ignored.**  New `scan-image` step: grype v0.112.0 against
+  the image `build-image` just built, failing on any Medium-or-above
+  finding not acknowledged in `.grype.yaml`.  @xram asked for a way to
+  mark the unfixable ones so they drop off the scream count, and the
+  design question was how to do that without building a mute button.
+
+  The answer is that **every ack pins CVE + package + exact installed
+  version**, with a `reason`.  Grype suppresses only when every field in
+  the rule matches, so the moment the package changes the ack stops
+  matching and the finding comes back to be looked at again.  An ack
+  cannot outlive the thing it was about.  The common alternative, a
+  bare `- vulnerability: CVE-...` line, suppresses that ID in every
+  package, through every fix, forever, which is how an allowlist
+  quietly turns into a blindfold.  Both behaviours were verified
+  against the pinned grype before shipping: a rule with the wrong
+  version does not suppress, and `reason` comes back in the JSON
+  output, so the justification travels with every scan result.
+
+  Five acks to start, all Medium: busybox's `wget` request-line
+  injection (three packages; Fauxbus never runs `wget`), and two CPython
+  CVEs in `poplib` and `tempfile`, neither of which Fauxbus imports.
+  The CPython two are worth a note because v0.2.19's board post got
+  them wrong.  It said they would clear on the next 3.13 patch.  They
+  will not: grype marks them "fixed", but the fixes landed only on the
+  3.15 pre-release line.  "Fixed" in a scanner means fixed *somewhere*,
+  which is not the same as fixable from here.
+
 - **v0.2.19** (2026-10-10) — **The container's final stage moves to
   Alpine**, after @xram asked about CVEs.  A fresh `--pull` of the old
   `python:3.13-slim` image scanned (grype) at 161 findings: 0 Critical,

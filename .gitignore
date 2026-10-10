@@ -15,3 +15,6 @@ venv/
 # hand a stranger.  What survives triage becomes a commit, an issue, or
 # a SPEC entry — those are the public record.
 .reviews/
+
+# CI hands the built image to the scan step through the workspace.
+fauxbus-image.tar

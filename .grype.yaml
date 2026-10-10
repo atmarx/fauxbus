@@ -1,0 +1,62 @@
+# Grype acks for the Fauxbus container image.
+#
+# CI scans the image it builds (see the `scan-image` step) and fails on
+# any finding at Medium or above that is not acknowledged here.  An ack
+# is a statement that someone read the CVE and decided it does not
+# reach Fauxbus.  It is not a way to make a red build go green.
+#
+# THE RULE: every ack pins three things, CVE + package name + exact
+# installed version, and says why in `reason`.
+#
+# The version pin is what makes an ack expire by itself.  Grype only
+# suppresses a match when every field in the rule agrees, so the moment
+# the package changes (a rebuild picks up Alpine's next busybox, the
+# python tag moves to 3.13.17), the rule stops matching and the finding
+# comes back for a fresh look.  Maybe the new version fixed it, and the
+# entry is dead weight to delete.  Maybe it didn't, and re-acking takes
+# one line.  Either way a person looks at it again.  Nothing here can
+# go on suppressing a CVE that later became fixable, which is what a
+# bare `- vulnerability: CVE-...` line does: it stays silent forever,
+# through every fix, in every package that ever carries that ID.
+#
+# Package names match exactly, so one CVE spread across several packages
+# (busybox and its applet packages below) needs one entry per package.
+#
+# `reason` is not just a comment.  Grype echoes it back in the JSON
+# output (`ignoredMatches[].appliedIgnoreRules`), so the justification
+# travels with every scan result rather than staying in this file.
+# `--show-suppressed` keeps acked findings visible in the table, marked
+# "(suppressed)": acknowledged is not the same as invisible.
+#
+# Verified against grype v0.112.0 (the CI pin) on 2026-10-10: a rule
+# pinned to the wrong version does not suppress, and `reason` survives
+# into the output.
+
+ignore:
+  # --- busybox wget: request-line injection via raw CR/LF in the URL ---
+  # Fauxbus never runs wget.  The image's own healthcheck uses Python's
+  # urllib, and the entrypoint uses only busybox's `sh`.  ssl_client is
+  # wget's HTTPS helper, so it is unreachable for the same reason.
+  # Alpine has published no fix yet (blank fix state).
+  - vulnerability: CVE-2025-60876
+    package: { name: busybox, version: 1.37.0-r31 }
+    reason: "2026-10-10 ash: wget applet, never invoked by Fauxbus (healthcheck is urllib, entrypoint is sh). No Alpine fix yet."
+  - vulnerability: CVE-2025-60876
+    package: { name: busybox-binsh, version: 1.37.0-r31 }
+    reason: "2026-10-10 ash: wget applet, never invoked by Fauxbus (healthcheck is urllib, entrypoint is sh). No Alpine fix yet."
+  - vulnerability: CVE-2025-60876
+    package: { name: ssl_client, version: 1.37.0-r31 }
+    reason: "2026-10-10 ash: wget's HTTPS helper, unreachable because Fauxbus never invokes wget. No Alpine fix yet."
+
+  # --- CPython: fixed only on the 3.15 pre-release line ----------------
+  # Grype reports both as "fixed", but the fixes landed in 3.15 alphas
+  # and RCs and no 3.13 release carries them, so a rebuild cannot clear
+  # them.  Neither module is imported anywhere in src/.  When the base
+  # tag moves past 3.13.16 these stop matching, and the new version gets
+  # checked for a backport.
+  - vulnerability: CVE-2025-15367
+    package: { name: python, version: 3.13.16 }
+    reason: "2026-10-10 ash: poplib command injection. Fauxbus never imports poplib. Fixed only in 3.15.0a6."
+  - vulnerability: CVE-2026-12345
+    package: { name: python, version: 3.13.16 }
+    reason: "2026-10-10 ash: tempfile.TemporaryDirectory cleanup race. Fauxbus never imports tempfile. Fixed only in 3.15.0rc3."

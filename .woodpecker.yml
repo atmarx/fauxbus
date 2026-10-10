@@ -120,11 +120,55 @@ steps:
         docker exec fauxbus-ci-${CI_PIPELINE_NUMBER} python -c \
           "import json; d = json.load(open('/usr/share/fauxbus/sbom.json')); names = sorted(c['name'] for c in d['components']); assert 'fauxbus' in names, names; print('SBOM components:', names)"
       - docker rm -f fauxbus-ci-${CI_PIPELINE_NUMBER}
+      # Hand the image to scan-image as a file in the shared workspace.
+      # Fauxbus pushes to no registry, and an archive keeps the scan step
+      # off the docker socket entirely: it reads bytes, it runs nothing.
+      - docker save fauxbus:ci-${CI_PIPELINE_NUMBER} -o fauxbus-image.tar
       - docker rmi fauxbus:ci-${CI_PIPELINE_NUMBER} || true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - test
+
+  # The CVE gate.  Any finding at Medium or above that is not acked in
+  # .grype.yaml fails the build, so the steady state is zero unacked
+  # findings and anything new is loud.  .grype.yaml explains what an ack
+  # is and why each one pins an exact package version (so it expires by
+  # itself the moment that package changes).
+  #
+  # Pattern borrowed from overheard's scan step, which already paid for
+  # the lessons: pin grype by tarball (install.sh exited 126 in alpine),
+  # hardcode the version in the URL (Woodpecker's ${VAR} is expanded at
+  # template time, so a shell variable from an earlier line arrives
+  # empty), and capture the exit code so `set -e` cannot kill the step
+  # before the table prints.  A red scan you cannot read is just a red
+  # light.
+  #
+  # Gated to one matrix cell, like build-image, because that is the only
+  # cell that produces an image.
+  - name: scan-image
+    image: alpine:3
+    when:
+      matrix:
+        PYTHON: "3.13"
+    commands:
+      - apk add --no-cache curl ca-certificates tar
+      - curl -sSfL "https://github.com/anchore/grype/releases/download/v0.112.0/grype_0.112.0_linux_amd64.tar.gz" -o /tmp/grype.tgz
+      - tar -xzf /tmp/grype.tgz -C /usr/local/bin grype
+      - grype version
+      - |
+        GRYPE_EXIT=0
+        grype --config ./.grype.yaml docker-archive:fauxbus-image.tar \
+          --fail-on medium --show-suppressed -o table || GRYPE_EXIT=$?
+        if [ "$GRYPE_EXIT" -ne 0 ]; then
+          echo ""
+          echo "Unacked CVEs at Medium or above (rows without '(suppressed)')."
+          echo "Fix by rebuilding if a fix exists, or ack it in .grype.yaml"
+          echo "with a reason and the exact package version."
+          exit 1
+        fi
+    depends_on:
+      - build-image
 
   # Tags publish themselves, as of 2026-08-08.  Written 2026-08-05 and
   # parked behind two conditions, both now met: pyproject's URLs point

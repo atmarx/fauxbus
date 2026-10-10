@@ -125,6 +125,11 @@ is whatever your builder cached the first time — and a cached base
 stops collecting security fixes the day it was pulled.  The final stage
 is Alpine for a related reason: a pure-stdlib app needs little more than
 the interpreter, so less distro means fewer CVEs nobody can patch.
+CI scans every image it builds with grype and fails on anything at
+Medium or above that `.grype.yaml` hasn't acknowledged.  Each ack names
+the exact package version it covers and why, so it lapses as soon as
+the package changes.  Pass the same file to your own scanner
+(`grype --config .grype.yaml`) to get the same acks.
 
 The image ships a healthcheck on the control-plane index, so
 `depends_on: { fauxbus: { condition: service_healthy } }` does the
