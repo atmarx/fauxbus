@@ -163,8 +163,9 @@ on: where exactly the manager/admin boundary sits for adding a member
 directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Building slice A added four more to that list, slice A.2 three more,
-and multi-resource-server responses two — and it is worth noticing that every one of them is a question the
-audit could not have asked before the code existed:
+multi-resource-server responses two, and slice B five — and it is worth
+noticing that every one of them is a question the audit could not have
+asked before the code existed:
 
 1. **The status for a token presented to the wrong resource server.**
    Fauxbus answers 403 — the token is genuine and introspects fine, it
@@ -206,12 +207,50 @@ audit could not have asked before the code existed:
    `by_resource_server` never sees the choice; code reading
    `response["access_token"]` raw, or taking that dict's first entry,
    does.
-   `PROVISIONAL` in `world.scopes_by_resource_server`.
+   `PROVISIONAL` in `world.scopes_by_resource_server`.  Slice B adds
+   one case to the same question: when `openid` is among the scopes,
+   the `auth.globus.org` token goes on top wherever `openid` was named,
+   because `id_token` sits beside the primary and the SDK reads it from
+   nowhere else.  The fixture shows `openid` alone.  `PROVISIONAL` in
+   `auth_api._authorization_code`.
 9. **The shape of an `other_tokens` entry.**  Unrecorded, but pinned
    from the reader's side: the SDK runs each entry through the same
    `_convert_token_info_dict` as the top level, so an entry carries the
    top level's five token fields and no nested `other_tokens`.
    `PROVISIONAL` in `world.token_response`.
+10. **What happens when a client's `required_idp` is unsatisfied.**
+    Fauxbus keeps the person at the picker and never calls the client
+    back, on the strength of the reference's wording for a neighbouring
+    case.  The real service might instead redirect with an error.
+    `PROVISIONAL` in `world.RequiredIdpUnsatisfied`.
+11. **How long an authorization code lives.**  Unpublished; Fauxbus
+    uses RFC 6749's recommended ten minutes, on the logical clock.
+    `PROVISIONAL` at `world.CODE_LIFETIME`.
+12. **Which userinfo refusal is a 401 and which a 403.**  Both bodies
+    are recorded, with identical text.  Fauxbus answers 401 for no live
+    token and 403 for a genuine token with no person or no `openid`
+    behind it.  `PROVISIONAL` in `world.userinfo_token`.
+13. **Whether the token endpoint accepts `client_secret_post`.**  The
+    real service's own discovery document advertises
+    `client_secret_basic` only; Fauxbus accepts both (slice A's
+    decision) and advertises only Basic.  A broker configured with
+    `client_secret_post` passes against Fauxbus and may fail in
+    production.  `PROVISIONAL` in `oidc_api.discovery`.
+14. **Whether the openid code exchange echoes `state`.**  The SDK's
+    default code-exchange fixture carries `"state"` in the body; its
+    openid variant does not.  Fauxbus echoes in both.  `PROVISIONAL` in
+    `auth_api._authorization_code`.
+
+And `identity_set`, already at the top of this list since v0.2.15, now
+has code to point at: its entry shape and its order are two
+`PROVISIONAL` markers in `world.identity_claims` and `Account.ordered`,
+one obligation.
+
+Slice B also *retired* questions, which this list has not had a chance
+to record before.  The first real-service capture (2026-10-12, two
+public unauthenticated GETs — see the slice B section) made the
+discovery document's keys, the JWKS entry's keys, the `/jwk.json` path,
+and the RS512 algorithm RECORDED before they could ever be guessed.
 
 Error documents are shaped `{"code": ..., "detail": ...}` — the form the
 SDK's error classes parse into `.code` and `.message` regardless of which
@@ -220,7 +259,11 @@ v0.2: the OAuth2 token endpoint answers RFC 6749 §5.2's
 `{"error", "error_description"}`, because that is what the SDK's own
 fixture shows Globus sending from that path.  Two error dialects in one
 server is not a wart — it is the fake being faithful to a service that
-really does speak both.
+really does speak both.  Slice B made it three: userinfo answers Globus
+Auth's own document, a JSON:API `errors` list with RFC 6749's
+`error`/`error_description` beside it, RECORDED from
+`globus_sdk/testing/data/auth/userinfo.py` — and unlike the token
+endpoint's, those errors *do* reach the SDK's `.code` and `.message`.
 
 ### Control-plane reachability
 
@@ -539,6 +582,228 @@ that cannot have them.  It is the same `identity_set` the grading audit
 already calls the most consequential provisional in Auth, which is why
 it gets refused rather than guessed twice.
 
+## v0.2 — Auth slice B: the OIDC authorization-code flow
+
+A real, unmodified Keycloak can now broker a sign-in against Fauxbus:
+its login page, a button, Fauxbus's authorize endpoint, a page listing
+seeded accounts, back to Keycloak with a code, a signed ID token
+Keycloak verifies against Fauxbus's published key, a userinfo call, and
+a brokered Keycloak user whose federated identity is a Globus identity
+UUID.  `examples/keycloak_broker.py` runs exactly that against
+`quay.io/keycloak/keycloak:26.0`, and it passed on 2026-10-12 with both
+`client_secret_basic` and `client_secret_post`.
+
+**The surface**, all of it rebuilt on one configured issuer:
+
+- `GET /.well-known/openid-configuration` — discovery.
+- `GET /jwk.json` — the public signing key.
+- `GET /v2/oauth2/authorize` — the browser leg: `response_type=code`,
+  `client_id`, `redirect_uri`, `scope`, `state`, `nonce`,
+  `prompt=login`, and PKCE `S256`.
+- `POST /v2/oauth2/token` with `grant_type=authorization_code` — the
+  code exchange, client auth by Basic or form body.
+- `GET`/`POST /v2/oauth2/userinfo` — the ID token's claims, live.
+- Out-of-band, under `/_fauxbus/auth/`: the account picker (`GET` and
+  `POST /_fauxbus/auth/login`) and a headless sign-in
+  (`POST /_fauxbus/auth/session`).
+
+**The first recording from the real service.**  Every grade in this
+project has so far come from the SDK's fixtures, because no tenancy
+exists to record against.  Two documents need no tenancy at all:
+`https://auth.globus.org/.well-known/openid-configuration` and the
+`/jwk.json` it points at are public, unauthenticated GETs.  Captured on
+2026-10-12, and they corrected this document twice before a line of
+signing code was written.  The real service signs ID tokens with
+**RS512**, not the RS256 SPEC's 2026-08-24 probe assumed; and its token
+endpoint advertises **`client_secret_basic` only**.  The discovery
+document's key set, the JWKS entry's key set, the `/jwk.json` path, and
+the algorithm are therefore RECORDED, and Fauxbus serves them key for
+key.  The published reference (docs.globus.org/api/auth/reference, read
+the same day) grounded three more things as DOCUMENTED: which scope
+gates which claim, what `sub` is, and what `required_idp` means.
+
+**Discovery tells the truth about Fauxbus where it must.**  The keys are
+the live document's.  Values describe *this* server, because a broker
+acts on them: `response_types_supported` is `["code"]` where the live
+service also lists implicit and hybrid types nobody has asked Fauxbus to
+build.  The one place the fake is kinder than its own document is client
+authentication — discovery says Basic, as recorded, and the token
+endpoint still accepts `client_secret_post` too, as slice A decided.
+Whether the real endpoint does is unobserved, and the recording list
+says so.  **A broker should be configured with Basic**, against the fake
+and the real thing alike.
+
+**Claims, by scope** — DOCUMENTED.  `openid` gives `sub`,
+`last_authentication`, and `identity_set`, plus the token claims `iss`,
+`aud`, `exp`, `iat`, `at_hash`, and `nonce` when one was sent.  `email`
+adds `email`.  `profile` adds `name`, `organization`,
+`preferred_username`, `identity_provider`, and
+`identity_provider_display_name`.  Note what `openid` alone leaves out:
+any name or address for the person.  A broker that maps `email` and
+forgets to request the `email` scope gets a user with no email, and
+should — that is what the real service would hand it.  One function
+builds the claims for both the ID token and userinfo, because OIDC
+requires their `sub` to match and Keycloak checks it.
+
+**`sub` is the effective identity**, and this is the line the slice
+exists for.  The reference defines it as "the primary identity, or the
+appropriate linked identity if this client requires an identity from a
+particular provider."  So the seed models an account as a primary
+identity plus linked ones, a client may carry `required_idp`, and an
+account whose primary is Globus ID signs in to a university's client
+*as its university identity*.  The proof run shows it end to end:
+Keycloak's federated link for alice is her university UUID, not her
+Globus ID.  When an account has no identity from the required provider,
+Fauxbus keeps the person at the picker with a 403 explaining why and
+never calls the client back — the reference describes the neighbouring
+case as the user being "redirected to log in or link an identity," which
+is a stay-at-Globus behavior, not an `error=` redirect.  The details are
+PROVISIONAL.
+
+**`identity_set` is still the provisional that matters most.**  The
+reference confirms it arrives under `openid` and describes it only as
+"the identities linked to this account."  No fixture and no doc shows an
+entry.  Fauxbus reuses the top-level claim names plus `username`, lists
+the primary first and the rest by UUID, and gives `last_authentication`
+only to the identity that just signed in (null for the others, rather
+than an invented history).  Two markers, one obligation, still at the top
+of the recording list.
+
+**Three refusals at authorize, one rule each.**  The redirect URI is
+matched exactly — no trailing-slash or case forgiveness, as RFC 6749
+§3.1.2.3 and Keycloak's own side both require.  When the redirect URI
+cannot be trusted (unknown client, missing or unregistered URI) the
+error is rendered and never redirected, because redirecting errors to
+an unvetted URI is how an authorization server becomes an open
+redirector.  When the client asked for something malformed, it gets
+RFC 6749 §4.1.2.1's `error=` redirect with its own `state`.  And when it
+asked for something Globus does and Fauxbus has not built — `prompt=none`,
+offline access, PKCE `plain`, another `response_mode` — it gets the loud
+501, rendered, because an `error=` code would tell the client *it* was
+wrong.  The same three-way split the token endpoint makes for grant
+types, for the same reason.
+
+**The code** is one-use, bound to the client, the exact redirect URI,
+the scopes, the nonce, the PKCE challenge, and the identity, and every
+mismatch at the exchange is the RECORDED 401 `invalid_grant`.  It lives
+600 seconds on the logical clock (PROVISIONAL — no lifetime is
+published), so a test proves expiry with a `tick`, and a failed exchange
+does not spend it.  The response is the recorded document: `other_tokens`
+always present, `resource_server` flipped to `auth.globus.org` with
+`id_token` beside it whenever `openid` was asked — even when another
+service's scope was named first, since `id_token` is only ever read from
+the top level — and the authorize request's `state` echoed in the body,
+as the SDK's default fixture shows.  A public (native-app) client's
+exchange is a 501: Fauxbus registers confidential clients only.
+
+**Signing is RS512 in `signing.py`, stdlib only.**  The zero-dependency
+rule held: the switch from the probe's RS256 was one constant, the
+SHA-512 `DigestInfo` prefix.  The fixture private key is in the source,
+published on purpose, and the `kid` is its RFC 7638 thumbprint.  Every
+ID token the suite mints goes through PyJWT and through globus-sdk's own
+`decode_id_token`, which arrives with the conformance extra — so a wrong
+byte in a hand-rolled signer is a red test, not a mystery in a broker
+log.
+
+### Clocks: logical by default, wall time by explicit opt-in
+
+The roadmap settled on 2026-08-24 that signed-token instants must anchor
+to real time, because the verifier is not playing.  Building it turned
+"must" into a question of *who decides*, and the answer is the harness,
+out loud.
+
+`oidc.signed_token_clock` is `"logical"` (the default) or `"wall"`, set
+in the seed or by `--signed-token-clock` at boot.  Under **logical**, an
+ID token's `iat` is the world clock: deterministic, byte-identical
+across runs (a test can assert on the whole token string), and right for
+anything a harness verifies with its own clock or seeds to a real
+second.  Under **wall**, `iat` is real time, and that is right for an
+outside verifier like Keycloak.  Determinism survives in the offsets —
+`exp - iat` is always 172800 — rather than in the absolute value.
+
+What `wall` changes is deliberately narrow: ID-token `iat`/`exp` and the
+`last_authentication` recorded at sign-in.  Authorization codes and
+access tokens stay on the logical clock, because Fauxbus is the one
+validating those.  `tick` does not move wall time.  And there is exactly
+one wall-clock read in the codebase, `FauxbusServer.signed_now`, with the
+clock injectable so the suite can freeze it; `world.py` never reads time
+at all.
+
+Why not wall by default, given the trap?  Because principle 3 is a
+promise to every consumer that did not ask for an outside verifier, and
+a fake that starts reading the wall clock on its own is a fake whose
+dumps stopped being reproducible without anyone choosing that.  The
+price is that a Keycloak user who forgets the flag gets ID tokens from
+1970 and a login that "just fails."  So the boot line and
+`GET /_fauxbus/` both name the clock in use, the README's Keycloak
+section leads with it, and `examples/seed.json` — the copyable pattern —
+sets `"wall"`.
+
+### Issuer versus reachability
+
+In a compose network the browser reaches Fauxbus as
+`http://localhost:9800` and the broker reaches it as
+`http://fauxbus:9800`.  A broker checks `iss` as a string, so the issuer
+cannot be derived from whichever `Host` header a request carried; it is
+configuration, `--issuer` or the seed's `oidc.issuer`, and every surface
+answers with it regardless of the name it was reached by.  Pick the
+name the *browser* uses — it is the one in the authorize URL — and give
+the broker the network name for its back-channel URLs.  Keycloak takes
+the four endpoints separately, which is exactly what makes this work.
+With no issuer configured, the OIDC surfaces answer a 503 saying so
+rather than guess.  An issuer under `globus.org` or `globusid.org` is
+refused at boot (exit 2) and at the seed door (422).
+
+Seed authoritative, flag as default: a seeded issuer beats `--issuer`,
+the state dump shows only the world's own value (null when unset), and
+`GET /_fauxbus/` shows the effective one.  A world reset to empty, or a
+seed that never mentions OIDC, still leaves a broker pointed at a
+working issuer.
+
+### The seed model
+
+```json
+{
+  "oidc": {"issuer": "http://localhost:9800", "signed_token_clock": "wall"},
+  "identity_providers": {
+    "41143743-f3c8-4d60-bbdb-eeecaba85bd9": {"name": "Globus ID"},
+    "00000000-0000-4000-8000-0000000001d9": {"name": "Night Owl University"}
+  },
+  "accounts": {
+    "<primary identity id>": {
+      "identities": {
+        "<primary identity id>": {"username": "...", "identity_provider": "...",
+                                  "name": "...", "email": "...", "organization": "..."},
+        "<linked identity id>":  {"...": "..."}
+      }
+    }
+  },
+  "clients": {
+    "<client id>": {"secret": "...", "name": "...",
+                    "redirect_uris": ["https://broker.example/realms/x/broker/globus/endpoint"],
+                    "required_idp": "<identity provider id or null>"}
+  }
+}
+```
+
+An account is named by its primary identity, as Globus names one, and
+lists every identity including the primary.  An identity belongs to one
+account.  UUID and username stay separate fields, which keeps a rename
+representable (see the roadmap's identity-churn note).  A client with no
+`redirect_uris` cannot run the browser flow, which is how Fauxbus says
+"client_credentials only" without a grant-types field nobody would
+consult.  The identity object's `status` and `identity_type` are left
+out until a surface emits them.
+
+The login in flight is world state too — parked authorization requests,
+issued codes, sessions — and it round-trips like everything else, so a
+harness can dump a half-finished login and restore it exactly.  Reset
+clears all three: a surviving code could be redeemed by the next test,
+and a surviving session would sign the next test's browser in as the
+last test's user.  Their minted names (`fauxbus-code-N`,
+`fauxbus-session-N`, `fauxbus-request-N`) get the same seed-door guard
+`fauxbus-at-N` got in v0.2.17.
+
 ## The control plane (`/_fauxbus/`)
 
 - `POST /_fauxbus/reset` — the between-tests handshake.  If a canonical
@@ -565,6 +830,15 @@ it gets refused rather than guessed twice.
   imitated `/v2/…` surface — you cannot brick the control plane with it.
   One-shot inline variant: send `X-Fauxbus-Fail: 429` on any request to get
   that failure exactly once, for quick cases.
+- `GET /_fauxbus/auth/login?request=…` and `POST /_fauxbus/auth/login`
+  — the account picker a browser with no Fauxbus session is sent to by
+  `/v2/oauth2/authorize` (slice B).  Plain HTML, one form per seeded
+  account, no password field and never will be.  Picking signs the
+  browser in with a `fauxbus_session` cookie and finishes the parked
+  authorization request.
+- `POST /_fauxbus/auth/session` — `{"account": "<primary identity id>"}`
+  signs a headless test in before it starts a login, so authorize skips
+  the picker.  Returns the cookie in `Set-Cookie` and in the body.
 - `POST /_fauxbus/tick` — advance Fauxbus's logical clock by N seconds
   (roadmap: what makes transfer-task progression testable without
   `sleep`; nothing consumes it in v0.1, but it exists from day one so
@@ -595,10 +869,12 @@ test connects.
   a byte-identical round-trip test in CI.
 - Zero runtime dependencies — stdlib only, on purpose.  A test fake
   consumers add to their dev environments should not bring a supply
-  chain with it.  Tested against its hardest case on 2026-08-24: signing
-  RS256 ID tokens looks like it requires a crypto library and turns out
-  not to (roadmap → Auth).  The rule has not needed an exception yet,
-  and "we checked" is a stronger claim than "we intend to."
+  chain with it.  Tested against its hardest case on 2026-08-24, and
+  then built against it in slice B: signing ID tokens looks like it
+  requires a crypto library and turns out not to — `signing.py` signs
+  RS512 with `hashlib` and `pow()`.  The rule has not needed an
+  exception yet, and "we built it" is a stronger claim than "we
+  checked," which was stronger than "we intend to."
 - MIT (decided 2026-07-30).  We reviewed the Globus Connect source
   license first: it covers GCS/GCP source code only — not the APIs, not
   the Apache-2 SDK — and Fauxbus stays entirely outside its scope by
@@ -692,8 +968,11 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
     to be slice B's floor as well: a broker that signs people in and
     checks their groups asks for `openid` and a Groups scope in one
     request, which is two services.
-  - **`id_token` on an `openid` request**, which needs slice B's signing.
-    Refused rather than answered without the field.
+  - ~~**`id_token` on an `openid` request**~~ — **built in slice B**,
+    for the authorization-code grant, where a person signed in for the
+    token to describe.  Under `client_credentials` it is still refused:
+    recording list #3 asks whether the real service answers that at
+    all.
   - **Dependent scopes** (`scope[dependent]`) and the dependent-token
     grant.
   - **`refresh_token`** as a grant, and refresh tokens in the response.
@@ -713,6 +992,11 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   tokens** keep their place in the roadmap and still have no consumer
   asking.
 
+  **Slice B shipped** (v0.2.21, its own section above) — the paragraphs
+  below are the design as it was settled beforehand, kept because the
+  section above refers back to them, with corrections marked where the
+  building changed them.
+
   **Slice B — the OIDC authorization-code flow**, so a real identity
   broker can authenticate a seeded account against Fauxbus.  Principle 1
   survives this better than expected: `get_openid_configuration`,
@@ -727,7 +1011,10 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   rather than let the grade be assumed.  The broker-in-a-container
   acceptance test belongs to the consumer's repo: making a broker a
   Fauxbus dev dependency would mean acquiring a second supply chain in
-  order to test a fake whose entire pitch is not having one.
+  order to test a fake whose entire pitch is not having one.  (Held:
+  Fauxbus ran it once itself, as `examples/keycloak_broker.py` — a
+  script, not a test, outside the suite and outside every dependency
+  list — and hands it to consumers as the template.)
 
   Test control for the redirect leg stays out-of-band per principle 4.
   No `fauxbus_*` query parameters on `/v2/oauth2/authorize` — an
@@ -750,7 +1037,11 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   fixture private key ships **published in the repo, on purpose**:
   anyone can forge a Fauxbus token, so nobody can ever be tempted to
   trust one.  That turns "don't point production at the fake" from a
-  sentence in a document into a property of the system.
+  sentence in a document into a property of the system.  *Corrected in
+  slice B:* the real service signs **RS512**, captured from its live
+  discovery document and JWKS on 2026-10-12; RS256 was the probe's
+  choice, not Globus's.  The recording won, and the switch was one
+  constant.
 
   **Clocks: signed tokens are the one exception to principle 3.**
   Fauxbus has no wall-clock dependence; time advances when a test says
@@ -766,7 +1057,10 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   `iat`/`exp` on signed tokens anchor to real time, and determinism is
   preserved in the *offset* rather than the absolute value.  Worth
   stating loudly: the symptom is "login just fails," which points
-  nowhere near the cause.
+  nowhere near the cause.  *Refined in slice B:* real time is an
+  explicit opt-in (`signed_token_clock: "wall"`), not the default — see
+  "Clocks" in the slice B section for why the harness, not Fauxbus,
+  makes that call.
 
   **Identity churn: a constraint, not a feature.**  This bullet briefly
   required the seed model to *stage* renames through the control plane —
@@ -789,6 +1083,9 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   the configured issuer names a real Globus domain.  Refuse, not warn:
   the failure being prevented is a production client trusting a fake,
   and that is not a thing to leave to whether someone read the output.
+  (Built as stated; the "every surface must agree" half turned out to
+  need a corollary about Host headers — see "Issuer versus
+  reachability" above.)
 - **Web interface** (penciled for v0.4) — a browser face at
   `app.fauxbus.local` (mocked in DNS) that lightly mirrors
   `app.globus.org`: browse groups and memberships, watch transfer tasks
@@ -806,6 +1103,81 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.21** (2026-10-12) — **Auth slice B: a real Keycloak signs
+  someone in through Fauxbus.**  Discovery, `/jwk.json`, the authorize
+  endpoint with an out-of-band account picker, the `authorization_code`
+  grant, signed ID tokens, userinfo, linked identities and
+  `required_idp`.  Root Cellar's dev realm is the consumer; its
+  `globus-desk` broker points here next.  Full design in the slice B
+  section above.
+
+  **The real service was asked first, and it corrected the plan
+  twice.**  Every grade in this project has come from SDK fixtures,
+  because there is no tenancy to record against.  But discovery and the
+  JWKS are public, unauthenticated GETs, and nobody had fetched them.
+  Fetched before writing the signer, they said **RS512** — SPEC's
+  2026-08-24 probe, and the brief for this slice, both said RS256 —
+  and that the token endpoint advertises **`client_secret_basic` only**,
+  where slice A had built `client_secret_post` with Keycloak's default
+  in mind.  The signer took the recorded algorithm (one constant
+  changed); the post method stays accepted but goes on the recording
+  list, and the advice to consumers flips to Basic.  The published
+  reference, read the same afternoon, turned three planned guesses into
+  DOCUMENTED: `identity_set` arrives under plain `openid` (this
+  slice's own first draft had it gated behind `view_identity_set`, a
+  real scope name that turned out to gate nothing here), `sub` is the *effective* identity, and
+  `required_idp` swaps it for the linked one.  Cheapest grounding this
+  project has ever done, and it ran last.  It should have run in
+  August.
+
+  **The clock decision: logical by default, wall time by stated
+  opt-in.**  The roadmap had already settled that ID-token instants
+  must anchor to real time for an outside verifier.  Building it, the
+  open question was who flips that switch, and the answer is the
+  harness: `oidc.signed_token_clock: "wall"` in the seed, or
+  `--signed-token-clock wall`.  One wall-clock read in the codebase
+  (`FauxbusServer.signed_now`, injectable), `world.py` still reads no
+  time at all, codes and access tokens stay logical, and under the
+  default an ID token is byte-identical across runs.  The trap is
+  named on the boot line, in `GET /_fauxbus/`, in the README, and
+  pre-set in `examples/seed.json`.
+
+  **The proof ran.**  `examples/keycloak_broker.py` drives
+  `quay.io/keycloak/keycloak:26.0` with `urllib` and a cookie jar:
+  Keycloak's login page, the identity-provider button, Fauxbus's
+  authorize and picker, back to Keycloak with a code, first-broker-
+  login, a Keycloak token for alice.  Keycloak's federated identity for
+  her is `00000000-…-00000000000a` — her *university* identity, because
+  the seeded client requires that provider — with both
+  `client_secret_basic` and `client_secret_post`.  Fauxbus's own
+  request log shows what Keycloak actually sent: `code_challenge` with
+  S256, a `nonce`, its long dotted `state`, then a token exchange, a
+  JWKS fetch, and a userinfo call.  **Nothing in Keycloak forced a
+  Fauxbus change.**  One thing a consumer will want to know: Keycloak's
+  attribute importer flattens `identity_set` objects into Java
+  `{key=value}` strings, not JSON.
+
+  Caught before commit, both by reading rather than testing: an issuer
+  checked *after* the code was redeemed would have answered a 503 while
+  leaving a spent code and minted tokens behind — slice A's orphan
+  problem through a side door — so the issuer is now required before
+  the code is touched; and response headers were validated after the
+  status line went out, too late to turn a refusal into a clean error.
+
+  223 tests, up from 161; 25 through the real globus-sdk, including its
+  own `decode_id_token` verifying a Fauxbus ID token through discovery
+  and the JWK.
+
+  **PROVISIONAL inventory: 31 markers**, up eight from 23, **five new
+  obligations** (recording list 10–14: the unsatisfied-`required_idp`
+  behavior, code lifetime, userinfo's 401/403 split, whether
+  `client_secret_post` is accepted, the `state` echo on openid).  The
+  other three markers attach to obligations already listed:
+  `identity_set`'s entry shape and its order (two markers, the
+  standing top-priority item), and `openid` on top of a multi-service
+  response (#8, one case narrower).  Counted with
+  `grep -rn PROVISIONAL src/ | wc -l`.
 
 - **v0.2.20** (2026-10-10) — **CI scans the image, and CVEs get acked
   rather than ignored.**  New `scan-image` step: grype v0.112.0 against

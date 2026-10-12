@@ -39,7 +39,10 @@ batch membership verbs — plus the OAuth2 **client-credentials grant** at
 then spend it, and the **introspection** and **revocation** endpoints
 that go with it, so the service on the receiving end can ask whether
 the token it was handed is real and the service that issued one can
-take it back.  The conformance suite drives all of it through the
+take it back — plus the **OIDC authorization-code flow**, so a real
+identity broker like Keycloak can sign a seeded person in through
+Fauxbus, linked identities and all.  The conformance suite drives all
+of it through the
 actual globus-sdk, unmodified, including the SDK's retry layer
 recovering through an injected 429.  Response shapes not yet backed by a
 recording are marked `PROVISIONAL` in code and tracked as conformance
@@ -103,6 +106,61 @@ made-up tokens: it checks that a token was issued here, hasn't expired
 (on the logical clock — `POST /_fauxbus/tick` ages it, no sleeping), and
 is good for the service being called.  Three production failures you
 otherwise cannot write a test for.
+
+## Brokered login (OIDC)
+
+Seed people and a login client, give Fauxbus an issuer, and a real
+broker can sign someone in through it.  The browser lands on a plain
+Fauxbus page listing the seeded accounts — no passwords, ever — picks
+one, and the broker gets a code, a signed ID token, and userinfo, the
+way it would from Globus.  `examples/seed.json` carries a working set:
+alice, whose Globus ID account has a linked university identity, and a
+login client that requires the university provider, so she signs in
+*as her university identity*.
+
+```sh
+fauxbus serve --seed examples/seed.json --issuer http://localhost:9800 \
+              --signed-token-clock wall
+```
+
+**`--signed-token-clock wall` is the flag that matters.**  Fauxbus runs
+on a logical clock and never reads real time unless you ask; Keycloak
+checks an ID token's `exp` against real time and cannot be asked to
+tick.  Without the flag, the tokens say 1970 and the login "just
+fails."  (The example seed sets it already.)
+
+**One issuer, two names.**  In compose the browser reaches Fauxbus at
+`localhost:9800` and Keycloak reaches it at `fauxbus:9800`.  Fauxbus
+stamps every ID token with the configured issuer whichever name it was
+reached by, so give Keycloak the browser's name for the authorize URL
+and the issuer, and the network's name for everything else.  The
+identity-provider settings `examples/keycloak_broker.py` proved against
+Keycloak 26.0:
+
+| Keycloak setting | Value |
+| --- | --- |
+| Issuer | `http://localhost:9800` |
+| Authorization URL | `http://localhost:9800/v2/oauth2/authorize` |
+| Token URL | `http://fauxbus:9800/v2/oauth2/token` |
+| JWKS URL (Use JWKS URL: on) | `http://fauxbus:9800/jwk.json` |
+| User Info URL | `http://fauxbus:9800/v2/oauth2/userinfo` |
+| Client authentication | Client secret as basic auth (`client_secret_basic`) |
+| Validate signatures | on |
+| PKCE | on, S256 |
+| Scopes | `openid profile email` |
+| Sync mode | force |
+
+Basic auth because that is the only method the real Globus advertises;
+Fauxbus also accepts `client_secret_post`, which the real service may
+not.  Ask for `profile` and `email` explicitly — under `openid` alone
+Globus sends no name or address, and neither does Fauxbus.  Run the
+proof yourself with `python examples/keycloak_broker.py` (needs docker;
+cleans up after itself).
+
+The fixture signing key is published in `src/fauxbus/signing.py` on
+purpose.  Anyone can forge a Fauxbus token, so nobody can be tempted to
+trust one.  Never configure it as a trusted issuer anywhere real —
+and Fauxbus refuses to run with an issuer under a Globus domain.
 
 ## In a compose stack
 
