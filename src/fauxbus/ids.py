@@ -73,6 +73,33 @@ def access_token(counter: int) -> str:
     return f"{ACCESS_TOKEN_PREFIX}{counter}"
 
 
+# Slice B's ephemeral state follows the access token's naming rule: a
+# readable prefix plus the counter, so a code in a log says it is a code.
+# Each prefix pairs with a counter name in World.counters.
+CODE_PREFIX = "fauxbus-code-"
+SESSION_PREFIX = "fauxbus-session-"
+REQUEST_PREFIX = "fauxbus-request-"
+
+
+def minted_name(prefix: str, counter: int) -> str:
+    """The Nth object of a minted kind, spelled the same every run."""
+    return f"{prefix}{counter}"
+
+
+def minted_number(prefix: str, name: str) -> int | None:
+    """Invert ``minted_name``: the N in ``<prefix>N``, or None.
+
+    The general form of ``access_token_number`` below, for the same
+    reason: a seeded name the mint has not reached yet is a name the
+    mint will one day overwrite.  Same parse-don't-pattern-match rule,
+    so ``fauxbus-code-007`` is free for a harness to use.
+    """
+    rest = name.removeprefix(prefix)
+    if rest == name or not rest.isdigit() or str(int(rest)) != rest:
+        return None
+    return int(rest)
+
+
 def access_token_number(token: str) -> int | None:
     """Invert ``access_token``: the N in ``fauxbus-at-N``, or None.
 

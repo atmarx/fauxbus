@@ -27,6 +27,7 @@ import base64
 import binascii
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from .ids import identity_id_for_token
 
@@ -90,6 +91,56 @@ REFRESH_SCOPE = "offline_access"
 # request, and a fake that honours neither had better say so for both —
 # otherwise the SDK's own spelling is the one that fails silently.
 OFFLINE_ACCESS_TYPE = "offline"
+
+
+# The scope that asks for the caller's linked identities.  Its *name* is
+# RECORDED — ``globus_sdk/scopes/data/auth.py`` defines
+# ``AuthScopes.view_identity_set`` — but slice B does not consult it:
+# the published reference puts ``identity_set`` under plain ``openid``
+# for both the ID token and userinfo (DOCUMENTED, docs.globus.org/api/
+# auth/reference, read 2026-10-12).  Kept here so the next reader who
+# wonders whether it gates anything finds the answer next to the name.
+VIEW_IDENTITY_SET_SCOPE = "urn:globus:auth:scope:auth.globus.org:view_identity_set"
+
+# Domains whose names Fauxbus will never wear as an issuer.  Not a
+# warning, a refusal: the failure being prevented is a production client
+# trusting a fake — or, the other way round, a harness quietly minting
+# tokens that claim to come from the real service — and neither is a
+# thing to leave to whether someone read the boot output.
+# globusid.org is Globus's own identity provider; it belongs here for
+# the same reason auth.globus.org does.
+_GLOBUS_DOMAINS = ("globus.org", "globusid.org")
+
+
+def check_issuer(issuer: str) -> str:
+    """Validate a configured OIDC issuer, or raise ValueError saying why.
+
+    An issuer is the one string every OIDC surface must agree on —
+    discovery's ``issuer``, every endpoint URL derived from it, and the
+    ``iss`` inside every ID token a broker checks character for
+    character.  OIDC Discovery §3 requires an http(s) URL with no query
+    and no fragment; Fauxbus additionally refuses any host under a real
+    Globus domain.
+
+    The value comes back unchanged, trailing slash and all, because a
+    broker compares ``iss`` as a *string*: quietly "normalizing"
+    ``http://fauxbus:9800/`` to ``http://fauxbus:9800`` would hand the
+    broker a different string than the one its operator typed into it.
+    """
+    parts = urlsplit(issuer)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"issuer must be an http(s) URL with a host, got {issuer!r}")
+    if parts.query or parts.fragment:
+        raise ValueError(f"issuer may not carry a query or fragment (OIDC Discovery §3): {issuer!r}")
+    host = parts.hostname.lower().rstrip(".")
+    for domain in _GLOBUS_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            raise ValueError(
+                f"refusing issuer {issuer!r}: {domain} belongs to the real Globus service. "
+                f"A fake that signs tokens in Globus's name is the one configuration "
+                f"Fauxbus will not run in. Use a name you own, e.g. http://fauxbus.test:9800"
+            )
+    return issuer
 
 
 @dataclass(frozen=True)

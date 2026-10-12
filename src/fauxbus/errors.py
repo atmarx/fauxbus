@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import ISSUES_URL
+from .ids import sequential_id
 
 
 class ApiError(Exception):
@@ -147,3 +148,55 @@ def unsupported_grant_type(detail: str) -> OAuthError:
 
 def invalid_scope(detail: str) -> OAuthError:
     return OAuthError(400, "invalid_scope", detail)
+
+
+class AuthServiceError(ApiError):
+    """Globus Auth's *own* error document — a third shape, and also recorded.
+
+    Two dialects turned out to be an undercount.  The userinfo endpoint
+    is an Auth API resource, not an OAuth2 grant, and the SDK's fixtures
+    for it (``globus_sdk/testing/data/auth/userinfo.py`` and
+    ``_common.py``, 4.8.1) show a document that carries *both* families
+    at once: a JSON:API-style ``errors`` list with ``code``/``detail``/
+    ``title``, and RFC 6749's ``error``/``error_description`` beside it.
+    The SDK parses the list, so ``.code`` comes back ``UNAUTHORIZED`` and
+    ``.message`` "Call must be authenticated" — unlike the token
+    endpoint, where both are ``None``.
+
+    The ``id`` in the fixture is a fresh ``uuid1`` per process.  Fauxbus
+    derives one from the code instead (principle 3: no randomness), so
+    the same failure renders the same bytes on every run.
+    """
+
+    def __init__(self, status: int, code: str, detail: str, title: str) -> None:
+        super().__init__(status, code, detail)
+        self.title = title
+
+    def body(self) -> dict[str, Any]:
+        return {
+            "errors": [
+                {
+                    "status": str(self.status),
+                    "id": sequential_id("auth-error", self.status),
+                    "code": self.code,
+                    "detail": self.detail,
+                    "title": self.title,
+                }
+            ],
+            "error_description": "Unauthorized",
+            "error": "unauthorized",
+        }
+
+
+# RECORDED, both of them, body and text: the fixtures pair the same
+# "Call must be authenticated" detail with 401/UNAUTHORIZED and with
+# 403/FORBIDDEN.  Which *situation* earns which status is not recorded —
+# see World.userinfo_token for the mapping Fauxbus chose.
+
+
+def auth_unauthorized() -> AuthServiceError:
+    return AuthServiceError(401, "UNAUTHORIZED", "Call must be authenticated", "Unauthorized")
+
+
+def auth_forbidden() -> AuthServiceError:
+    return AuthServiceError(403, "FORBIDDEN", "Call must be authenticated", "Unauthorized")
