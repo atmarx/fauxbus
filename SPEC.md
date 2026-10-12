@@ -1104,6 +1104,63 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **Package release: fauxbus 0.3.0** (2026-10-12, tag `v0.3.0`) — **Auth
+  slice B reaches consumers**, and with it everything since 0.2.0.  A
+  minor: new imitated surface (introspection, revocation, discovery,
+  `/jwk.json`, authorize, the `authorization_code` grant, userinfo),
+  new CLI flag (`--signed-token-clock`), and a changed container base.
+  One behaviour an 0.2.0 consumer could have relied on changed, on
+  purpose: asking for a refresh token (`offline_access`, or
+  `access_type=offline`) used to get a 200 that quietly had no
+  `refresh_token` in it, and now gets the 501 it always deserved.
+  Requests spanning two services went the other way, from 501 to 200.
+
+  What a consumer gets, in the order it landed: token introspection and
+  revocation (v0.2.17); the two slice A bugs that came with them — the
+  mint overwriting seeded tokens, and `offline_access` treated as a
+  service (v0.2.17); multi-resource-server token responses (v0.2.18);
+  the OIDC authorization-code flow with signed RS512 ID tokens, linked
+  identities and `required_idp` (v0.2.21).
+
+  **Proved by its consumer before the tag existed.**  Root Cellar drove
+  slice B end to end on its dev stack at `7f8a483` — this exact tree —
+  through its Keycloak `globus-desk` broker: a person with a linked
+  university identity signed in and was role-gated correctly, and a
+  person without one was refused at the broker, as `required_idp`
+  should.  Root Cellar is waiting on this tag, because 0.2.0 refuses a
+  seed with an `oidc` section.
+
+  **The container changes under you.**  The image's final stage is
+  `python:3.13-alpine` now, not Debian slim (v0.2.19): no bash, no apt,
+  busybox `sh` instead.  Nothing in Fauxbus depends on the old base,
+  but `docker exec … bash` will fail.  uid is still 9800; gid is now
+  9800 too.  The reason is the scan: a fresh build went from 161 grype
+  findings to 5 Medium, all acked in `.grype.yaml`, and CI now fails on
+  anything Medium-or-above that is not (v0.2.20).  **Rebuild with
+  `--pull`** — a consumer image built a month ago carried 14 Criticals
+  that a fresh build does not.
+
+  **Re-pin handshake:** Root Cellar moves both of its pins to
+  `fauxbus==0.3.0` in one commit, alongside its OIDC seed.  Its own
+  seat carries that.
+
+  Verified before the tag, from a `git archive` of the release commit:
+  a clean-venv install reports 0.3.0 from `fauxbus version`, from
+  `importlib.metadata`, from the module literal, and on the wire at
+  `GET /_fauxbus/` — with no runtime dependencies.  `twine check`
+  passes.  223 tests, 25 through the real globus-sdk.
+
+  **PROVISIONAL inventory: 31 markers**, up from 0.2.0's 17 — fourteen
+  across three releases' worth of surface, every one listed on the
+  recording list with the version that added it.  The real-Globus leg
+  of the conformance tether is still unrun.  One partial exception,
+  worth naming because it is new: slice B fetched the real service's
+  *public* discovery document and JWKS, and they corrected two things
+  (RS512, not RS256; Basic client auth as the advertised method).
+  Everything behind authentication is still graded against SDK
+  fixtures, and a sacrificial tenancy is still the single item that
+  would retire the most markers at once.
+
 - **v0.2.21** (2026-10-12) — **Auth slice B: a real Keycloak signs
   someone in through Fauxbus.**  Discovery, `/jwk.json`, the authorize
   endpoint with an out-of-band account picker, the `authorization_code`
