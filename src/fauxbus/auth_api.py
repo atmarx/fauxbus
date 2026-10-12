@@ -1,8 +1,10 @@
 """The imitated surface: Globus Auth v2, the OAuth2 token endpoint.
 
-One route so far — ``POST /v2/oauth2/token`` with
-``grant_type=client_credentials``, the grant a service uses to act as
-*itself* rather than on behalf of a person.  It is built
+``POST /v2/oauth2/token`` with two grants.  ``client_credentials`` (slice
+A) is the grant a service uses to act as *itself* rather than on behalf
+of a person; ``authorization_code`` (slice B) is where a browser login
+that started at ``/v2/oauth2/authorize`` (see ``oidc_api.py``) is
+redeemed for tokens acting as the person who signed in.  Both are built
 resource-server-generic on purpose: nothing here knows or cares that
 Groups exists.  The requested scopes name the service, and the same
 endpoint that hands a WordPress provisioner a Groups token hands a
@@ -30,13 +32,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from .auth import OFFLINE_ACCESS_TYPE, REFRESH_SCOPE, parse_basic, split_scopes
+from . import signing
+from .auth import (
+    AUTH_RESOURCE_SERVER,
+    OFFLINE_ACCESS_TYPE,
+    REFRESH_SCOPE,
+    parse_basic,
+    split_scopes,
+)
 from .errors import (
     invalid_client,
     invalid_request,
     not_implemented,
     unsupported_grant_type,
 )
+from .oidc_api import require_issuer
 from .server import Ctx, FauxbusServer
 from .world import GLOBUS_GRANT_TYPES, IMPLEMENTED_GRANT_TYPES, OAuthClient
 
@@ -95,6 +105,18 @@ def _authenticate_client(ctx: Ctx, form: dict[str, str]) -> OAuthClient:
         client_id, secret = basic
     elif in_body:
         client_id, secret = form.get("client_id", ""), form.get("client_secret", "")
+        if client_id and not secret and form.get("grant_type") == "authorization_code":
+            # A client_id with no secret on a code exchange is not a
+            # malformed request — it is how a *public* client (a native
+            # app; globus-sdk's NativeAppAuthClient) authenticates, with
+            # PKCE standing in for the secret.  Globus supports those.
+            # Fauxbus registers confidential clients only, so this is our
+            # gap, and calling it invalid_request would blame the caller.
+            raise not_implemented(
+                "this looks like a public (native app) client exchanging a code with no "
+                "secret. Fauxbus registers confidential clients only. Real client code "
+                "needs a native app flow?"
+            )
         if not client_id or not secret:
             raise invalid_request(
                 "in-body client authentication requires both 'client_id' and "
@@ -167,7 +189,14 @@ def token(ctx: Ctx) -> tuple[int, Any]:
     form = _require_form(ctx)
     client = _authenticate_client(ctx, form)
     grant_type = _require_grant(form)
+    if grant_type == "authorization_code":
+        return _authorization_code(ctx, client, form)
+    return _client_credentials(ctx, client, form, grant_type)
 
+
+def _client_credentials(
+    ctx: Ctx, client: OAuthClient, form: dict[str, str], grant_type: str
+) -> tuple[int, Any]:
     raw_scope = form.get("scope", "")
     scopes = split_scopes(raw_scope)
     if not scopes:
@@ -183,19 +212,19 @@ def token(ctx: Ctx) -> tuple[int, Any]:
             "urn:globus:auth:scope:groups.api.globus.org:all"
         )
     if "openid" in scopes:
-        # SPEC promises that an openid response carries an ``id_token``,
-        # and Fauxbus cannot sign one until Auth slice B lands.  Issuing
-        # the token *without* the field would be the silent wrong answer
-        # principle 2 forbids — the consumer's ``response["id_token"]``
-        # would raise a KeyError pointing at their code rather than at
-        # this gap.  There is also a semantic argument: an ID token
-        # describes an authenticated person, and client_credentials has
-        # no person in it at all.
+        # Still refused after slice B, and now the reason is different.
+        # Fauxbus can sign ID tokens — but an ID token describes an
+        # authenticated *person*, and client_credentials has no person in
+        # it at all.  Whether the real endpoint declines this request or
+        # answers it somehow is unobserved (recording list #3), and
+        # answering without the ``id_token`` field would be the silent
+        # wrong answer principle 2 forbids: the consumer's
+        # ``response["id_token"]`` would raise a KeyError pointing at
+        # their code rather than at this gap.
         raise not_implemented(
-            "Fauxbus does not issue ID tokens yet, so it will not answer a request "
-            "carrying the 'openid' scope with a token that is missing one. Signed "
-            "id_tokens arrive with Auth slice B (the authorization-code flow), where "
-            "there is an authenticated person for an ID token to describe."
+            "Fauxbus issues ID tokens only from the authorization-code grant, where a "
+            "person signed in for the token to describe. Whether Globus answers 'openid' "
+            "under client_credentials is unrecorded, so Fauxbus will not guess."
         )
 
     _refuse_refresh_requests(form, scopes)
@@ -222,6 +251,80 @@ def token(ctx: Ctx) -> tuple[int, Any]:
     # World.token_response for the field-by-field grounding, and in
     # particular why ``other_tokens`` is not optional.
     return 200, ctx.world.token_response(issued[0], issued[1:])
+
+
+def _authorization_code(ctx: Ctx, client: OAuthClient, form: dict[str, str]) -> tuple[int, Any]:
+    """RFC 6749 §4.1.3: trade a one-use code for tokens.
+
+    The response is RECORDED from ``oauth2_exchange_code_for_tokens.py``
+    (4.8.1), and it holds two surprises worth knowing before reading the
+    code:
+
+    - **``state`` comes back in the body.**  The fixture's default
+      response carries ``"state": "_default"`` — the SDK's own default
+      state value — even though the exchange request never sends one.
+      So the real service remembers the authorize request's ``state``
+      and echoes it here.  Fauxbus does the same, from the code's
+      binding, and leaves the key off when no state was sent.  The
+      fixture's ``openid`` variant has no ``state`` at all; whether that
+      is the service or the fixture being terse is unknown, and Fauxbus
+      echoes it there too.
+    - **``openid`` puts ``auth.globus.org`` on top.**  The fixture's
+      openid response names ``auth.globus.org`` as the primary
+      ``resource_server`` with ``id_token`` beside it at the top level,
+      which is the only place ``decode_id_token`` looks.  So when
+      ``openid`` is among the scopes, the Auth token is primary whatever
+      order the scopes were named in.  PROVISIONAL as a rule for
+      multi-service requests (recording list #8's question, one case
+      narrower): the fixture shows ``openid`` alone.
+
+    ``scope`` in the exchange body is ignored — RFC 6749 §4.1.3 does not
+    define it here, and the code already carries what was authorized.
+    """
+    code_value = form.get("code")
+    if not code_value:
+        raise invalid_request("'code' is required.")
+    redirect_uri = form.get("redirect_uri")
+    if not redirect_uri:
+        raise invalid_request(
+            "'redirect_uri' is required — the same URI the authorization request used "
+            "(RFC 6749 §4.1.3)."
+        )
+    # Before the code is spent, not after: a missing issuer discovered
+    # while signing would leave a redeemed code and minted tokens behind
+    # an error response — the orphan problem the all-or-nothing scope
+    # parse exists to prevent, arriving by a side door.
+    issuer = require_issuer(ctx)
+    code = ctx.world.redeem_code(client, code_value, redirect_uri, form.get("code_verifier"))
+
+    by_server = ctx.world.scopes_by_resource_server(code.scopes)
+    if "openid" in code.scopes:
+        by_server = {AUTH_RESOURCE_SERVER: by_server.pop(AUTH_RESOURCE_SERVER), **by_server}
+    issued = [
+        ctx.world.issue_token(
+            client,
+            resource_server=resource_server,
+            scopes=server_scopes,
+            grant_type="authorization_code",
+            code=code,
+        )
+        for resource_server, server_scopes in by_server.items()
+    ]
+    doc = ctx.world.token_response(issued[0], issued[1:])
+    if "openid" in code.scopes:
+        claims = ctx.world.id_token_claims(
+            code,
+            issued[0].token,
+            issuer=issuer,
+            now=ctx.server.signed_now(),
+        )
+        doc["id_token"] = signing.sign_jwt(claims)
+    if code.state is not None:
+        # PROVISIONAL for the openid case: the recorded default response
+        # echoes ``state``; the recorded openid response has none.  See
+        # the docstring — Fauxbus echoes in both.
+        doc["state"] = code.state
+    return 200, doc
 
 
 def _require_token_field(form: dict[str, str]) -> str:
@@ -275,19 +378,19 @@ def introspect(ctx: Ctx) -> tuple[int, Any]:
     _authenticate_client(ctx, form)
     token = _require_token_field(form)
     if form.get("include"):
-        # ``include=identity_set`` asks for the caller's linked
-        # identities.  Fauxbus does not model identity linking at all —
-        # there is no way to seed a second identity onto anyone — so the
-        # only answer it could give is a list of one, every time, for
-        # everybody.  That is exactly the plausible-looking answer to an
-        # unanswerable question that principle 2 exists to forbid: a
-        # consumer testing "this user has three linked identities" would
-        # get a passing test against a world that cannot have them.
+        # ``include=identity_set`` asks for the token subject's linked
+        # identities.  Until slice B this was refused because Fauxbus
+        # could not model linking at all, and the only possible answer
+        # was a list of one for everybody.  Slice B can model it — the
+        # seed's ``accounts`` link identities — so the refusal now rests
+        # on principle 2 alone: nobody has asked for the introspection
+        # form, and its shape is as unrecorded as userinfo's.  The
+        # identity set a broker needs arrives in the ID token and from
+        # userinfo, which are built.
         raise not_implemented(
-            f"Fauxbus does not model linked identities, so it will not answer "
-            f"include={form['include']!r} with an identity set of one and let that pass "
-            f"for the real thing. Drop the parameter for the rest of the document. Real "
-            f"client code needs identity sets?"
+            f"include={form['include']!r} on introspection is not built. Linked identities "
+            f"are modeled (the seed's 'accounts'), and a login's identity_set is in its ID "
+            f"token and at /v2/oauth2/userinfo. Real client code needs it here too?"
         )
     return 200, ctx.world.introspect(token)
 

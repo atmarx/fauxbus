@@ -23,8 +23,16 @@ def index(ctx: Ctx) -> tuple[int, Any]:
     return 200, {
         "fauxbus": __version__,
         "sdk_pin": SDK_PIN,
-        "imitates": ["groups v2", "auth v2 (client_credentials)"],
+        "imitates": ["groups v2", "auth v2 (client_credentials, authorization_code + OIDC)"],
         "require_issued_tokens": ctx.server.require_issued_tokens,
+        # The *effective* values — world's if the seed set them, else the
+        # boot flags'.  The state dump shows only the world's half, so
+        # this is where to look when a broker's login fails and the
+        # question is which issuer and which clock it actually met.
+        "oidc": {
+            "issuer": ctx.server.issuer(),
+            "signed_token_clock": ctx.server.signed_token_clock(),
+        },
         "control": [
             "GET  /_fauxbus/state",
             'POST /_fauxbus/reset (to canonical seed; body {"to": "empty"} for blank)',
@@ -34,6 +42,8 @@ def index(ctx: Ctx) -> tuple[int, Any]:
             "POST /_fauxbus/failures",
             "DELETE /_fauxbus/failures[?id=fail-N]",
             "POST /_fauxbus/tick",
+            "GET  /_fauxbus/auth/login?request=... (account picker, for a browser)",
+            'POST /_fauxbus/auth/session {"account": "<primary identity id>"} (headless sign-in)',
         ],
     }
 

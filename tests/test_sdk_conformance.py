@@ -10,6 +10,7 @@ base_url alone, which is the whole point.
 from __future__ import annotations
 
 import os
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -25,9 +26,21 @@ if os.environ.get("FAUXBUS_REQUIRE_CONFORMANCE"):
 else:
     globus_sdk = pytest.importorskip("globus_sdk")
 
-from conftest import CLIENT_ID, CLIENT_SECRET, GROUPS_SCOPE, TRANSFER_SCOPE  # noqa: E402
+from conftest import (  # noqa: E402
+    ALICE_GLOBUSID,
+    CLIENT_ID,
+    CLIENT_SECRET,
+    GROUPS_SCOPE,
+    LOGIN_CLIENT,
+    LOGIN_REDIRECT,
+    LOGIN_SECRET,
+    TRANSFER_SCOPE,
+    oidc_seed,
+)
 from globus_sdk import (  # noqa: E402
     AccessTokenAuthorizer,
+    AuthAPIError,
+    AuthClient,
     BatchMembershipActions,
     ClientCredentialsAuthorizer,
     ConfidentialAppAuthClient,
@@ -37,6 +50,7 @@ from globus_sdk import (  # noqa: E402
     GroupsManager,
 )
 
+from fauxbus import signing  # noqa: E402
 from fauxbus.ids import identity_id_for_token  # noqa: E402
 
 # The stated SDK contract version, as one literal.  SPEC.md and README
@@ -411,3 +425,119 @@ def test_introspecting_a_token_the_sdk_never_got_is_not_an_error(registered):
     # against the real service either.
     data = confidential_client(registered.base_url).oauth2_token_introspect("t-alice")
     assert data["active"] is False
+
+
+# ------------------------------------------- auth slice B: the OIDC code flow
+#
+# Every leg the pinned SDK exposes, driven through it.  The one leg it
+# cannot drive — a person at the authorize page — is walked by plain
+# HTTP between ``oauth2_get_authorize_url`` and
+# ``oauth2_exchange_code_for_tokens``, exactly where a browser would be.
+
+
+def login_client(base_url: str) -> ConfidentialAppAuthClient:
+    return ConfidentialAppAuthClient(LOGIN_CLIENT, LOGIN_SECRET, base_url=base_url)
+
+
+def browser_login(fx, authorize_url: str, account: str = ALICE_GLOBUSID) -> str:
+    """Be the browser: follow the SDK's authorize URL to the picker, pick, return the code."""
+    status, headers, _ = fx.browse(authorize_url)
+    assert status == 302, headers
+    request_id = parse_qs(urlsplit(headers["Location"]).query)["request"][0]
+    status, headers, _ = fx.browse(
+        "/_fauxbus/auth/login", method="POST", form={"request": request_id, "account": account}
+    )
+    assert status == 302, headers
+    callback = parse_qs(urlsplit(headers["Location"]).query)
+    return callback["code"][0]
+
+
+def test_discovery_and_jwk_load_through_the_sdk(oidc):
+    client = login_client(oidc.base_url)
+    config = client.get_openid_configuration()
+    assert config["issuer"] == oidc.base_url
+    # get_jwk follows discovery's jwks_uri and decodes keys[0] into a
+    # real ``cryptography`` public key — the SDK's own path to verifying.
+    key = client.get_jwk(openid_configuration=config, as_pem=True)
+    assert key.public_numbers().n == signing.N
+    raw = client.get_jwk(openid_configuration=config, as_pem=False)
+    assert raw["keys"][0]["kid"] == signing.KID
+
+
+def test_the_sdks_own_code_flow_ends_in_an_id_token_it_verifies(fx):
+    """The whole flow the SDK documents, against a wall-clock world.
+
+    ``decode_id_token`` is the SDK's verifier: it fetches discovery and
+    the JWK itself, checks the RS512 signature, the audience, and
+    ``exp``/``iat`` against *real* time.  That last check is why this
+    world opts into ``signed_token_clock: "wall"`` — on the logical
+    clock at zero the token would be from 1970, and the SDK would be
+    right to refuse it.  Exactly the trap a broker falls into.
+    """
+    fx.post(
+        "/_fauxbus/seed",
+        oidc_seed(fx.base_url, oidc={"issuer": fx.base_url, "signed_token_clock": "wall"}),
+    )
+    client = login_client(fx.base_url)
+    client.oauth2_start_flow(LOGIN_REDIRECT, "openid profile email", state="sdk-state")
+    url = client.oauth2_get_authorize_url(query_params={"nonce": "sdk-nonce"})
+    assert url.startswith(fx.base_url + "/v2/oauth2/authorize?")
+
+    tokens = client.oauth2_exchange_code_for_tokens(browser_login(fx, url))
+    auth_tokens = tokens.by_resource_server["auth.globus.org"]
+    assert auth_tokens["scope"] == "openid profile email"
+    assert tokens["state"] == "sdk-state"  # the default fixture's echo
+
+    claims = tokens.decode_id_token()
+    assert claims["sub"] == ALICE_GLOBUSID
+    assert claims["aud"] == LOGIN_CLIENT
+    assert claims["nonce"] == "sdk-nonce"
+    assert claims["preferred_username"] == "alice@globusid.org"
+
+
+def test_userinfo_through_the_sdk_matches_the_id_token(fx):
+    fx.post(
+        "/_fauxbus/seed",
+        oidc_seed(fx.base_url, oidc={"issuer": fx.base_url, "signed_token_clock": "wall"}),
+    )
+    client = login_client(fx.base_url)
+    client.oauth2_start_flow(LOGIN_REDIRECT, "openid email")
+    tokens = client.oauth2_exchange_code_for_tokens(
+        browser_login(fx, client.oauth2_get_authorize_url())
+    )
+    access = tokens.by_resource_server["auth.globus.org"]["access_token"]
+    info = AuthClient(base_url=fx.base_url, authorizer=AccessTokenAuthorizer(access)).userinfo()
+    claims = tokens.decode_id_token()
+    assert info["sub"] == claims["sub"]
+    assert info["identity_set"] == claims["identity_set"]
+    assert info["email"] == "alice@example.org"
+
+
+def test_userinfo_refusals_parse_the_way_the_recorded_fixture_says(oidc):
+    """Unlike the token endpoint, these errors DO reach ``.code`` and ``.message``.
+
+    The fixture's metadata says so (``code: UNAUTHORIZED``, ``message:
+    "Call must be authenticated"``), and this pins it — the SDK reads the
+    JSON:API ``errors`` list in Globus Auth's own error document.
+    """
+    client = AuthClient(base_url=oidc.base_url, authorizer=AccessTokenAuthorizer("t-alice"))
+    with pytest.raises(AuthAPIError) as exc:
+        client.userinfo()
+    assert exc.value.http_status == 401
+    assert exc.value.code == "UNAUTHORIZED"
+    assert exc.value.message == "Call must be authenticated"
+
+
+def test_a_spent_code_fails_through_the_sdk_like_the_recorded_invalid_grant(fx):
+    fx.post("/_fauxbus/seed", oidc_seed(fx.base_url))
+    client = login_client(fx.base_url)
+    client.oauth2_start_flow(LOGIN_REDIRECT, "openid")
+    code = browser_login(fx, client.oauth2_get_authorize_url())
+    client.oauth2_exchange_code_for_tokens(code)
+    with pytest.raises(AuthAPIError) as exc:
+        client.oauth2_exchange_code_for_tokens(code)
+    assert exc.value.http_status == 401
+    assert exc.value.raw_json == {
+        "error": "invalid_grant",
+        "error_description": "that authorization code has already been redeemed; codes are one-use.",
+    }

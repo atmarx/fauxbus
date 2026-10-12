@@ -12,13 +12,17 @@ Truth grades (see SPEC.md "Recorded, documented, provisional"):
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from .auth import (
     AUTH_ISSUER,
+    AUTH_RESOURCE_SERVER,
     Identity,
+    check_issuer,
     client_username,
     derive_identity,
     placeholder_username,
@@ -26,12 +30,26 @@ from .auth import (
 )
 from .errors import (
     ApiError,
+    auth_forbidden,
+    auth_unauthorized,
     group_not_found,
     invalid_client,
+    invalid_grant,
+    invalid_request,
     not_implemented,
     validation_error,
 )
-from .ids import access_token, access_token_number, sequential_id
+from .ids import (
+    CODE_PREFIX,
+    REQUEST_PREFIX,
+    SESSION_PREFIX,
+    access_token,
+    access_token_number,
+    minted_name,
+    minted_number,
+    sequential_id,
+)
+from .signing import at_hash, b64url
 
 ROLES = ("member", "manager", "admin")
 STATUSES = ("active", "declined", "invited", "left", "pending", "rejected", "removed")
@@ -87,6 +105,35 @@ def _require_int(value: Any, what: str) -> int:
         return int(value)
     except (TypeError, ValueError):
         raise validation_error(f"{what} is not an integer: {value!r}") from None
+
+
+def _optional_str(value: Any, what: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise validation_error(f"{what} must be a string or null, got {type(value).__name__}")
+    return value
+
+
+def _require_redirect_uri(value: Any, client_id: str) -> str:
+    """A redirect URI a client may register (RFC 6749 §3.1.2).
+
+    Absolute, no fragment, and — Fauxbus's own addition — no whitespace
+    or control characters.  It ends up in a ``Location`` header, and a
+    CR or LF there would let a seed forge response headers; the same
+    reason ``server.checked_header`` exists.
+    """
+    if not isinstance(value, str) or not value:
+        raise validation_error(f"client {client_id} redirect_uris must be non-empty strings")
+    if not value.isascii() or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise validation_error(f"client {client_id} redirect_uri {value!r} contains whitespace, control or non-ASCII characters")
+    parts = urlsplit(value)
+    if not parts.scheme or parts.fragment:
+        raise validation_error(
+            f"client {client_id} redirect_uri {value!r} must be absolute and carry no "
+            f"fragment (RFC 6749 §3.1.2)"
+        )
+    return value
 
 
 def _require_mapping(value: Any, what: str) -> dict[str, Any]:
@@ -181,7 +228,22 @@ GLOBUS_GRANT_TYPES = (
 
 # Which of those Fauxbus can actually perform today.  Everything else in
 # GLOBUS_GRANT_TYPES hits the 501 wall with a pointer to the tracker.
-IMPLEMENTED_GRANT_TYPES = ("client_credentials",)
+IMPLEMENTED_GRANT_TYPES = ("client_credentials", "authorization_code")
+
+# How long an authorization code stays redeemable, on the *logical*
+# clock.  PROVISIONAL: the published reference gives no lifetime, and no
+# fixture shows one.  Ten minutes is RFC 6749 §4.1.2's recommended
+# ceiling.  Because the clock is logical, a code never ages in a test
+# that does not tick — a harness proves expiry with ``POST
+# /_fauxbus/tick {"seconds": 601}``, never with a sleep.
+CODE_LIFETIME = 600
+
+# The two answers to "what time is it?" for an ID token.  Read SPEC's
+# "Clocks" section before choosing; the short form is that ``logical`` is
+# the default and keeps principle 3 whole, and ``wall`` is the explicit
+# opt-in an outside verifier like Keycloak needs, because it checks
+# ``exp``/``iat`` against real time and cannot be asked to tick.
+SIGNED_TOKEN_CLOCKS = ("logical", "wall")
 
 
 @dataclass
@@ -195,12 +257,176 @@ class OAuthClient:
     the membership list under its own name, exactly like a person would.
     That is why ``identity_id`` here is not a separate field: it would
     only ever be a second copy of ``client_id``.
+
+    Slice B added two things a *login* client needs and a service client
+    never touches.  ``redirect_uris`` is the allow-list the authorize
+    endpoint matches exactly — a client with none simply cannot run the
+    browser flow, which is how Fauxbus says "this client does
+    client_credentials only" without a separate grant-types field nobody
+    would consult.  ``required_idp`` is DOCUMENTED ("in order to use this
+    client a user must have an identity from this IdP in their identity
+    set"), and it changes *who signs in*: see World.effective_identity.
     """
 
     client_id: str
     secret: str
     name: str
     username: str
+    redirect_uris: list[str] = field(default_factory=list)
+    required_idp: str | None = None
+
+
+@dataclass
+class IdentityProvider:
+    """Where an identity comes from — a university, Globus ID, ORCID.
+
+    Only ``name`` is modeled, because only ``name`` reaches the wire (as
+    ``identity_provider_display_name``).  The recorded IdP document
+    (``get_identity_providers.py``) also has ``short_name``, ``domains``
+    and ``alternative_names``; they wait for the identity-providers
+    lookup endpoint, which nobody has asked for.
+    """
+
+    id: str
+    name: str
+
+
+@dataclass
+class GlobusIdentity:
+    """One identity: a login at one provider.
+
+    Field names are RECORDED from the identity object in
+    ``get_identities.py`` (``id``, ``username``, ``identity_provider``,
+    ``name``, ``email``, ``organization``).  ``status`` and
+    ``identity_type`` from the same fixture are left out until a surface
+    emits them.
+
+    The UUID and the username are deliberately two fields.  SPEC's
+    "identity churn" note: a rename changes the username and keeps the
+    UUID, and collapsing them into one identifier would make that
+    impossible to represent.  Free today, a migration later.
+    """
+
+    id: str
+    username: str
+    identity_provider: str
+    name: str | None = None
+    email: str | None = None
+    organization: str | None = None
+
+
+@dataclass
+class Account:
+    """A Globus account: a primary identity plus the identities linked to it.
+
+    Named by its primary identity's UUID, because that is how Globus
+    names an account — there is no separate account id on the wire.
+    ``identities`` includes the primary, so every identity in the set is
+    the same kind of object and "the account's identities" is one dict.
+    """
+
+    primary: str
+    identities: dict[str, GlobusIdentity]
+
+    def ordered(self) -> list[GlobusIdentity]:
+        # Primary first, then the linked identities by UUID.  PROVISIONAL
+        # as an *order* — the identity_set shape itself is unrecorded —
+        # but it has to be some order, and this one is stable.
+        rest = sorted(i for i in self.identities if i != self.primary)
+        return [self.identities[self.primary], *(self.identities[i] for i in rest)]
+
+
+@dataclass
+class AuthorizationRequest:
+    """An authorize request parked while the browser picks an account.
+
+    The authorize endpoint cannot finish without a signed-in account,
+    and Fauxbus will not take one as a query parameter (principle 4).
+    So the request waits here, under a name the out-of-band picker
+    carries in its URL, and the picker resumes it.  Everything the code
+    will later be bound to is captured now, from the original request,
+    so nothing about the login can be changed by tampering with the
+    picker's form.
+    """
+
+    id: str
+    client_id: str
+    redirect_uri: str
+    scopes: list[str]
+    state: str | None
+    nonce: str | None
+    code_challenge: str | None
+
+
+@dataclass
+class AuthorizationCode:
+    """A one-use code, and everything the exchange must match against.
+
+    Bound to the client, the exact redirect URI, the scopes, the nonce,
+    the PKCE challenge, and the identity — RFC 6749 §4.1.2 and OIDC Core
+    §3.1.2.  The exchange checks every one of them.  ``issued_at`` and
+    ``expires_at`` are on the logical clock because Fauxbus is the only
+    thing that validates a code; ``authenticated_at`` is a signed-token
+    instant, because it ends up inside an ID token someone else checks.
+    """
+
+    code: str
+    client_id: str
+    redirect_uri: str
+    scopes: list[str]
+    state: str | None
+    nonce: str | None
+    code_challenge: str | None
+    account: str
+    identity_id: str
+    authenticated_at: int
+    issued_at: int
+    expires_at: int
+    used: bool = False
+
+
+class RequiredIdpUnsatisfied(ApiError):
+    """An account with no identity from the provider a client requires.
+
+    How the real service behaves here is PROVISIONAL in its details, but
+    not in its direction.  The reference says such a client can only be
+    used by someone with an identity from that IdP "in their identity
+    set," and describes the neighbouring ``session_required_single_domain``
+    case as the user being "redirected to log in or link an identity" —
+    that is, the user is kept *at Globus* and the client is never called
+    back.  Fauxbus does the same: no ``error=`` redirect to the client, a
+    refusal rendered at the picker, and the authorization request left
+    parked so another account can be chosen.
+    """
+
+    def __init__(
+        self, client: OAuthClient, account: Account, idps: dict[str, IdentityProvider]
+    ) -> None:
+        idp = idps.get(client.required_idp or "")
+        label = f"{idp.name} ({idp.id})" if idp else client.required_idp
+        super().__init__(
+            403,
+            "REQUIRED_IDP_UNSATISFIED",
+            f"{client.name} requires an identity from {label}, and account "
+            f"{account.primary} has none linked. Globus would ask this user to sign "
+            f"in with, or link, an identity from that provider; the client is never "
+            f"called back. Pick another account, or seed a linked identity.",
+        )
+
+
+@dataclass
+class Session:
+    """Fauxbus's own sign-in: which account this browser picked, and when.
+
+    Out-of-band state wearing a cookie.  The real service's session is
+    its own business and Fauxbus does not imitate it — this exists so a
+    second authorize request can skip the picker, which is the behavior
+    ``prompt=login`` is defined against.
+    """
+
+    id: str
+    account: str
+    authenticated_at: int
 
 
 @dataclass
@@ -230,6 +456,14 @@ class IssuedToken:
     issued_at: int  # logical clock, not wall clock — see World.clock
     expires_at: int  # same clock
     revoked: bool = False
+    # Set only for a token minted by the authorization-code grant, where
+    # a *person* signed in.  ``account`` is that person's primary
+    # identity, which userinfo needs to render ``identity_set``;
+    # ``authenticated_at`` is when they signed in, for
+    # ``last_authentication``.  A client_credentials token has neither,
+    # because no person was there.
+    account: str | None = None
+    authenticated_at: int | None = None
 
 
 class World:
@@ -254,6 +488,22 @@ class World:
         self.preferences: dict[str, dict[str, Any]] = {}  # identity_id -> prefs doc
         self.clients: dict[str, OAuthClient] = {}  # client_id -> registration
         self.tokens: dict[str, IssuedToken] = {}  # access token -> what it authorizes
+        # Slice B.  The first two are configuration that lives in the
+        # world rather than on the server, because the seed is
+        # authoritative: a state dump must describe the world it came
+        # from, and a world whose issuer lived only in a CLI flag would
+        # dump as something else.  None means "not set here" — the
+        # server's --issuer / --signed-token-clock defaults apply.
+        self.issuer: str | None = None
+        self.signed_token_clock: str | None = None
+        self.identity_providers: dict[str, IdentityProvider] = {}
+        self.accounts: dict[str, Account] = {}  # primary identity id -> account
+        # The ephemeral half: a login in flight is world state too, so it
+        # dumps and restores like everything else (a half-finished login
+        # is a thing a harness can capture and replay).
+        self.authorization_requests: dict[str, AuthorizationRequest] = {}
+        self.authorization_codes: dict[str, AuthorizationCode] = {}
+        self.sessions: dict[str, Session] = {}
 
     # ------------------------------------------------------------------ ids
 
@@ -392,6 +642,7 @@ class World:
         scopes: list[str],
         grant_type: str,
         expires_in: int = DEFAULT_EXPIRES_IN,
+        code: AuthorizationCode | None = None,
     ) -> IssuedToken:
         """Mint one access token and remember what it authorizes.
 
@@ -400,21 +651,39 @@ class World:
         ``/_fauxbus/tick``, deterministically, rather than by sleeping
         for two days.  SPEC principle 3 holds here without an exception,
         because Fauxbus is the only thing that will ever validate this
-        token.  Signed ID tokens are the one place it cannot hold, and
-        that is a Slice B problem.
+        token.  Signed ID tokens are the one place it cannot hold — see
+        ``id_token_claims``.
+
+        Who the token *acts as* is the one thing that differs between the
+        two grants.  Under client_credentials no person is present, so
+        the token acts as the client, which is an identity in its own
+        right.  Under authorization_code a person signed in, and the
+        token acts as their *effective* identity — the client is only the
+        requester.  That is the moment ``sub`` and ``client_id`` come
+        apart in introspection, which slice A.2 predicted in a comment.
         """
         counter = self.counters.get("access_token", 0)
         self.counters["access_token"] = counter + 1
+        if code is None:
+            # A client IS its identity — see OAuthClient.
+            identity_id, username = client.client_id, client.username
+            account = authenticated_at = None
+        else:
+            identity = self.accounts[code.account].identities[code.identity_id]
+            identity_id, username = identity.id, identity.username
+            account, authenticated_at = code.account, code.authenticated_at
         issued = IssuedToken(
             token=access_token(counter),
             client_id=client.client_id,
-            identity_id=client.client_id,  # a client IS its identity — see OAuthClient
-            username=client.username,
+            identity_id=identity_id,
+            username=username,
             resource_server=resource_server,
             scopes=list(scopes),
             grant_type=grant_type,
             issued_at=self.clock,
             expires_at=self.clock + expires_in,
+            account=account,
+            authenticated_at=authenticated_at,
         )
         self.tokens[issued.token] = issued
         return issued
@@ -609,6 +878,7 @@ class World:
             # (principle 4) and under no obligation to be discreet.
             return {"active": False}
         client = self.clients.get(issued.client_id)
+        person = self._person(issued)
         return {
             "active": True,
             "token_type": "Bearer",
@@ -616,10 +886,10 @@ class World:
             "client_id": issued.client_id,
             # The subject is an identity, and for a client_credentials
             # token that identity IS the client (see OAuthClient) — so
-            # ``sub`` and ``client_id`` are the same UUID here, and that
-            # is faithful rather than lazy.  They come apart the moment
-            # slice B lands an authorization-code token, where a person
-            # is the subject and the client is only the requester.
+            # ``sub`` and ``client_id`` are the same UUID there, and that
+            # is faithful rather than lazy.  They come apart for an
+            # authorization-code token, where the person's *effective*
+            # identity is the subject and the client only the requester.
             "sub": issued.identity_id,
             "username": issued.username,
             # PROVISIONAL: a client identity has no mailbox, and the
@@ -630,8 +900,11 @@ class World:
             # value.  A seeded token may name a client that was never
             # registered — deliberately allowed — which is the other way
             # ``name`` arrives as null.
-            "name": client.name if client is not None else None,
-            "email": None,
+            "name": person.name if person else client.name if client is not None else None,
+            # A person has a mailbox; a client does not (see above).  The
+            # recorded fixture's subject is a person, so this is the
+            # branch the recording actually grounds.
+            "email": person.email if person else None,
             "exp": issued.expires_at,
             "iat": issued.issued_at,
             # RFC 7662 §2.2: ``nbf`` is when the token becomes valid.
@@ -643,6 +916,11 @@ class World:
             "aud": [issued.resource_server, issued.client_id],
             "iss": AUTH_ISSUER,
         }
+
+    def _person(self, issued: IssuedToken) -> GlobusIdentity | None:
+        """The signed-in identity behind a token, or None for a client's own token."""
+        account = self.accounts.get(issued.account) if issued.account else None
+        return account.identities.get(issued.identity_id) if account else None
 
     def revoke(self, client: OAuthClient, token: str) -> None:
         """Retire a token, if it is this client's to retire.
@@ -681,6 +959,342 @@ class World:
         if issued is None or issued.client_id != client.client_id:
             return
         issued.revoked = True
+
+    # ----------------------------------------------------------------- oidc
+
+    def login_client(self, client_id: str, redirect_uri: str) -> OAuthClient:
+        """The two checks the authorize endpoint makes before it trusts a redirect URI.
+
+        Everything after these may be reported by redirecting the browser
+        back to the client with ``error=`` on the query string (RFC 6749
+        §4.1.2.1).  These two may not, because their failure means the
+        redirect URI itself is not trustworthy, and redirecting to an
+        unvetted URI on an error is how an authorization server becomes an
+        open redirector.  So their errors are rendered, never redirected.
+
+        The match is exact, string for string, with no normalization —
+        not trailing slashes, not case, not query order.  That is what
+        the RFC 6749 §3.1.2.3 and OAuth security BCP require, it is what
+        Keycloak does on its own side, and a fake that matched loosely
+        would pass a test that production fails.
+        """
+        if not client_id:
+            raise invalid_request("'client_id' is required.")
+        client = self.clients.get(client_id)
+        if client is None:
+            raise invalid_request(
+                f"no client is registered with id {client_id!r}, so there is no redirect URI "
+                f"Fauxbus can trust to report that to. Register it in the seed's 'clients'."
+            )
+        if not redirect_uri:
+            raise invalid_request("'redirect_uri' is required.")
+        if redirect_uri not in client.redirect_uris:
+            raise invalid_request(
+                f"redirect_uri {redirect_uri!r} is not registered for client {client_id}. "
+                f"Registered: {client.redirect_uris or 'none'}. The match is exact — no "
+                f"trailing-slash or case forgiveness."
+            )
+        return client
+
+    def park_authorization(
+        self,
+        client: OAuthClient,
+        *,
+        redirect_uri: str,
+        scopes: list[str],
+        state: str | None,
+        nonce: str | None,
+        code_challenge: str | None,
+    ) -> AuthorizationRequest:
+        n = self.counters.get("authorization_request", 0)
+        self.counters["authorization_request"] = n + 1
+        request = AuthorizationRequest(
+            id=minted_name(REQUEST_PREFIX, n),
+            client_id=client.client_id,
+            redirect_uri=redirect_uri,
+            scopes=list(scopes),
+            state=state,
+            nonce=nonce,
+            code_challenge=code_challenge,
+        )
+        self.authorization_requests[request.id] = request
+        return request
+
+    def open_session(self, account_id: str, authenticated_at: int) -> Session:
+        if account_id not in self.accounts:
+            raise validation_error(
+                f"no account has primary identity {account_id!r}; seed it under 'accounts'."
+            )
+        n = self.counters.get("session", 0)
+        self.counters["session"] = n + 1
+        session = Session(minted_name(SESSION_PREFIX, n), account_id, authenticated_at)
+        self.sessions[session.id] = session
+        return session
+
+    def effective_identity(self, account: Account, client: OAuthClient) -> GlobusIdentity | None:
+        """Which of an account's identities signs in to this client — or None.
+
+        DOCUMENTED (docs.globus.org/api/auth/reference, read 2026-10-12):
+        ``sub`` is "the effective identity of the logged in Globus
+        account," which is "the primary identity, or the appropriate
+        linked identity if this client requires an identity from a
+        particular provider."
+
+        So without ``required_idp`` it is the primary.  With it, it is
+        the identity from that provider — the primary itself if the
+        primary qualifies, otherwise the linked identity with the lowest
+        UUID if several do (an arbitrary but stable tiebreak for a case
+        the docs do not address).  None means the account has no
+        identity from that provider at all, and the login cannot finish.
+
+        This is the line the whole slice exists for, from the consumer's
+        side: an account whose primary is Globus ID signs in to a
+        university's service *as its university identity*, and the
+        service authorizes on that UUID.
+        """
+        if client.required_idp is None:
+            return account.identities[account.primary]
+        for identity in account.ordered():
+            if identity.identity_provider == client.required_idp:
+                return identity
+        return None
+
+    def complete_authorization(
+        self, request: AuthorizationRequest, session: Session
+    ) -> AuthorizationCode:
+        """Turn a parked request plus a signed-in account into a one-use code.
+
+        Raises ``RequiredIdpUnsatisfied`` when the client demands an
+        identity provider this account has no identity from.  The request
+        stays parked when that happens: the browser is still at the
+        picker, and another account may do.
+        """
+        client = self.clients.get(request.client_id)
+        account = self.accounts.get(session.account)
+        if client is None or account is None:
+            # Only reachable if a harness re-seeded the world out from under
+            # a login in flight; the seed door validates both otherwise.
+            raise validation_error("the client or account behind this login no longer exists")
+        identity = self.effective_identity(account, client)
+        if identity is None:
+            raise RequiredIdpUnsatisfied(client, account, self.identity_providers)
+        n = self.counters.get("authorization_code", 0)
+        self.counters["authorization_code"] = n + 1
+        code = AuthorizationCode(
+            code=minted_name(CODE_PREFIX, n),
+            client_id=client.client_id,
+            redirect_uri=request.redirect_uri,
+            scopes=list(request.scopes),
+            state=request.state,
+            nonce=request.nonce,
+            code_challenge=request.code_challenge,
+            account=account.primary,
+            identity_id=identity.id,
+            authenticated_at=session.authenticated_at,
+            issued_at=self.clock,
+            expires_at=self.clock + CODE_LIFETIME,
+        )
+        self.authorization_codes[code.code] = code
+        del self.authorization_requests[request.id]
+        return code
+
+    def redeem_code(
+        self,
+        client: OAuthClient,
+        code: str,
+        redirect_uri: str,
+        code_verifier: str | None,
+    ) -> AuthorizationCode:
+        """RFC 6749 §4.1.3: every binding checked, any mismatch the same refusal.
+
+        Every failure is ``invalid_grant`` — RECORDED as a 401 with the
+        bare ``{"error": "invalid_grant"}`` in
+        ``oauth2_exchange_code_for_tokens.py`` — and a program cannot tell
+        them apart, which is correct: "this code is someone else's" and
+        "this code does not exist" must look the same to a caller who
+        might be guessing.  The ``error_description`` tells a human which
+        one it was, as it does everywhere else on this endpoint.
+
+        The code is spent only on *success*.  A failed exchange — wrong
+        verifier, wrong redirect — leaves it redeemable by the right
+        caller.  What RFC 6749 §4.1.2 adds for a *second successful-looking*
+        redemption (revoke everything the first one minted) is not built:
+        a replayed code is refused, which is the part a broker's test can
+        observe, and nobody has asked for the cascade.
+        """
+        record = self.authorization_codes.get(code)
+        if record is None:
+            raise invalid_grant("no such authorization code was issued here.")
+        if record.used:
+            raise invalid_grant("that authorization code has already been redeemed; codes are one-use.")
+        if record.expires_at <= self.clock:
+            raise invalid_grant(
+                f"that authorization code expired at logical clock {record.expires_at}; the "
+                f"clock now reads {self.clock}. Codes age on POST /_fauxbus/tick, never on "
+                f"real time."
+            )
+        if record.client_id != client.client_id:
+            raise invalid_grant("that authorization code was issued to a different client.")
+        if record.redirect_uri != redirect_uri:
+            raise invalid_grant(
+                "redirect_uri does not match the one the authorization request used "
+                "(RFC 6749 §4.1.3: it must be identical)."
+            )
+        if record.code_challenge is not None:
+            # RFC 7636 §4.6, S256: BASE64URL(SHA256(verifier)) == challenge.
+            if not code_verifier:
+                raise invalid_grant("this code was issued with a PKCE challenge; 'code_verifier' is required.")
+            derived = b64url(hashlib.sha256(code_verifier.encode("ascii", "replace")).digest())
+            if derived != record.code_challenge:
+                raise invalid_grant("code_verifier does not match the code_challenge (S256).")
+        elif code_verifier:
+            # A verifier for a code that never had a challenge is a client
+            # confused about which login it is finishing.  RFC 7636 is
+            # silent; refusing beats silently ignoring a security
+            # parameter the client believes is being checked.
+            raise invalid_grant("a code_verifier was sent, but this code was issued without a code_challenge.")
+        record.used = True
+        return record
+
+    def identity_claims(
+        self, account_id: str, identity_id: str, scopes: list[str], authenticated_at: int
+    ) -> dict[str, Any]:
+        """The claims about a person, shared by the ID token and userinfo.
+
+        One function for both, because OIDC Core §5.3.2 requires
+        userinfo's ``sub`` to equal the ID token's — and Keycloak checks
+        exactly that, refusing the login if they differ.  Two functions
+        would be two chances to drift.
+
+        Scope gating is DOCUMENTED (docs.globus.org/api/auth/reference,
+        read 2026-10-12): ``openid`` gives ``sub``, ``last_authentication``
+        and ``identity_set``; ``email`` adds ``email``; ``profile`` adds
+        ``name``, ``organization``, ``preferred_username``,
+        ``identity_provider`` and ``identity_provider_display_name``.
+        Note what ``openid`` alone does *not* include: any name or email
+        for the person.  A broker that maps ``email`` and forgets to ask
+        for the ``email`` scope gets a user with no email, against the
+        fake and against the real thing alike.
+        """
+        account = self.accounts[account_id]
+        effective = account.identities[identity_id]
+        claims: dict[str, Any] = {
+            "sub": effective.id,
+            "last_authentication": authenticated_at,
+            # PROVISIONAL, and the most consequential provisional in
+            # Auth: no SDK fixture has a success body for userinfo or an
+            # ID token, and the reference describes identity_set only as
+            # "the identities linked to this account."  Each entry reuses
+            # the claim names the reference defines for the top level,
+            # plus ``username`` (the recorded identity-object field),
+            # and every entry carries every field regardless of scope —
+            # an inference the first recording session settles.
+            "identity_set": [
+                {
+                    "sub": identity.id,
+                    "username": identity.username,
+                    "name": identity.name,
+                    "email": identity.email,
+                    "organization": identity.organization,
+                    "identity_provider": identity.identity_provider,
+                    "identity_provider_display_name": self._idp_name(identity),
+                    # Only the identity that just signed in has a known
+                    # last authentication; Fauxbus keeps no login history
+                    # for the others, and null says so rather than inventing one.
+                    "last_authentication": authenticated_at if identity.id == effective.id else None,
+                }
+                for identity in account.ordered()
+            ],
+        }
+        if "profile" in scopes:
+            claims.update(
+                name=effective.name,
+                organization=effective.organization,
+                preferred_username=effective.username,
+                identity_provider=effective.identity_provider,
+                identity_provider_display_name=self._idp_name(effective),
+            )
+        if "email" in scopes:
+            claims["email"] = effective.email
+        return claims
+
+    def _idp_name(self, identity: GlobusIdentity) -> str | None:
+        idp = self.identity_providers.get(identity.identity_provider)
+        return idp.name if idp is not None else None
+
+    def id_token_claims(
+        self,
+        code: AuthorizationCode,
+        access_token_value: str,
+        *,
+        issuer: str,
+        now: int,
+    ) -> dict[str, Any]:
+        """Everything the signed ID token says, before it is signed.
+
+        ``now`` is the signed-token instant the server chose — logical or
+        wall, per the world's ``signed_token_clock`` — and this method
+        never reads a clock itself.  World stays free of wall time even
+        when the server does not.
+
+        ``exp`` is ``iat`` plus the same 172800 seconds the recorded
+        token and introspection fixtures show for access tokens; the ID
+        token's own lifetime is unrecorded, and matching the access
+        token's is the reading least likely to surprise a broker.
+        """
+        claims = self.identity_claims(code.account, code.identity_id, code.scopes, code.authenticated_at)
+        claims.update(
+            iss=issuer,
+            # A string, not a list: one audience, the client that asked.
+            # OIDC Core permits either; a list of one would oblige some
+            # verifiers to look for an ``azp`` claim as well.
+            aud=code.client_id,
+            iat=now,
+            exp=now + DEFAULT_EXPIRES_IN,
+            at_hash=at_hash(access_token_value),
+        )
+        if code.nonce is not None:
+            # OIDC Core §3.1.3.7: echoed unchanged, and only when sent.
+            # The broker compares it to the nonce it generated, which is
+            # what stops an ID token from one login being replayed into
+            # another.
+            claims["nonce"] = code.nonce
+        return claims
+
+    def userinfo_token(self, token: str | None) -> IssuedToken:
+        """The access token userinfo will describe, or the recorded refusal.
+
+        Userinfo is always strict, whatever ``--require-issued-tokens``
+        says, for the same reason introspection is: its answer *is* the
+        issued record.  A made-up bearer string has no account behind it
+        and nothing to say.
+
+        The statuses are PROVISIONAL even though both bodies are
+        RECORDED.  The fixtures show a 401 and a 403 with identical text
+        and no hint of which situation earns which.  Fauxbus reads them
+        as the usual pair: 401 when there is no live token at all
+        (missing, unknown, expired, revoked), 403 when the token is
+        genuine but not one userinfo serves — the published reference
+        requires a token "valid for at least the openid scope," and a
+        token minted without a person behind it is not.
+        """
+        issued = self.active_token(token) if token else None
+        if issued is None:
+            raise auth_unauthorized()
+        if (
+            issued.resource_server != AUTH_RESOURCE_SERVER
+            or "openid" not in issued.scopes
+            or issued.account is None
+            or issued.account not in self.accounts
+        ):
+            raise auth_forbidden()
+        return issued
+
+    def userinfo(self, issued: IssuedToken) -> dict[str, Any]:
+        assert issued.account is not None and issued.authenticated_at is not None
+        return self.identity_claims(
+            issued.account, issued.identity_id, issued.scopes, issued.authenticated_at
+        )
 
     # --------------------------------------------------------------- groups
 
@@ -1147,7 +1761,13 @@ class World:
             "identities": {t: dict(p) for t, p in sorted(self.pinned_identities.items())},
             "preferences": {i: dict(p) for i, p in sorted(self.preferences.items())},
             "clients": {
-                cid: {"secret": c.secret, "name": c.name, "username": c.username}
+                cid: {
+                    "secret": c.secret,
+                    "name": c.name,
+                    "username": c.username,
+                    "redirect_uris": list(c.redirect_uris),
+                    "required_idp": c.required_idp,
+                }
                 for cid, c in sorted(self.clients.items())
             },
             # Issued tokens are world state, so they round-trip like
@@ -1165,8 +1785,67 @@ class World:
                     "issued_at": t.issued_at,
                     "expires_at": t.expires_at,
                     "revoked": t.revoked,
+                    "account": t.account,
+                    "authenticated_at": t.authenticated_at,
                 }
                 for tok, t in sorted(self.tokens.items())
+            },
+            # Slice B.  Configuration first, then who exists, then the
+            # login machinery in flight — all of it world state, all of
+            # it round-tripping.  The private signing key is *not* here:
+            # it is a constant in signing.py, the same in every world, and
+            # a seed that could swap it would be a seed that could make
+            # one Fauxbus's tokens verify against another's JWKS.
+            "oidc": {"issuer": self.issuer, "signed_token_clock": self.signed_token_clock},
+            "identity_providers": {
+                iid: {"name": idp.name} for iid, idp in sorted(self.identity_providers.items())
+            },
+            "accounts": {
+                primary: {
+                    "identities": {
+                        iid: {
+                            "username": i.username,
+                            "identity_provider": i.identity_provider,
+                            "name": i.name,
+                            "email": i.email,
+                            "organization": i.organization,
+                        }
+                        for iid, i in sorted(a.identities.items())
+                    }
+                }
+                for primary, a in sorted(self.accounts.items())
+            },
+            "authorization_requests": {
+                rid: {
+                    "client_id": r.client_id,
+                    "redirect_uri": r.redirect_uri,
+                    "scopes": list(r.scopes),
+                    "state": r.state,
+                    "nonce": r.nonce,
+                    "code_challenge": r.code_challenge,
+                }
+                for rid, r in sorted(self.authorization_requests.items())
+            },
+            "authorization_codes": {
+                code: {
+                    "client_id": c.client_id,
+                    "redirect_uri": c.redirect_uri,
+                    "scopes": list(c.scopes),
+                    "state": c.state,
+                    "nonce": c.nonce,
+                    "code_challenge": c.code_challenge,
+                    "account": c.account,
+                    "identity_id": c.identity_id,
+                    "authenticated_at": c.authenticated_at,
+                    "issued_at": c.issued_at,
+                    "expires_at": c.expires_at,
+                    "used": c.used,
+                }
+                for code, c in sorted(self.authorization_codes.items())
+            },
+            "sessions": {
+                sid: {"account": x.account, "authenticated_at": x.authenticated_at}
+                for sid, x in sorted(self.sessions.items())
             },
             "groups": {
                 gid: {
@@ -1219,6 +1898,7 @@ class World:
             self.preferences[_require_uuid(str(identity_id), "identity_id")] = {
                 "allow_add": bool(prefs.get("allow_add", True))
             }
+        self._load_oidc_people(doc)
         for client_id, c in _require_mapping(doc.get("clients"), "clients").items():
             # A client id must be a UUID because a Globus client is an
             # identity, and identities are UUIDs everywhere else in this
@@ -1229,11 +1909,28 @@ class World:
             c = _require_mapping(c, f"clients[{client_id!r}]")
             if not c.get("secret"):
                 raise validation_error(f"client {client_id} requires a non-empty 'secret'")
+            redirect_uris = c.get("redirect_uris") or []
+            if not isinstance(redirect_uris, list):
+                raise validation_error(f"client {client_id} 'redirect_uris' must be a list")
+            required_idp = c.get("required_idp")
+            if required_idp is not None:
+                required_idp = _require_uuid(str(required_idp), f"client {client_id} required_idp")
+                if required_idp not in self.identity_providers:
+                    # Loud here rather than at login: a required_idp
+                    # naming a provider nobody can have an identity from
+                    # would refuse every account with a reason that
+                    # sounds like the account's fault.
+                    raise validation_error(
+                        f"client {client_id} requires identity provider {required_idp}, which "
+                        f"is not in 'identity_providers'."
+                    )
             self.clients[client_id] = OAuthClient(
                 client_id=client_id,
                 secret=str(c["secret"]),
                 name=str(c.get("name") or client_id),
                 username=str(c.get("username") or client_username(client_id)),
+                redirect_uris=[_require_redirect_uri(u, client_id) for u in redirect_uris],
+                required_idp=required_idp,
             )
         # What the mint has not yet reached, the mint still owns.  Read
         # before the loop because the loop must not move it.
@@ -1295,7 +1992,14 @@ class World:
                 issued_at=_require_int(t.get("issued_at", self.clock), f"token {tok!r} issued_at"),
                 expires_at=_require_int(t["expires_at"], f"token {tok!r} expires_at"),
                 revoked=bool(t.get("revoked", False)),
+                account=self._require_account(t.get("account"), f"token {tok!r}"),
+                authenticated_at=(
+                    None
+                    if t.get("authenticated_at") is None
+                    else _require_int(t["authenticated_at"], f"token {tok!r} authenticated_at")
+                ),
             )
+        self._load_logins_in_flight(doc)
         for gid, g in _require_mapping(doc.get("groups"), "groups").items():
             gid = _require_uuid(str(gid), "group id")
             if not isinstance(g, dict) or not g.get("name"):
@@ -1355,6 +2059,180 @@ class World:
                 )
             self.groups[gid] = group
 
+    def _load_oidc_people(self, doc: dict[str, Any]) -> None:
+        """Slice B's seed sections: configuration, providers, accounts.
+
+        Loaded before ``clients`` because a client's ``required_idp`` must
+        name a provider that exists, and before ``tokens`` because a
+        person's token names an account.  The same loud-at-the-door rule
+        as everywhere else: a typo fails the seed call, not a login three
+        redirects later.
+        """
+        oidc = _require_mapping(doc.get("oidc"), "oidc")
+        unknown = set(oidc) - {"issuer", "signed_token_clock"}
+        if unknown:
+            raise validation_error(f"unknown 'oidc' fields: {sorted(unknown)}")
+        if oidc.get("issuer") is not None:
+            try:
+                self.issuer = check_issuer(str(oidc["issuer"]))
+            except ValueError as err:
+                raise validation_error(str(err)) from None
+        clock_mode = oidc.get("signed_token_clock")
+        if clock_mode is not None and clock_mode not in SIGNED_TOKEN_CLOCKS:
+            raise validation_error(
+                f"oidc.signed_token_clock must be one of {SIGNED_TOKEN_CLOCKS} or null, "
+                f"got {clock_mode!r}"
+            )
+        self.signed_token_clock = clock_mode
+
+        for iid, idp in _require_mapping(doc.get("identity_providers"), "identity_providers").items():
+            iid = _require_uuid(str(iid), "identity provider id")
+            idp = _require_mapping(idp, f"identity_providers[{iid!r}]")
+            if not idp.get("name"):
+                raise validation_error(f"identity provider {iid} requires a 'name'")
+            self.identity_providers[iid] = IdentityProvider(id=iid, name=str(idp["name"]))
+
+        owner: dict[str, str] = {}  # identity id -> the account that holds it
+        for primary, a in _require_mapping(doc.get("accounts"), "accounts").items():
+            primary = _require_uuid(str(primary), "account (primary identity) id")
+            a = _require_mapping(a, f"accounts[{primary!r}]")
+            identities: dict[str, GlobusIdentity] = {}
+            for iid, i in _require_mapping(a.get("identities"), f"account {primary} identities").items():
+                iid = _require_uuid(str(iid), f"account {primary} identity id")
+                if iid in owner:
+                    # An identity belongs to exactly one account in Globus —
+                    # linking moves it, it is never shared — and two
+                    # accounts claiming one identity would give that
+                    # identity two different identity_sets.
+                    raise validation_error(
+                        f"identity {iid} appears in accounts {owner[iid]} and {primary}; an "
+                        f"identity belongs to one account."
+                    )
+                owner[iid] = primary
+                i = _require_mapping(i, f"identity {iid}")
+                if not i.get("username"):
+                    raise validation_error(f"identity {iid} requires a 'username'")
+                idp_id = _require_uuid(str(i.get("identity_provider")), f"identity {iid} identity_provider")
+                if idp_id not in self.identity_providers:
+                    raise validation_error(
+                        f"identity {iid} names identity provider {idp_id}, which is not in "
+                        f"'identity_providers'."
+                    )
+                identities[iid] = GlobusIdentity(
+                    id=iid,
+                    username=str(i["username"]),
+                    identity_provider=idp_id,
+                    name=_optional_str(i.get("name"), f"identity {iid} name"),
+                    email=_optional_str(i.get("email"), f"identity {iid} email"),
+                    organization=_optional_str(i.get("organization"), f"identity {iid} organization"),
+                )
+            if primary not in identities:
+                raise validation_error(
+                    f"account {primary} is named for its primary identity, so that identity "
+                    f"must appear in its own 'identities'."
+                )
+            self.accounts[primary] = Account(primary=primary, identities=identities)
+
+    def _require_account(self, value: Any, what: str) -> str | None:
+        if value is None:
+            return None
+        account = _require_uuid(str(value), f"{what} account")
+        if account not in self.accounts:
+            raise validation_error(f"{what} names account {account}, which is not in 'accounts'.")
+        return account
+
+    def _refuse_unminted(self, section: str, name: str, prefix: str, counter: str) -> None:
+        """The ``fauxbus-at-N`` collision rule, for every other minted name.
+
+        Codes, sessions and parked requests are minted from counters the
+        same way access tokens are, so seeding ``fauxbus-code-0`` into a
+        fresh world would be overwritten by the first login — silently,
+        deterministically, every run.  Same refusal, same line drawn at
+        the counter rather than the name shape; see the ``tokens`` loop
+        in ``load`` for the whole story.
+        """
+        n = minted_number(prefix, name)
+        mints_next = self.counters.get(counter, 0)
+        if n is not None and n >= mints_next:
+            raise validation_error(
+                f"{section} entry {name!r} is a name this world has not minted yet — the next "
+                f"one is {minted_name(prefix, mints_next)!r} — so it would be silently "
+                f"overwritten. Use a name outside the {prefix}N space, or set "
+                f"counters.{counter} to {n + 1} or more."
+            )
+
+    def _load_logins_in_flight(self, doc: dict[str, Any]) -> None:
+        """Parked requests, issued codes, and sessions: a half-finished login.
+
+        Joining the round trip was decided rather than defaulted: carving
+        an exception out of an invariant is how invariants die, and being
+        able to dump a world mid-login and restore it exactly is a thing a
+        harness can genuinely use.
+        """
+
+        def binding(section: str, name: str, r: dict[str, Any]) -> dict[str, Any]:
+            # The fields a parked request and a code share.
+            client_id = _require_uuid(str(r.get("client_id")), f"{section} {name} client_id")
+            if client_id not in self.clients:
+                raise validation_error(f"{section} {name} names unregistered client {client_id}")
+            scopes = r.get("scopes") or []
+            if not isinstance(scopes, list) or not all(isinstance(x, str) for x in scopes):
+                raise validation_error(f"{section} {name} 'scopes' must be a list of strings")
+            if not isinstance(r.get("redirect_uri"), str):
+                raise validation_error(f"{section} {name} requires a 'redirect_uri'")
+            return {
+                "client_id": client_id,
+                "redirect_uri": r["redirect_uri"],
+                "scopes": list(scopes),
+                "state": _optional_str(r.get("state"), f"{section} {name} state"),
+                "nonce": _optional_str(r.get("nonce"), f"{section} {name} nonce"),
+                "code_challenge": _optional_str(r.get("code_challenge"), f"{section} {name} code_challenge"),
+            }
+
+        for rid, r in _require_mapping(doc.get("authorization_requests"), "authorization_requests").items():
+            rid = str(rid)
+            self._refuse_unminted("authorization_requests", rid, REQUEST_PREFIX, "authorization_request")
+            r = _require_mapping(r, f"authorization_requests[{rid!r}]")
+            self.authorization_requests[rid] = AuthorizationRequest(id=rid, **binding("request", rid, r))
+
+        for code, c in _require_mapping(doc.get("authorization_codes"), "authorization_codes").items():
+            code = str(code)
+            self._refuse_unminted("authorization_codes", code, CODE_PREFIX, "authorization_code")
+            c = _require_mapping(c, f"authorization_codes[{code!r}]")
+            account = self._require_account(c.get("account"), f"code {code!r}")
+            if account is None:
+                raise validation_error(f"code {code!r} requires an 'account'")
+            identity_id = _require_uuid(str(c.get("identity_id") or account), f"code {code!r} identity_id")
+            if identity_id not in self.accounts[account].identities:
+                raise validation_error(f"code {code!r}: identity {identity_id} is not in account {account}")
+            self.authorization_codes[code] = AuthorizationCode(
+                code=code,
+                **binding("code", code, c),
+                account=account,
+                identity_id=identity_id,
+                authenticated_at=_require_int(c.get("authenticated_at", self.clock), f"code {code!r} authenticated_at"),
+                issued_at=_require_int(c.get("issued_at", self.clock), f"code {code!r} issued_at"),
+                expires_at=_require_int(
+                    c.get("expires_at", self.clock + CODE_LIFETIME), f"code {code!r} expires_at"
+                ),
+                used=bool(c.get("used", False)),
+            )
+
+        for sid, x in _require_mapping(doc.get("sessions"), "sessions").items():
+            sid = str(sid)
+            self._refuse_unminted("sessions", sid, SESSION_PREFIX, "session")
+            x = _require_mapping(x, f"sessions[{sid!r}]")
+            account = self._require_account(x.get("account"), f"session {sid!r}")
+            if account is None:
+                raise validation_error(f"session {sid!r} requires an 'account'")
+            self.sessions[sid] = Session(
+                id=sid,
+                account=account,
+                authenticated_at=_require_int(
+                    x.get("authenticated_at", self.clock), f"session {sid!r} authenticated_at"
+                ),
+            )
+
     def reset(self) -> None:
         self.clock = 0
         self.counters = {}
@@ -1367,3 +2245,14 @@ class World:
         # next issued token is `fauxbus-at-0` again, as determinism wants.
         self.clients = {}
         self.tokens = {}
+        # And every login in flight with them: a code that survived a
+        # reset could be redeemed by the next test, and a session that
+        # survived would sign the next test's browser in as the last
+        # test's user without ever showing the picker.
+        self.issuer = None
+        self.signed_token_clock = None
+        self.identity_providers = {}
+        self.accounts = {}
+        self.authorization_requests = {}
+        self.authorization_codes = {}
+        self.sessions = {}

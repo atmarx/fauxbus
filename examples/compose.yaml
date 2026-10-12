@@ -37,6 +37,15 @@ services:
       #
       # That client is an active admin of the seeded group, because in
       # Globus a client is an identity and its token acts as itself.
+      #
+      # It also seeds a browser login (Auth slice B): an OIDC issuer of
+      # http://localhost:9800 on the wall clock, a "Night Owl web login"
+      # client that requires the university identity provider, and
+      # alice, whose Globus ID account links that university identity.
+      # Point a Keycloak identity provider at it — README "Brokered
+      # login" has the settings, and examples/keycloak_broker.py proves
+      # them.  Edit the client's redirect_uris to your broker's
+      # endpoint; the match is exact.
       - ./seed.json:/seed.json:ro
 
     # The image ships this same healthcheck; repeated here so

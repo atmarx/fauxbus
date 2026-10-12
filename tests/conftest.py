@@ -40,6 +40,94 @@ GROUPS_SCOPE = "urn:globus:auth:scope:groups.api.globus.org:all"
 TRANSFER_SCOPE = "urn:globus:auth:scope:transfer.api.globus.org:all"
 
 
+# --- slice B: a small world of people, providers, and login clients -------
+#
+# Globus ID's provider UUID is RECORDED (globus_sdk/testing/data/auth/
+# get_identity_providers.py) — using the real one costs nothing and
+# makes the identity_provider claims look like the real thing.  The
+# university is invented, under an RFC 2606 name.
+GLOBUSID_IDP = "41143743-f3c8-4d60-bbdb-eeecaba85bd9"
+UNIVERSITY_IDP = "00000000-0000-4000-8000-0000000001d9"
+
+# alice: primary identity at Globus ID, plus a linked university identity.
+ALICE_GLOBUSID = "00000000-0000-4000-8000-00000000a11c"
+ALICE_UNIVERSITY = "00000000-0000-4000-8000-00000000a11e"
+# bob: Globus ID only — the account a required_idp client must refuse.
+BOB_GLOBUSID = "00000000-0000-4000-8000-000000000b0b"
+
+LOGIN_CLIENT = "00000000-0000-4000-8000-00000000c0de"
+LOGIN_SECRET = "login-secret-not-a-real-one"
+LOGIN_REDIRECT = "https://app.example.org/callback"
+# A second login client that demands the university identity.
+CAMPUS_CLIENT = "00000000-0000-4000-8000-0000000ca305"
+CAMPUS_SECRET = "campus-secret-not-a-real-one"
+CAMPUS_REDIRECT = "https://campus.example.edu/broker/fauxbus/endpoint"
+
+
+def oidc_seed(issuer: str, **extra: Any) -> dict[str, Any]:
+    """A seed document with everything a browser login needs.
+
+    ``issuer`` is the live test server's own URL, because globus-sdk's
+    ``get_jwk`` follows discovery's ``jwks_uri`` — an issuer the test
+    process cannot reach would send the SDK somewhere that does not
+    answer.
+    """
+    doc: dict[str, Any] = {
+        "identities": PINS,
+        "oidc": {"issuer": issuer},
+        "identity_providers": {
+            GLOBUSID_IDP: {"name": "Globus ID"},
+            UNIVERSITY_IDP: {"name": "Example University"},
+        },
+        "accounts": {
+            ALICE_GLOBUSID: {
+                "identities": {
+                    ALICE_GLOBUSID: {
+                        "username": "alice@globusid.org",
+                        "identity_provider": GLOBUSID_IDP,
+                        "name": "Alice Example",
+                        "email": "alice@example.org",
+                        "organization": "Independent",
+                    },
+                    ALICE_UNIVERSITY: {
+                        "username": "ae123@example.edu",
+                        "identity_provider": UNIVERSITY_IDP,
+                        "name": "Alice Example",
+                        "email": "ae123@example.edu",
+                        "organization": "Example University",
+                    },
+                }
+            },
+            BOB_GLOBUSID: {
+                "identities": {
+                    BOB_GLOBUSID: {
+                        "username": "bob@globusid.org",
+                        "identity_provider": GLOBUSID_IDP,
+                        "name": "Bob Example",
+                        "email": "bob@example.org",
+                    }
+                }
+            },
+        },
+        "clients": {
+            **CLIENTS,
+            LOGIN_CLIENT: {
+                "secret": LOGIN_SECRET,
+                "name": "Example Web Login",
+                "redirect_uris": [LOGIN_REDIRECT],
+            },
+            CAMPUS_CLIENT: {
+                "secret": CAMPUS_SECRET,
+                "name": "Campus Broker",
+                "redirect_uris": [CAMPUS_REDIRECT],
+                "required_idp": UNIVERSITY_IDP,
+            },
+        },
+    }
+    doc.update(extra)
+    return doc
+
+
 def basic_header(client_id: str, secret: str) -> str:
     """The header globus-sdk's BasicAuthorizer builds, byte for byte.
 
@@ -120,6 +208,51 @@ class Client:
             return err.code, json.loads(err.read() or b"null"), dict(err.headers)
 
 
+    def browse(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        form: dict[str, str] | None = None,
+        cookie: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        """One browser hop, *not* following redirects.
+
+        A login is a chain of 302s, and every one of them is something a
+        test wants to read — the Location, the code in it, the cookie set
+        beside it.  urllib follows redirects by default, which would
+        swallow exactly the evidence the test exists to inspect, so this
+        uses an opener with redirect handling removed.  Returns the
+        status, the headers (a plain dict; ``Set-Cookie`` included), and
+        the raw body bytes, because a hop's body may be HTML or nothing.
+        """
+        req = urllib.request.Request(
+            path if path.startswith("http") else self.base_url + path,
+            data=urllib.parse.urlencode(form).encode() if form is not None else None,
+            method=method,
+        )
+        if form is not None:
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        if cookie is not None:
+            req.add_header("Cookie", cookie)
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
+        try:
+            with _NO_REDIRECTS.open(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as err:
+            return err.code, dict(err.headers), err.read()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None  # surface the 3xx as an HTTPError instead of following it
+
+
+_NO_REDIRECTS = urllib.request.build_opener(_NoRedirect)
+
+
 @pytest.fixture(scope="session")
 def live_server():
     server = make_server("127.0.0.1", 0)
@@ -156,6 +289,14 @@ def registered(fx: Client) -> Client:
     """A world with alice/bob/carol pinned and one confidential client registered."""
     status, _, _ = fx.post("/_fauxbus/seed", {"identities": PINS, "clients": CLIENTS})
     assert status == 200
+    return fx
+
+
+@pytest.fixture
+def oidc(fx: Client) -> Client:
+    """A world seeded for browser logins, issuer = this server."""
+    status, doc, _ = fx.post("/_fauxbus/seed", oidc_seed(fx.base_url))
+    assert status == 200, doc
     return fx
 
 

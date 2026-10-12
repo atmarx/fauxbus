@@ -1,7 +1,51 @@
 {
+  "accounts": {
+    "00000000-0000-4000-8000-00000000000b": {
+      "identities": {
+        "00000000-0000-4000-8000-00000000000b": {
+          "email": "bob@example.org",
+          "identity_provider": "41143743-f3c8-4d60-bbdb-eeecaba85bd9",
+          "name": "Bob Example",
+          "organization": null,
+          "username": "bob@globusid.org"
+        }
+      }
+    },
+    "00000000-0000-4000-8000-00000000a11c": {
+      "identities": {
+        "00000000-0000-4000-8000-00000000000a": {
+          "email": "alice@example.org",
+          "identity_provider": "00000000-0000-4000-8000-0000000001d9",
+          "name": "Alice Example",
+          "organization": "Night Owl University",
+          "username": "alice@example.org"
+        },
+        "00000000-0000-4000-8000-00000000a11c": {
+          "email": "alice@globusid.example",
+          "identity_provider": "41143743-f3c8-4d60-bbdb-eeecaba85bd9",
+          "name": "Alice Example",
+          "organization": null,
+          "username": "alice@globusid.org"
+        }
+      }
+    }
+  },
+  "authorization_codes": {},
+  "authorization_requests": {},
   "clients": {
+    "00000000-0000-4000-8000-00000000c0de": {
+      "name": "Night Owl web login",
+      "redirect_uris": [
+        "http://localhost:8080/realms/nightowl/broker/fauxbus/endpoint"
+      ],
+      "required_idp": "00000000-0000-4000-8000-0000000001d9",
+      "secret": "web-login-secret-not-a-real-one",
+      "username": "00000000-0000-4000-8000-00000000c0de@clients.auth.globus.org"
+    },
     "00000000-0000-4000-8000-0000000c11e7": {
       "name": "Night Owl dispatcher",
+      "redirect_uris": [],
+      "required_idp": null,
       "secret": "dispatcher-secret-not-a-real-one",
       "username": "00000000-0000-4000-8000-0000000c11e7@clients.auth.globus.org"
     }
@@ -60,7 +104,20 @@
       "username": "bob@example.org"
     }
   },
+  "identity_providers": {
+    "00000000-0000-4000-8000-0000000001d9": {
+      "name": "Night Owl University"
+    },
+    "41143743-f3c8-4d60-bbdb-eeecaba85bd9": {
+      "name": "Globus ID"
+    }
+  },
+  "oidc": {
+    "issuer": "http://localhost:9800",
+    "signed_token_clock": "wall"
+  },
   "preferences": {},
+  "sessions": {},
   "tokens": {},
   "version": 0
 }

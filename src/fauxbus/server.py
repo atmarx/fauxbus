@@ -12,6 +12,7 @@ import json
 import re
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -60,6 +61,30 @@ class Ctx:
     # different question than "who is the caller", asked at a different
     # layer.
     headers: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Raw:
+    """A response body that is not JSON: an HTML page, or nothing at all.
+
+    Fauxbus spoke only JSON until slice B, and the browser leg of an
+    OIDC login does not.  A redirect is a status, a ``Location`` header
+    and an empty body; the account picker is a page a person reads.
+    Handlers return ``Raw`` in place of a document, and ``_send`` writes
+    the bytes as they are instead of serializing them.
+    """
+
+    body: bytes = b""
+    content_type: str = "text/plain; charset=utf-8"
+
+
+def redirect(location: str, headers: dict[str, str] | None = None) -> tuple[int, Raw, dict[str, str]]:
+    """A 302 with an empty body — the shape of every hop in a browser login.
+
+    302 rather than 303 or 307 because it is what RFC 6749 §4.1.2's own
+    example uses and what every OAuth client is written to follow.
+    """
+    return 302, Raw(), {"Location": location, **(headers or {})}
 
 
 Handler = Callable[[Ctx], tuple[int, Any] | tuple[int, Any, dict[str, str]]]
@@ -157,6 +182,9 @@ class FauxbusServer(ThreadingHTTPServer):
         canonical_seed: dict[str, Any] | None = None,
         control_loopback_only: bool = False,
         require_issued_tokens: bool = False,
+        issuer: str | None = None,
+        signed_token_clock: str | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__(address, FauxbusHandler)
         self.world = world or World()
@@ -184,6 +212,19 @@ class FauxbusServer(ThreadingHTTPServer):
         # The document reset restores — the fixed point tests return to.
         # Set at boot (--seed) or via POST /_fauxbus/seed?canonical=true.
         self.canonical_seed = canonical_seed
+        # Slice B's two boot-time defaults (--issuer, --signed-token-clock).
+        # They are *defaults*, consulted only when the world has no value
+        # of its own: the seed is authoritative, so a seeded issuer beats
+        # the flag, and a dump always describes the world rather than
+        # the command line.  What the flags buy is that a reset to an
+        # empty world, or a seed that never mentions OIDC, still leaves a
+        # broker pointed at a working issuer.
+        self.default_issuer = issuer
+        self.default_signed_token_clock = signed_token_clock
+        # The one wall clock in Fauxbus, injectable so a test can freeze
+        # it.  Read in exactly one place — ``signed_now`` — and only when
+        # the world has opted into wall time for signed tokens.
+        self.wall_clock = wall_clock
 
     def add_route(
         self,
@@ -200,6 +241,40 @@ class FauxbusServer(ThreadingHTTPServer):
         self.routes.append(
             Route(method, re.compile(f"^{pattern}$"), handler, auth, resource_server)
         )
+
+    def issuer(self) -> str | None:
+        """The effective OIDC issuer: the world's, else the boot default, else none."""
+        return self.world.issuer or self.default_issuer
+
+    def signed_token_clock(self) -> str:
+        return self.world.signed_token_clock or self.default_signed_token_clock or "logical"
+
+    def signed_now(self) -> int:
+        """The instant an ID token is stamped with, and the only wall-clock read in Fauxbus.
+
+        Principle 3's single stated exception, and the code is shaped to
+        keep it single.  Under ``logical`` (the default) a signed token's
+        ``iat`` is the world clock — deterministic, byte-identical across
+        runs, and expired by ``tick`` like everything else.  That is right
+        for anything Fauxbus or a harness verifies, and wrong for an
+        outside verifier: Keycloak checks ``exp`` against real time and
+        cannot be asked to tick, so a world at clock zero mints ID tokens
+        that expired in 1970, and the symptom is "login just fails" with
+        nothing pointing at a clock.
+
+        So ``wall`` exists, as an opt-in the harness states out loud —
+        ``oidc.signed_token_clock`` in the seed or ``--signed-token-clock
+        wall`` at boot.  What it changes is narrow: ID-token ``iat``/``exp``
+        and the ``last_authentication`` recorded at sign-in.  Codes and
+        access tokens stay on the logical clock, because Fauxbus is the
+        one validating those.  Determinism survives in the *offsets* —
+        ``exp - iat`` is always the same 172800 — rather than in the
+        absolute value.  ``tick`` does not move wall time; under ``wall``
+        an ID token's instants are simply when it was minted.
+        """
+        if self.signed_token_clock() == "wall":
+            return int(self.wall_clock())
+        return self.world.clock
 
     def arm_failure(self, doc: dict[str, Any]) -> FailureRule:
         status = doc.get("status")
@@ -263,13 +338,24 @@ class FauxbusHandler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _send(self, status: int, doc: Any, headers: dict[str, str] | None = None) -> None:
-        # sort_keys: byte-stable responses across runs.  Principle 3
-        # applies to the wire, not just the world.
-        body = json.dumps(doc, sort_keys=True).encode()
+        if isinstance(doc, Raw):
+            body, content_type = doc.body, doc.content_type
+        else:
+            # sort_keys: byte-stable responses across runs.  Principle 3
+            # applies to the wire, not just the world.
+            body, content_type = json.dumps(doc, sort_keys=True).encode(), "application/json"
+        # Slice B is the first place a header value is built from request
+        # data — a Location carrying the client's own redirect URI and
+        # state.  Everything that reaches here is already percent-encoded
+        # or seed-validated, and this check makes that a guarantee rather
+        # than a hope: a CR or LF in a header is response splitting,
+        # whoever put it there.  Checked *before* the status line goes
+        # out, so a refusal can still become a clean error response.
+        checked = [checked_header(name, value) for name, value in (headers or {}).items()]
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        for name, value in (headers or {}).items():
+        for name, value in checked:
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
@@ -382,11 +468,15 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                     "the control plane is restricted to loopback callers "
                     "(--control-loopback-only). The imitated surface is unaffected.",
                 )
-            if path.startswith("/v2/"):
+            if not path.startswith("/_fauxbus"):
                 # Injection is scoped to the imitated surface.  The
                 # control plane stays unbreakable: a harness that could
                 # sabotage its own reset endpoint couldn't be trusted
                 # to clean up after the test that did it (principle 4).
+                # "The imitated surface" used to mean /v2/; slice B added
+                # /.well-known/openid-configuration and /jwk.json, which
+                # a broker fetches and a test may well want to break, so
+                # the line is now drawn by exclusion rather than by prefix.
                 if self._maybe_inject(method, path):
                     return
             body, body_encoding = self._read_body()
@@ -557,10 +647,15 @@ def make_server(
     canonical_seed: dict[str, Any] | None = None,
     control_loopback_only: bool = False,
     require_issued_tokens: bool = False,
+    issuer: str | None = None,
+    signed_token_clock: str | None = None,
+    wall_clock: Callable[[], float] = time.time,
 ) -> FauxbusServer:
+    from .account_picker import register as register_picker
     from .auth_api import register as register_auth
     from .control_api import register as register_control
     from .groups_api import register as register_groups
+    from .oidc_api import register as register_oidc
 
     server = FauxbusServer(
         (host, port),
@@ -570,10 +665,15 @@ def make_server(
         canonical_seed=canonical_seed,
         control_loopback_only=control_loopback_only,
         require_issued_tokens=require_issued_tokens,
+        issuer=issuer,
+        signed_token_clock=signed_token_clock,
+        wall_clock=wall_clock,
     )
     register_auth(server)
+    register_oidc(server)
     register_groups(server)
     register_control(server)
+    register_picker(server)
     return server
 
 
@@ -582,8 +682,17 @@ def boot_line(server: FauxbusServer) -> str:
 
     host, port = server.server_address[:2]
     strict = " [--require-issued-tokens]" if server.require_issued_tokens else ""
+    issuer = server.issuer()
+    # The OIDC half says its issuer and its clock out loud, because both
+    # are the configuration that makes a broker's login "just fail" when
+    # wrong — and boot output is where someone looks first.
+    oidc = (
+        f"OIDC issuer {issuer}, signed-token clock {server.signed_token_clock()}"
+        if issuer
+        else "OIDC off until an issuer is set (--issuer or the seed's oidc.issuer)"
+    )
     return (
         f"fauxbus {__version__} listening on http://{host}:{port} — "
-        f"imitating: groups v2, auth v2 client_credentials (globus-sdk {SDK_PIN} "
-        f"surface){strict}; control plane at /_fauxbus/"
+        f"imitating: groups v2, auth v2 client_credentials + authorization_code "
+        f"(globus-sdk {SDK_PIN} surface){strict}; {oidc}; control plane at /_fauxbus/"
     )

@@ -255,13 +255,14 @@ def test_missing_scope_is_invalid_request(registered):
 def test_a_grant_globus_has_but_fauxbus_lacks_is_a_loud_501(registered):
     """Principle 2's sharpest edge, and the reason GLOBUS_GRANT_TYPES exists.
 
-    Globus supports authorization_code perfectly well; Fauxbus is the one
-    that has not built it. Answering ``unsupported_grant_type`` would be
-    the fake telling a lie about the real service on its own behalf. 501
-    with a tracker link says whose gap it is.
+    Globus supports refresh_token perfectly well; Fauxbus is the one that
+    has not built it. Answering ``unsupported_grant_type`` would be the
+    fake telling a lie about the real service on its own behalf. 501 with
+    a tracker link says whose gap it is.  (This test used
+    authorization_code until slice B built it.)
     """
     status, doc, _ = registered.form_post(
-        TOKEN, {"grant_type": "authorization_code", "code": "x"}, basic=CREDS
+        TOKEN, {"grant_type": "refresh_token", "refresh_token": "x"}, basic=CREDS
     )
     assert status == 501
     assert doc["code"] == "NOT_IMPLEMENTED"

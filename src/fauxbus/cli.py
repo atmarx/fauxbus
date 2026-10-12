@@ -8,8 +8,9 @@ import sys
 from pathlib import Path
 
 from . import SDK_PIN, __version__
+from .auth import check_issuer
 from .server import boot_line, make_server
-from .world import World
+from .world import SIGNED_TOKEN_CLOCKS, World
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,6 +48,21 @@ def main(argv: list[str] | None = None) -> int:
         "string, and every consumer written so far assumes it. Turn this on "
         "to test the three failures the permissive model cannot produce",
     )
+    serve.add_argument(
+        "--issuer",
+        help="the OIDC issuer URL, used verbatim in discovery, every endpoint URL, and "
+        "every ID token's iss. Pick the name the *browser* reaches Fauxbus by; a broker "
+        "in another network can be given separate token/JWKS/userinfo URLs. A seed's "
+        "oidc.issuer overrides this. Refused if it names a real Globus domain",
+    )
+    serve.add_argument(
+        "--signed-token-clock",
+        choices=SIGNED_TOKEN_CLOCKS,
+        help="what time ID tokens say it is. 'logical' (the default) keeps Fauxbus "
+        "deterministic; 'wall' stamps iat/exp with real time, which an outside verifier "
+        "like Keycloak needs — on the logical clock its logins fail as 'expired'. A "
+        "seed's oidc.signed_token_clock overrides this",
+    )
     serve.add_argument("--verbose", action="store_true", help="log every request")
 
     sub.add_parser("version", help="print version and imitated SDK pin")
@@ -56,9 +72,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "version":
         print(
             f"fauxbus {__version__} (imitating the globus-sdk {SDK_PIN} GroupsClient "
-            f"and client-credentials token surface)"
+            f"and the Auth token, introspection, and OIDC authorization-code surface)"
         )
         return 0
+
+    if args.issuer is not None:
+        # Refuse, not warn — see auth.check_issuer.  Exit code 2 like a
+        # bad seed: the process never starts in a configuration that
+        # signs tokens in Globus's name.
+        try:
+            check_issuer(args.issuer)
+        except ValueError as err:
+            print(f"fauxbus: {err}", file=sys.stderr)
+            return 2
 
     world = World()
     canonical_seed = None
@@ -83,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
         canonical_seed=canonical_seed,
         control_loopback_only=args.control_loopback_only,
         require_issued_tokens=args.require_issued_tokens,
+        issuer=args.issuer,
+        signed_token_clock=args.signed_token_clock,
     )
     # Boot chatter goes to stderr, like all of it — stdout belongs to
     # whoever wants to pipe this process.

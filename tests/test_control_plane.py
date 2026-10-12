@@ -13,7 +13,10 @@ TOKEN = "t-alice"
 def test_index_names_itself(fx):
     status, doc, _ = fx.get("/_fauxbus/")
     assert status == 200
-    assert doc["imitates"] == ["groups v2", "auth v2 (client_credentials)"]
+    assert doc["imitates"] == [
+        "groups v2",
+        "auth v2 (client_credentials, authorization_code + OIDC)",
+    ]
     assert doc["sdk_pin"] == "4.8.1"
     # A harness needs to know which auth posture it is talking to before
     # it decides whether to fetch a token or just make one up.
