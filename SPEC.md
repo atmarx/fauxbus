@@ -893,6 +893,67 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
 
 ## Roadmap (after Groups earns its keep)
 
+- **Next milestone, decided 2026-10-12: the Globus login shim.**
+  @xram's framing: *a way to mock Globus login reliably in code for
+  e2e testing.*  A shim, never a real identity provider.  Everything
+  in this document that makes Fauxbus untrustworthy on purpose (the
+  published signing key, the password-less account picker, the
+  unauthenticated control plane) stays exactly as it is.
+
+  **Acceptance test for the whole milestone:** an *unmodified* app
+  built on Globus login runs its full login and its Globus calls
+  against Fauxbus, with only configuration changed, while the test
+  drives every step from code: who signs in, when tokens expire, which
+  call fails.  "Unmodified" is literal: globus-sdk reads
+  `GLOBUS_SDK_SERVICE_URL_AUTH` / `_GROUPS` (verified on 4.8.1;
+  `GROUPS` takes the `/v2/` suffix), and a broker takes an issuer URL.
+
+  In order, each one a commit and a board post:
+
+  1. **Drop-in by environment.**  Conformance tests that reach Fauxbus
+     through the env vars instead of `base_url`; a README section,
+     "point your app at Fauxbus"; and a test that a person's
+     authorization-code token works against Groups *as that person*,
+     which is the group-gated-login story most consumers want.  Nearly
+     free, and it becomes the harness every later step is judged by.
+  2. **Native-app (public) clients with PKCE, and the
+     `/v2/web/auth-code` page.**  Today a public client's exchange is a
+     501.  This unlocks `NativeAppAuthClient` and the SDK's `UserApp`,
+     so every CLI and notebook built on globus-sdk.  The SDK sends
+     those clients to `{auth}/v2/web/auth-code` to display the code;
+     like authorize, that page is a browser surface the SDK cannot
+     ground, so it is graded against what the SDK does with it.
+  3. **Refresh tokens.**  `access_type=offline` / `offline_access`
+     yields a `refresh_token` on every token in the document (primary
+     and `other_tokens`); `grant_type=refresh_token`; refresh tokens
+     revocable; access-token expiry on the logical clock, so
+     `RefreshTokenAuthorizer` can be proved to survive a `tick` past
+     expiry.  There is no refresh fixture in 4.8.1: the shape is pinned
+     from the reader's side (`refresh_token` via `.get`), and whether
+     Globus rotates refresh tokens is PROVISIONAL.
+  4. **`fauxbus.testing`, an in-process harness.**  A context manager
+     (and a pytest fixture when pytest is present) that starts a server
+     on a free port, seeds it, and gives a test `sign_in(account)`,
+     `tick(seconds)`, `fail(...)`, `state()`.  These are thin wrappers
+     over the HTTP control plane, never a backdoor into `World`, so
+     principle 4 holds and the harness tests the same server everyone
+     else runs.  Stdlib only.  This is what turns the pieces into
+     something a test author uses in five lines.
+  5. **Identities lookup**: `GET /v2/api/identities` by ids and
+     usernames, from the recorded `get_identities` fixture.  For apps
+     that show names or add group members by username.
+  6. **A second relying party**: `examples/oauth2_proxy.py`, a generic
+     OIDC client beside the Keycloak one, plus a headless `UserApp`
+     example.  Proof that Fauxbus is a Globus login fake, not a
+     Keycloak special case.
+  7. **Release 0.4.0.**
+
+  Steps 2 and 3 come first among the real work because they are the
+  first two refusals a real app hits: most Globus apps are native
+  clients, and most ask for refresh tokens.  Deferred until a consumer
+  asks: dependent tokens, `prompt=none` and session step-up, logout,
+  the consents API.  Transfer stays held.
+
 - **Transfer** — the big one: endpoints/collections, task submission, and a
   simulated task lifecycle (ACTIVE → SUCCEEDED/FAILED with byte progress)
   driven by `/_fauxbus/tick`, so e2e suites can watch a transfer "run"
