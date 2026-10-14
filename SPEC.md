@@ -163,9 +163,9 @@ on: where exactly the manager/admin boundary sits for adding a member
 directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Building slice A added four more to that list, slice A.2 three more,
-multi-resource-server responses two, and slice B five — and it is worth
-noticing that every one of them is a question the audit could not have
-asked before the code existed:
+multi-resource-server responses two, slice B five, and Transfer task
+monitoring nine — and it is worth noticing that every one of them is a
+question the audit could not have asked before the code existed:
 
 1. **The status for a token presented to the wrong resource server.**
    Fauxbus answers 403 — the token is genuine and introspects fine, it
@@ -240,6 +240,53 @@ asked before the code existed:
     default code-exchange fixture carries `"state"` in the body; its
     openid variant does not.  Fauxbus echoes in both.  `PROVISIONAL` in
     `auth_api._authorization_code`.
+15. **Which collection a task's visibility hangs on.**  The published
+    reference says a role on the "source or destination collection"
+    lets a caller see a task; the SDK's docstrings for
+    `endpoint_manager_get_task` and `endpoint_manager_task_event_list`
+    say "the destination endpoint of the task."  They disagree.
+    Fauxbus takes the reference, the more permissive reading.
+    `PROVISIONAL` in `World._task_visible`.
+16. **Whether `administrator` goes quiet when a subscription lapses.**
+    The reference says the two activity roles do.  Fauxbus treats
+    administrator the same.  `PROVISIONAL` in `World._monitor_refusal`.
+17. **What a malformed id answers.**  A task id or collection id that is
+    not a UUID gets 404 `TaskNotFound` / `EndpointNotFound` rather than
+    a 400.  Two markers, in `World._transfer_task` and
+    `endpoint_manager_task_list`.
+18. **Which malformed task-list requests are refused.**  The
+    `BadRequest` code is recorded and the rules come from the SDK's
+    docstring (`filter_endpoint` required unless every status asked
+    for is a running one) and the reference (`limit` at most 1000), but
+    nobody has watched the service apply them, or seen its messages.
+    `PROVISIONAL` in `endpoint_manager_task_list`.
+19. **Whether `filter_completion_time`'s edges are inclusive.**  Fauxbus
+    includes both.  `PROVISIONAL` in `World._in_window`.
+20. **What `last_key` holds.**  The reference calls it opaque.  Fauxbus
+    borrows the recorded example's shape (`complete,<time>`), adds the
+    task id so two tasks with one timestamp can be told apart, and
+    pages by key rather than by offset.  A last page still carries its
+    key (the recording does); an empty page carries null (nothing
+    recorded).  Two markers in `World._encode_last_key`.
+21. **How `successful_transfers` pages.**  No page size is documented;
+    Fauxbus uses 100.  The marker is an integer in the reference and
+    an offset in Fauxbus.  Two markers, at
+    `SUCCESSFUL_TRANSFERS_PAGE` and in
+    `endpoint_manager_successful_transfers`.
+22. **Whether the endpoint-manager file list refuses a running task.**
+    The reference says the owner's `/task/<id>/successful_transfers`
+    answers 400 `ClientError.BadRequest` for a task "not yet
+    complete"; the endpoint-manager page does not restate it.  Fauxbus
+    applies the same rule to both.  `PROVISIONAL` in
+    `endpoint_manager_successful_transfers`.
+23. **The values of the task fields Fauxbus does not model.**  The key
+    set is recorded and complete; `deadline`, the `subtasks_*` counts,
+    `is_ok`, `nice_status`, `effective_bytes_per_second`, `username`,
+    the legacy `name#id` endpoint strings, and the host, mapped and
+    local-user fields are null or a resting value.  So is
+    `successful_transfer.dynamic`, which the reference shows as
+    `false` and does not explain.  Two markers, in `World.task_doc`
+    and on `dynamic`.
 
 And `identity_set`, already at the top of this list since v0.2.15, now
 has code to point at: its entry shape and its order are two
@@ -264,6 +311,8 @@ Auth's own document, a JSON:API `errors` list with RFC 6749's
 `error`/`error_description` beside it, RECORDED from
 `globus_sdk/testing/data/auth/userinfo.py` — and unlike the token
 endpoint's, those errors *do* reach the SDK's `.code` and `.message`.
+Transfer made it four: `{code, message, request_id, resource}`,
+RECORDED in the SDK's Transfer fixtures — see the Transfer section.
 
 ### Control-plane reachability
 
@@ -804,6 +853,137 @@ last test's user.  Their minted names (`fauxbus-code-N`,
 `fauxbus-session-N`, `fauxbus-request-N`) get the same seed-door guard
 `fauxbus-at-N` got in v0.2.17.
 
+## v0.2 — Transfer task monitoring
+
+A researcher sends a dataset to a landing collection.  Nobody at the
+receiving end submitted that transfer, and Globus will not call anyone
+when it finishes: there is no webhook, so a service that needs to know
+polls.  It asks the Transfer API, as an *endpoint manager*, which
+tasks came into the collection and which files each one delivered.
+Root Cellar's poller does exactly that, and this slice is the API it
+asks.  Its three calls run against Fauxbus unmodified; the conformance
+suite repeats them argument for argument.
+
+**The surface**, three `TransferClient` methods of globus-sdk 4.8.1:
+
+- `endpoint_manager_task_list` — `GET /v0.10/endpoint_manager/task_list`,
+  with `filter_endpoint`, `filter_endpoint_use`, `filter_status`,
+  `filter_completion_time`, `limit`, and `last_key` paging.
+- `endpoint_manager_get_task` — `GET /v0.10/endpoint_manager/task/{id}`.
+- `endpoint_manager_task_successful_transfers` —
+  `GET /v0.10/endpoint_manager/task/{id}/successful_transfers`, paged
+  by `next_marker`.
+
+`endpoint_manager_task_event_list` is not built and answers the loud
+501; no consumer calls it, and the reference itself says task events
+are for troubleshooting.  The task list's other filters
+(`filter_task_id`, `filter_owner_id`, `filter_is_paused`,
+`filter_min_faults`, `filter_local_user`) are a 501 too, *by name* —
+an ignored filter is the purest silent wrong answer there is, since
+the caller asked for fewer tasks and got all of them in a response that
+looks perfect.
+
+**Grades.**  RECORDED, from
+`globus_sdk/testing/data/transfer/`: the task-list envelope (`DATA`,
+`DATA_TYPE`, `has_next_page`, `last_key`, and no total); the task
+document's full key set, which a conformance test reads out of the
+fixture's source with `ast` and compares key for key; the
+successful-transfer envelope and the three row fields the fixture
+shows (`DATA_TYPE`, `source_path`, `destination_path`); and Transfer's
+error document, `{code, message, request_id, resource}`.  DOCUMENTED,
+from the published reference (read 2026-10-14): the four other row
+fields (`size`, `checksum`, `checksum_algorithm`, `dynamic`); the
+ordering (running tasks first, newest request first, then finished
+tasks, newest completion first); `limit`'s default of 100 and ceiling
+of 1000; the roles; the subscription rule; the completion-time formats
+and the blank-end rule; `fatal_error`'s shape; and that a running
+task's file list is a 400.  PROVISIONAL: nine obligations, items 15–23
+on the recording list.
+
+**The SDK's fixture does not ground the fields the consumer stores.**
+Worth its own paragraph, because it is the kind of thing this project
+exists to notice.  The successful-transfer rows in 4.8.1's fixture
+carry a source path and a destination path and nothing else.  `size`,
+`checksum` and `checksum_algorithm` — the three things a poller writes
+down beside each path — come from the published reference alone.
+Fauxbus serves them, graded DOCUMENTED, and they are the first thing a
+recording session should look at.
+
+**Who may look.**  A Transfer token (under `--require-issued-tokens`,
+a Groups token here is refused, the same check that has kept Transfer
+tokens out of Groups since slice A), and an identity holding
+`activity_monitor`, `activity_manager` or `administrator` on a
+collection the task touched.  The role only counts while the
+collection is subscribed: the reference says "if the endpoint or
+collection is unsubscribed, activity manager and monitor roles become
+inactive," which is a production failure — a lapsed subscription, every
+grant still in place, the poller suddenly refused — that a fake with no
+subscription field could never show.  Role principals are identities;
+Globus also grants roles to groups, and nobody has asked for that.
+Without `filter_endpoint` (legal only when asking for running tasks),
+a caller sees the tasks its roles reach — the SDK's docstring describes
+the method as listing tasks "visible via activity_monitor role."
+
+**The model is bookkeeping.**  The bright line from 2026-07-31 holds:
+no byte moves, no path is opened, no GridFTP.  A collection is a name,
+a subscription, and role grants.  A task is an owner, a source and
+destination, a status, and a list of files that are rows with a path
+and a size.  Progress is whole files in list order, arriving evenly
+between `active_since` and `due_at` on the logical clock, computed
+rather than stored, so a dump taken mid-transfer reloads to the same
+point.  Checksums are whatever the harness says, or null: there are no
+bytes to compute one over, and an invented one would have a consumer
+comparing its own copy against noise.
+
+**The control plane, and why this shape.**  Two routes and a clock:
+
+- `POST /_fauxbus/transfer/tasks` creates a task at the current clock.
+  `duration` sets it running; `status` can start it anywhere.
+- `POST /_fauxbus/transfer/tasks/<id>` moves it: `INACTIVE` pauses,
+  `ACTIVE` with a `duration` resumes, `SUCCEEDED` finishes it now,
+  `FAILED` with `files_succeeded` fails it part-way.  A finished task
+  does not move again (409): Globus never reports a terminal task
+  finishing a second way, and a consumer's "terminal means terminal"
+  rule deserves a fake that agrees.
+- `POST /_fauxbus/tick` finishes every ACTIVE task its seconds carry
+  past due, stamped with the time it was *due*, not the time the
+  harness looked.
+
+The alternative was imitating task submission (`submit_transfer`) and
+letting tests create tasks through the imitated surface.  That would
+mean building submission documents, submission ids, endpoint
+activation, and a data plane's worth of validation for a call no
+consumer makes — the poller only reads.  So creation is a harness act,
+out-of-band per principle 4, the same way a group's subscription
+arrives by seed because no Groups endpoint writes one.  Duration plus
+tick, rather than "complete it now" alone, because a poller's window
+logic is about *when* things finished, and only the clock can test that
+without a sleep.  Explicit moves, alongside it, because "fail it at
+60%" is SPEC's opening promise and an outage is not a duration.
+Failure injection needed nothing new: armed rules and `X-Fauxbus-Fail`
+already reach every path outside `/_fauxbus/`, `/v0.10/` included.
+
+**Seed the clock to a real second.**  Task times are the logical clock
+rendered as ISO 8601, so a fresh world's tasks finish in 1970, and a
+poller asking for "completed since ten minutes ago" by its own wall
+clock finds nothing.  This is introspection's lesson again (seed
+`"clock": 1767225600`), and it bites harder here, because the poller's
+window is computed from its *own* `now`.  A long-running dev stack must
+also tick the fake forward as wall time passes, or the tasks it creates
+fall behind the window.  `examples/seed.json` seeds a real second.
+
+**A fourth error dialect.**  Transfer's errors say `message` where the
+rest of Globus says `detail`, carry a `request_id` and the `resource`
+path, and use CamelCase codes (`PermissionDenied`, `TaskNotFound`,
+`EndpointNotFound`, `BadRequest`, and the reference's own
+`ClientError.BadRequest` for a running task's file list).  The SDK
+reads either key into `.message`, so a consumer cannot tell, but a raw
+reader can, and the fake says what the service says.  The `request_id`
+is nine characters hashed from the code and the path rather than drawn
+at random, so the same failure renders the same bytes every run.
+Fauxbus's own errors — the 501s, a missing token — keep Fauxbus's
+dialect, because those are the fake speaking about itself.
+
 ## The control plane (`/_fauxbus/`)
 
 - `POST /_fauxbus/reset` — the between-tests handshake.  If a canonical
@@ -827,7 +1007,8 @@ last test's user.  Their minted names (`fauxbus-code-N`,
   for the next N matching requests (or until cleared).  `GET
   /_fauxbus/failures` lists what's armed; `DELETE /_fauxbus/failures`
   disarms (all, or one by `?id=`).  Injection applies only to the
-  imitated `/v2/…` surface — you cannot brick the control plane with it.
+  imitated surface (`/v2/…`, `/v0.10/…`, and the OIDC discovery and
+  JWKS paths) — you cannot brick the control plane with it.
   One-shot inline variant: send `X-Fauxbus-Fail: 429` on any request to get
   that failure exactly once, for quick cases.
 - `GET /_fauxbus/auth/login?request=…` and `POST /_fauxbus/auth/login`
@@ -839,10 +1020,26 @@ last test's user.  Their minted names (`fauxbus-code-N`,
 - `POST /_fauxbus/auth/session` — `{"account": "<primary identity id>"}`
   signs a headless test in before it starts a login, so authorize skips
   the picker.  Returns the cookie in `Set-Cookie` and in the body.
-- `POST /_fauxbus/tick` — advance Fauxbus's logical clock by N seconds
-  (roadmap: what makes transfer-task progression testable without
-  `sleep`; nothing consumes it in v0.1, but it exists from day one so
-  determinism is load-bearing, not retrofitted).
+- `POST /_fauxbus/tick` — advance Fauxbus's logical clock by N seconds.
+  It existed from day one with nothing consuming it, so that
+  determinism would be load-bearing rather than retrofitted.  Token and
+  code expiry read it since the Auth slices, and since the Transfer
+  slice it does what the roadmap built it for: an ACTIVE task whose
+  duration a tick carries past is SUCCEEDED, stamped with the time it
+  was due.
+- `POST /_fauxbus/transfer/tasks` — create a transfer task at the
+  current clock: `owner_id`, `source_endpoint_id`,
+  `destination_endpoint_id`, `files` (each `source_path`,
+  `destination_path`, `size`, optional `checksum` and
+  `checksum_algorithm`), and optionally `status`, `duration`,
+  `files_succeeded`, `faults`, `fatal_error`, `label`, base paths.
+  Answers with the task's id and its seed form.
+- `POST /_fauxbus/transfer/tasks/<id>` — move a task along: `{"status":
+  "INACTIVE"}`, `{"status": "ACTIVE", "duration": 60}`, `{"status":
+  "SUCCEEDED"}`, `{"status": "FAILED", "files_succeeded": 3}`.  A
+  finished task is final (409).  Collections and their role grants
+  arrive only by seed (`collections`), since the slice reads tasks and
+  administers nothing.
 
 **The round-trip invariant:** the document `GET /_fauxbus/state` returns
 is a valid `POST /_fauxbus/seed` body, and seeding a fresh world with a
@@ -893,7 +1090,14 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
 
 ## Roadmap (after Groups earns its keep)
 
-- **Next milestone, decided 2026-10-12: the Globus login shim.**
+- **Reordered 2026-10-14: Transfer task monitoring first.**  Andrew,
+  2026-10-14: Transfer task monitoring moves ahead of the login shim;
+  Root Cellar's Globus door is built and its dev end-to-end test needs
+  it.  Built in v0.2.22 (the "Transfer task monitoring" section above).
+  The login-shim milestone below is unchanged and comes after it, its
+  steps in the order written.
+
+- **The milestone after that, decided 2026-10-12: the Globus login shim.**
   @xram's framing: *a way to mock Globus login reliably in code for
   e2e testing.*  A shim, never a real identity provider.  Everything
   in this document that makes Fauxbus untrustworthy on purpose (the
@@ -952,7 +1156,8 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   first two refusals a real app hits: most Globus apps are native
   clients, and most ask for refresh tokens.  Deferred until a consumer
   asks: dependent tokens, `prompt=none` and session step-up, logout,
-  the consents API.  Transfer stays held.
+  the consents API.  Transfer stayed held when this was written; the
+  reorder above moved its first slice ahead.
 
 - **Transfer** — the big one: endpoints/collections, task submission, and a
   simulated task lifecycle (ACTIVE → SUCCEEDED/FAILED with byte progress)
@@ -1004,6 +1209,16 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   bearing for a design that exists, and the wait is a scheduling
   decision rather than a reassessment.  Nothing here needs redesigning
   when it resumes; the surface below is confirmed and still current.
+
+  **Resumed 2026-10-14, and the first slice is built** (v0.2.22, the
+  "Transfer task monitoring" section above).  The confirmed surface
+  held, with one adjustment each way.  The poller that arrived also
+  reads `endpoint_manager_task_successful_transfers`, which this bullet
+  had not named, because a completion signal is only half the answer
+  without the list of what completed.  And
+  `endpoint_manager_task_event_list` stays a loud 501, because the
+  poller does not call it.  Next in Transfer, when a consumer asks:
+  event lists, the other task-list filters, then ACLs.
 
   ACLs and guest-collection permissions (group-membership-driven data
   access) were the previously-penciled first slice on the reasoning that
@@ -1164,6 +1379,55 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.22** (2026-10-14) — **Transfer task monitoring: a poller can
+  watch a landing collection against Fauxbus.**  Moved ahead of the
+  login shim the same day (Andrew, 2026-10-14: Transfer task
+  monitoring moves ahead of the login shim; Root Cellar's Globus door
+  is built and its dev end-to-end test needs it).  Three
+  `endpoint_manager_*` routes (task list, task, successful transfers),
+  collections with role grants and subscriptions in the seed, tasks
+  created and moved through `/_fauxbus/transfer/tasks`, and the first
+  `tick` that finishes something.  Full design in its section above.
+
+  **Three sources, and they did not agree.**  The SDK's fixtures, the
+  SDK's docstrings, and the published reference each ground part of
+  this surface, and reading all three is what turned up the slice's
+  real findings.  The fixture's successful-transfer rows carry two
+  paths and nothing else, while the consumer stores `size`, `checksum`
+  and `checksum_algorithm` beside each one — fields only the reference
+  documents.  The SDK's docstrings put task visibility on the
+  *destination* collection; the reference says source or destination.
+  And the reference's task page, read after the code was written,
+  corrected it before it left this branch: the first draft
+  answered a running task's file list with the files so far, under a
+  PROVISIONAL marker, and the reference says plainly that the service
+  "returns 400 ClientError.BadRequest if the task is not yet complete."
+  Slice B's changelog said the cheapest grounding ran last and should
+  have run first.  It ran in the middle this time, which is better and
+  still not first.
+
+  **What a poller should know, from the reference, before it meets the
+  real thing.**  A successful-transfer path is "relative to the guest
+  collection root, as submitted in the transfer request" — whatever the
+  submitter typed, not a normalized absolute path.
+  `destination_base_path` is null unless the submitter set
+  `store_base_path_info`, so it cannot be relied on to name a project.
+  And task times on a fresh Fauxbus world are 1970: a poller that
+  windows by its own wall clock needs the fake's clock seeded to a real
+  second, and ticked forward as the run goes on.
+
+  259 tests, up from 223; 33 through the real globus-sdk, up from 25,
+  including the consumer's three calls with its exact arguments, both
+  pagination styles across more than one page, and the task document's
+  key set compared against the fixture's source read with `ast`.
+
+  **PROVISIONAL inventory: 44 markers**, up thirteen from 31, **nine new
+  obligations** (recording list 15–23).  Four obligations carry two
+  markers each: malformed ids (task and collection), `last_key`'s shape
+  and its last-page behaviour, `successful_transfers`' page size and
+  marker meaning, and the unmodeled task fields plus `dynamic`.
+  Counted with `grep -rn PROVISIONAL src/ | wc -l`.
 
 - **Package release: fauxbus 0.3.0** (2026-10-12, tag `v0.3.0`) — **Auth
   slice B reaches consumers**, and with it everything since 0.2.0.  A

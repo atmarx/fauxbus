@@ -41,8 +41,10 @@ that go with it, so the service on the receiving end can ask whether
 the token it was handed is real and the service that issued one can
 take it back — plus the **OIDC authorization-code flow**, so a real
 identity broker like Keycloak can sign a seeded person in through
-Fauxbus, linked identities and all.  The conformance suite drives all
-of it through the
+Fauxbus, linked identities and all — plus **Transfer task
+monitoring**, the `endpoint_manager_*` calls a service uses to watch
+other people's transfers into a collection.  The conformance suite
+drives all of it through the
 actual globus-sdk, unmodified, including the SDK's retry layer
 recovering through an injected 429.  Response shapes not yet backed by a
 recording are marked `PROVISIONAL` in code and tracked as conformance
@@ -73,7 +75,8 @@ fauxbus serve --port 9800
 
 Point `globus_sdk.GroupsClient(...)` at that port instead of the real
 service host and run your existing test suite.  Other Globus clients
-will meet honest `501`s until their surfaces exist — see below.
+will meet honest `501`s until their surfaces exist — see below.  (Of
+`TransferClient`, only the task-monitoring calls exist so far.)
 
 ## Tokens
 
@@ -161,6 +164,50 @@ The fixture signing key is published in `src/fauxbus/signing.py` on
 purpose.  Anyone can forge a Fauxbus token, so nobody can be tempted to
 trust one.  Never configure it as a trusted issuer anywhere real —
 and Fauxbus refuses to run with an issuer under a Globus domain.
+
+## Watching transfers
+
+A service that watches a collection for finished transfers — the
+completion signal Globus only offers by polling — can be tested end to
+end.  Fauxbus answers three `TransferClient` calls:
+`endpoint_manager_task_list` (with `filter_endpoint`,
+`filter_endpoint_use`, `filter_status` and `filter_completion_time`,
+paged by `last_key`), `endpoint_manager_get_task`, and
+`endpoint_manager_task_successful_transfers` (paged by `next_marker`).
+No bytes move, ever; a task is bookkeeping.
+
+Seed a collection, its subscription, and who may watch it:
+
+```json
+"collections": {
+  "<collection id>": {"display_name": "Landing", "subscription_id": "<id>",
+                      "roles": {"<client id>": "activity_monitor"}}
+}
+```
+
+Then make a researcher's transfer happen and move it along from the
+test:
+
+```sh
+curl -X POST localhost:9800/_fauxbus/transfer/tasks -d '{
+  "owner_id": "<identity id>", "source_endpoint_id": "<anything>",
+  "destination_endpoint_id": "<collection id>", "duration": 60,
+  "files": [{"source_path": "/home/a/x.dat", "destination_path": "/landing/x.dat",
+             "size": 1024, "checksum": "...", "checksum_algorithm": "sha256"}]}'
+curl -X POST localhost:9800/_fauxbus/tick -d '{"seconds": 60}'   # now SUCCEEDED
+curl -X POST localhost:9800/_fauxbus/transfer/tasks/<task id> -d '{"status": "FAILED"}'
+```
+
+A task with a `duration` finishes on `tick`, files arriving evenly on
+the way; `INACTIVE` pauses one, `FAILED` with `files_succeeded` fails
+it part-way.  A role without a subscription does nothing, as in Globus.
+
+**Seed the clock to a real second.**  Task times are the logical clock
+rendered as ISO 8601, and a fresh world's clock is zero, so its tasks
+finish in 1970.  A poller that asks for "completed in the last ten
+minutes" by its own wall clock will find nothing.  Seed `"clock"` to the
+second your test starts (the example seed uses `1767225600`), and tick
+it forward rather than letting it fall behind.
 
 ## In a compose stack
 
