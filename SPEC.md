@@ -96,8 +96,12 @@ guidepost: if `GroupsClient` has a method, Fauxbus answers it.
   SDK-fixture behavior, not a guess)
 
 **Membership**
-- `GET /v2/groups/my_groups` — the calling identity's groups, with the
-  `statuses` filter.  Note a recorded quirk: the list-view documents are
+- `GET /v2/groups/my_groups` — the caller's groups, with the `statuses`
+  filter.  Two DOCUMENTED rules from Globus's published Groups OpenAPI:
+  with no filter, `statuses` means `active` (an invited or removed
+  member does not see the group), and the list covers "the user and its
+  linked identities", so a person signed in as one identity sees the
+  groups a linked identity is in.  Note a recorded quirk: the list-view documents are
   *slimmer* than the single-group document (no `description`, no
   subscription fields), and the response is a **bare JSON array** — no
   pagination envelope.
@@ -163,8 +167,8 @@ on: where exactly the manager/admin boundary sits for adding a member
 directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Building slice A added four more to that list, slice A.2 three more,
-multi-resource-server responses two, slice B five, and Transfer task
-monitoring nine — and it is worth noticing that every one of them is a
+multi-resource-server responses two, slice B five, Transfer task
+monitoring nine, and the login shim's first step one — and it is worth noticing that every one of them is a
 question the audit could not have asked before the code existed:
 
 1. **The status for a token presented to the wrong resource server.**
@@ -287,6 +291,17 @@ question the audit could not have asked before the code existed:
     `successful_transfer.dynamic`, which the reference shows as
     `false` and does not explain.  Two markers, in `World.task_doc`
     and on `dynamic`.
+24. **How linked identities show up in a Groups answer.**  The
+    published OpenAPI says `my_groups` covers the user's linked
+    identities, and Fauxbus lists every linked identity's membership
+    that passes the filter, in the account's identity order.  That
+    order is `PROVISIONAL` in `World.my_groups`.  Unmarked, because no
+    source says anything about it: whether a single-group GET's
+    `my_memberships`, and the role checks behind every write, follow
+    linked identities too.  Fauxbus answers both for the calling
+    identity alone, which is the conservative reading — a fake that
+    refuses where the real service allows breaks a test loudly, and
+    the reverse lets a bug through quietly.
 
 And `identity_set`, already at the top of this list since v0.2.15, now
 has code to point at: its entry shape and its order are two
@@ -1109,12 +1124,15 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
   against Fauxbus, with only configuration changed, while the test
   drives every step from code: who signs in, when tokens expire, which
   call fails.  "Unmodified" is literal: globus-sdk reads
-  `GLOBUS_SDK_SERVICE_URL_AUTH` / `_GROUPS` (verified on 4.8.1;
-  `GROUPS` takes the `/v2/` suffix), and a broker takes an issuer URL.
+  `GLOBUS_SDK_SERVICE_URL_AUTH` / `_GROUPS` / `_TRANSFER`, each set to
+  the bare server root, and a broker takes an issuer URL.  (This plan
+  first said `GROUPS` needed a `/v2/` suffix.  Step 1 tried it: every
+  4.8.1 `GroupsClient` path already starts with `/v2/`, so the suffix
+  sends `/v2/v2/groups`.)
 
   In order, each one a commit and a board post:
 
-  1. **Drop-in by environment.**  Conformance tests that reach Fauxbus
+  1. **Drop-in by environment.**  *Done in v0.2.23.*  Conformance tests that reach Fauxbus
      through the env vars instead of `base_url`; a README section,
      "point your app at Fauxbus"; and a test that a person's
      authorization-code token works against Groups *as that person*,
@@ -1379,6 +1397,48 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.23** (2026-10-14) — **Login shim, step 1: an app points at
+  Fauxbus by environment alone, and `my_groups` stops letting removed
+  members in.**  The step was meant to prove what already worked.
+  Writing it down found two things that didn't.
+
+  **The plan had the Groups variable wrong.**  SPEC's roadmap, written
+  two days ago, said `GLOBUS_SDK_SERVICE_URL_GROUPS` takes a `/v2/`
+  suffix.  It doesn't: every `GroupsClient` path in 4.8.1 already
+  begins with `/v2/`, so the suffix sends `/v2/v2/groups`.  All three
+  variables are the bare server root.  The first new test checks that
+  before any request leaves, so an SDK that stops honouring the
+  variables fails there instead of reaching for the real service.
+
+  **`my_groups` was more permissive than Globus.**  With no `statuses`
+  filter it returned every membership: invited, removed, left.
+  Globus's published Groups OpenAPI says the default is `active`.  The
+  group-gated-login test found it: remove a member, and the app still
+  saw them in the group.  That is the worst direction for a fake to be
+  wrong in, because the consumer's test passes while the bug it should
+  catch ships.  The same document says `my_groups` covers "the user and
+  its linked identities", which Fauxbus also missed — a person signed
+  in as their university identity didn't see groups their Globus ID
+  identity belonged to.  Both fixed, both DOCUMENTED.  A test that
+  pinned the old default (`test_my_groups_statuses_filter`) was
+  asserting the bug, and now asserts the documented rule.  Anyone who
+  relied on seeing invitations without asking for them needs
+  `statuses=invited`, as they would against Globus.
+
+  **What now runs with nothing but the environment changed:** a
+  confidential login client's code flow with the ID token verified by
+  the SDK; that person acting at Groups as themselves; a
+  group-gated login whose answer the test flips by changing the
+  membership; and the SDK's own `ClientApp` fetching its own tokens and
+  calling Transfer and Groups.  README gains "Point your app at
+  Fauxbus".
+
+  264 tests, up from 259; 37 through the real globus-sdk, up from 33.
+
+  **PROVISIONAL inventory: 45 markers**, up one from 44, **one new
+  obligation** (recording list 24, linked identities in a Groups
+  answer).
 
 - **v0.2.22** (2026-10-14) — **Transfer task monitoring: a poller can
   watch a landing collection against Fauxbus.**  Moved ahead of the

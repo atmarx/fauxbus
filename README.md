@@ -73,10 +73,36 @@ pipx install fauxbus
 fauxbus serve --port 9800
 ```
 
-Point `globus_sdk.GroupsClient(...)` at that port instead of the real
-service host and run your existing test suite.  Other Globus clients
-will meet honest `501`s until their surfaces exist — see below.  (Of
-`TransferClient`, only the task-monitoring calls exist so far.)
+Point your app at that port (next section) and run your existing test
+suite.  Groups and Auth's login and client-credentials flows are here;
+of `TransferClient`, only the task-monitoring calls exist so far.
+Anything else meets an honest `501` — see below.
+
+## Point your app at Fauxbus
+
+globus-sdk reads one environment variable per service when it builds a
+client, ahead of everything else.  Set these and your app talks to
+Fauxbus without a line of it changing:
+
+```sh
+export GLOBUS_SDK_SERVICE_URL_AUTH=http://localhost:9800/
+export GLOBUS_SDK_SERVICE_URL_GROUPS=http://localhost:9800/
+export GLOBUS_SDK_SERVICE_URL_TRANSFER=http://localhost:9800/
+```
+
+All three are the bare root, Groups included: the SDK's own paths
+already start with `/v2/`.  In a pytest suite, `monkeypatch.setenv` does
+the same per test.  This covers `ConfidentialAppAuthClient` login flows
+and the SDK's `ClientApp`, which fetches its own tokens; the conformance
+suite runs both this way.  (`UserApp` and native-app clients are next.)
+
+Then drive the person from the test.  Seed accounts and a login client
+(see "Brokered login" below).  `POST /_fauxbus/auth/session` signs a
+headless test in so the authorize page skips the account picker, or the
+test can walk the picker over plain HTTP, the way a browser would.  The person's Groups token acts as them, and changing
+their group memberships changes what your app sees on its next check:
+the "let them in if they're in the group" test, with the test deciding
+the answer.
 
 ## Tokens
 
