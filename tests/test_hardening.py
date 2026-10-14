@@ -210,6 +210,20 @@ def test_malformed_seed_blames_the_document_not_fauxbus(fx, doc):
     assert body["code"] == "VALIDATION_ERROR"
 
 
+def test_a_seed_section_this_version_does_not_know_is_refused_by_name(fx):
+    # 0.3.0 skipped unknown sections, so a seed written for 0.4.0's
+    # Transfer world loaded "fine" and every Transfer call 501'd.
+    status, body, _ = fx.post("/_fauxbus/seed", {"groups": {}, "colections": {}})
+    assert status == 422
+    assert body["code"] == "VALIDATION_ERROR"
+    assert "colections" in body["detail"]
+
+
+def test_every_section_a_dump_writes_is_one_a_seed_may_carry(fx):
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert fx.post("/_fauxbus/seed", state)[0] == 200
+
+
 def test_a_rejected_seed_leaves_the_world_alone(fx):
     fx.post("/_fauxbus/seed", {"groups": {G: {"name": "keeper"}}})
     fx.post("/_fauxbus/seed", {"groups": {G: {"name": "x", "session_limit": "abc"}}})

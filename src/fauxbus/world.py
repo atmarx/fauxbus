@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from . import __version__
 from .auth import (
     AUTH_ISSUER,
     AUTH_RESOURCE_SERVER,
@@ -2970,6 +2971,20 @@ class World:
         # as an inexplicable 403.
         if not isinstance(doc, dict):
             raise validation_error("seed document must be an object")
+        # A section this version does not know is refused, not skipped.
+        # Skipping is how 0.3.0 met a seed written for 0.4.0: it took
+        # the `collections` and `transfer_tasks` sections, dropped them
+        # without a word, and the Transfer routes 501'd for no visible
+        # reason.  The known sections are exactly the ones dump()
+        # writes — whatever this world can save, it can load, and
+        # nothing else — so the list cannot drift from the format.
+        unknown = sorted(set(doc) - set(self.dump()))
+        if unknown:
+            raise validation_error(
+                f"unknown seed sections {unknown}: this is fauxbus {__version__}, which "
+                f"knows {sorted(self.dump())}. A seed written for a newer fauxbus needs "
+                f"that version; a typo needs fixing."
+            )
         self.reset()
         self.clock = _require_int(doc.get("clock", 0), "clock")
         self.counters = {
