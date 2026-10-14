@@ -1563,16 +1563,51 @@ class World:
     def child_ids(self, group_id: str) -> list[str]:
         return sorted(g.id for g in self.groups.values() if g.parent_id == group_id)
 
-    def my_groups(self, caller: Identity, statuses: list[str] | None) -> list[Group]:
+    def linked_identity_ids(self, identity_id: str) -> list[str]:
+        """The identity and every identity linked to it, primary first.
+
+        Linking lives on the account, so the account that holds this
+        identity holds the whole set.  An identity no seeded account
+        holds (a pinned or hash-derived token's caller, a client) is a
+        set of one.
+        """
+        for account in self.accounts.values():
+            if identity_id in account.identities:
+                return [i.id for i in account.ordered()]
+        return [identity_id]
+
+    def my_groups(
+        self, caller: Identity, statuses: list[str] | None
+    ) -> list[tuple[Group, list[Membership]]]:
+        """Each group the caller is in, with the memberships that put it there.
+
+        DOCUMENTED (Groups OpenAPI, ``GET /v2/groups/my_groups``), two
+        rules that are easy to get wrong in a fake:
+
+        - ``statuses`` defaults to ``active``.  With no filter, an
+          invited, removed or departed member does not see the group.
+          This used to return every status, so a removed member still
+          looked "in" to an app gating its login on the list.  A fake
+          more permissive than the real service passes the very test
+          that should catch an app letting the wrong person in.
+        - it covers "the user and its linked identities".  A person who
+          signs in as one identity sees the groups a linked identity is
+          in, and ``my_memberships`` lists each membership that passes
+          the filter.  Their order (the account's identity order) is
+          PROVISIONAL.
+        """
+        wanted = statuses or ["active"]
+        mine = self.linked_identity_ids(caller.identity_id)
         found = []
-        for group in self.groups.values():
-            m = group.memberships.get(caller.identity_id)
-            if m is None:
-                continue
-            if statuses and m.status not in statuses:
-                continue
-            found.append(group)
-        return sorted(found, key=lambda g: g.id)
+        for group in sorted(self.groups.values(), key=lambda g: g.id):
+            memberships = [
+                group.memberships[i]
+                for i in mine
+                if i in group.memberships and group.memberships[i].status in wanted
+            ]
+            if memberships:
+                found.append((group, memberships))
+        return found
 
     # ------------------------------------------------------------- policies
 
@@ -1889,10 +1924,9 @@ class World:
             doc["allowed_actions"] = self._allowed_actions(group, caller)
         return doc
 
-    def my_groups_doc(self, group: Group, caller: Identity) -> dict[str, Any]:
+    def my_groups_doc(self, group: Group, memberships: list[Membership]) -> dict[str, Any]:
         """The my_groups list entry — RECORDED shape, and it is slimmer than
         the single-group document: no description, no subscription fields."""
-        my = group.memberships.get(caller.identity_id)
         return {
             "name": group.name,
             "parent_id": group.parent_id,
@@ -1901,7 +1935,7 @@ class World:
             "enforce_session": group.enforce_session,
             "session_limit": group.session_limit,
             "session_timeouts": dict(group.session_timeouts),
-            "my_memberships": [my.doc(group.id)] if my is not None else [],
+            "my_memberships": [m.doc(group.id) for m in memberships],
             "policies": self._policy_summary(group),
         }
 

@@ -3,8 +3,9 @@
 This file is the embryo of the two-backend conformance tether from
 SPEC.md.  Today it runs against Fauxbus on every CI run; the env-gated
 real-service backend arrives with the first recording session.  Nothing
-in here monkeypatches anything — the SDK is pointed at Fauxbus by
-base_url alone, which is the whole point.
+in here monkeypatches the SDK.  Most tests point it at Fauxbus by
+base_url; the last section uses only the environment variables the SDK
+reads for itself, the way an unmodified app would be pointed.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ else:
 from conftest import (  # noqa: E402
     ALICE,
     ALICE_GLOBUSID,
+    BOB_GLOBUSID,
     CLIENT_ID,
     CLIENT_SECRET,
     GROUPS_SCOPE,
@@ -52,8 +54,10 @@ from globus_sdk import (  # noqa: E402
     AuthAPIError,
     AuthClient,
     BatchMembershipActions,
+    ClientApp,
     ClientCredentialsAuthorizer,
     ConfidentialAppAuthClient,
+    GlobusAppConfig,
     GroupPolicies,
     GroupsAPIError,
     GroupsClient,
@@ -782,3 +786,136 @@ def test_an_injected_failure_reaches_the_consumer_as_a_transfer_error(watched):
     # Disarmed after one use: the next poll reads it.
     rows = list(tc.paginated.endpoint_manager_task_successful_transfers(task["task_id"]).items())
     assert len(rows) == 2
+
+
+# ------------------------------------------- drop-in: pointed by environment
+#
+# Everything above hands the SDK a ``base_url``.  An app under test does
+# not: it builds its clients the way production does, and the only
+# thing a test may change is configuration.  globus-sdk reads
+# ``GLOBUS_SDK_SERVICE_URL_<SERVICE>`` when a client is built, ahead of
+# any environment name, so three variables move an unmodified app from
+# Globus to Fauxbus.  Every client below is built without a base_url.
+# These tests are the login shim's acceptance harness: each later step
+# of that milestone has to pass through here.
+
+
+@pytest.fixture
+def pointed(fx, monkeypatch):
+    """The SDK aimed at Fauxbus by environment alone, as an app under test would be."""
+    for service in ("AUTH", "GROUPS", "TRANSFER"):
+        monkeypatch.setenv(f"GLOBUS_SDK_SERVICE_URL_{service}", fx.base_url + "/")
+    return fx
+
+
+def test_the_environment_alone_points_every_client_at_fauxbus(pointed):
+    """The precondition for this whole section, checked before a request leaves.
+
+    Every base is the bare server root, Groups included.  Each
+    ``GroupsClient`` path in 4.8.1 already starts with ``/v2/``, so a
+    ``/v2/`` suffix on the variable sends ``/v2/v2/groups``: a 501 here,
+    a 404 at Globus.  SPEC's plan said the suffix was needed until this
+    test was written; it is not.  If a future SDK stops honouring these
+    variables, this fails first, rather than a later test quietly
+    reaching for the real service.
+    """
+    root = pointed.base_url + "/"
+    assert AuthClient().base_url == root
+    assert ConfidentialAppAuthClient(LOGIN_CLIENT, LOGIN_SECRET).base_url == root
+    assert GroupsClient().base_url == root
+    assert TransferClient().base_url == root
+
+
+def sign_in(fx, account: str, scopes: str):
+    """A person signs in to the login client; returns the SDK's token response.
+
+    The app's half is unmodified SDK code with no base_url, so the
+    authorize URL it builds comes from the environment.  The browser's
+    half is ``browser_login``.
+    """
+    client = ConfidentialAppAuthClient(LOGIN_CLIENT, LOGIN_SECRET)
+    client.oauth2_start_flow(LOGIN_REDIRECT, scopes)
+    url = client.oauth2_get_authorize_url()
+    assert url.startswith(fx.base_url + "/v2/oauth2/authorize?")
+    return client.oauth2_exchange_code_for_tokens(browser_login(fx, url, account))
+
+
+def groups_as(tokens) -> GroupsClient:
+    access = tokens.by_resource_server["groups.api.globus.org"]["access_token"]
+    return GroupsClient(authorizer=AccessTokenAuthorizer(access))
+
+
+def test_a_person_signs_in_and_groups_sees_that_person(pointed):
+    """One login, two services: the Groups token acts as whoever signed in.
+
+    The ID token says who the person is; the Groups token, minted by the
+    same exchange and delivered in ``other_tokens``, must act as that
+    same identity.  A fake that let the two disagree would pass every
+    test written against one service at a time.
+    """
+    pointed.post(
+        "/_fauxbus/seed",
+        oidc_seed(pointed.base_url, oidc={"issuer": pointed.base_url, "signed_token_clock": "wall"}),
+    )
+    tokens = sign_in(pointed, ALICE_GLOBUSID, f"openid profile email {GROUPS_SCOPE}")
+    claims = tokens.decode_id_token()
+
+    created = groups_as(tokens).create_group({"name": "Alice's lab", "description": ""})
+    (me,) = created["my_memberships"]
+    assert me["identity_id"] == claims["sub"] == ALICE_GLOBUSID
+
+
+def test_group_gated_login_the_test_decides_who_is_in(pointed):
+    """The story most consumers want: "let them in if they're in the group."
+
+    The app checks membership with the signed-in person's own Groups
+    token, the way a real app does.  The test decides the answer by
+    changing the membership, here with alice's token through
+    ``GroupsManager``, and the app sees the change on its next check.
+    """
+    pointed.post("/_fauxbus/seed", oidc_seed(pointed.base_url))
+    scopes = f"openid {GROUPS_SCOPE}"
+    alice = groups_as(sign_in(pointed, ALICE_GLOBUSID, scopes))
+    bob = groups_as(sign_in(pointed, BOB_GLOBUSID, scopes))
+    gid = alice.create_group({"name": "Allowed in", "description": ""})["id"]
+
+    def bob_is_in() -> bool:
+        return gid in {g["id"] for g in bob.get_my_groups()}
+
+    assert not bob_is_in()
+    GroupsManager(alice).add_member(gid, BOB_GLOBUSID)
+    assert bob_is_in()
+    GroupsManager(alice).remove_member(gid, BOB_GLOBUSID)
+    assert not bob_is_in()
+
+
+def test_the_sdks_own_client_app_runs_unmodified(pointed):
+    """``ClientApp``, the SDK's 4.x shape for a service, fetches its own tokens.
+
+    Nothing here asks for a token by hand.  The app works out which
+    scopes its clients need, asks Fauxbus's token endpoint for them, and
+    calls Transfer and Groups with what comes back.  The one setting is
+    ``token_storage="memory"``: the default writes tokens under
+    ``~/.globus``, which no test should do, and it changes nothing on
+    the wire.
+    """
+    pointed.post("/_fauxbus/seed", transfer_seed(clock=int(NOON.timestamp())))
+    make_task(pointed, status="SUCCEEDED")
+    app = ClientApp(
+        "fauxbus-conformance",
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        config=GlobusAppConfig(token_storage="memory"),
+    )
+
+    (task,) = TransferClient(app=app).endpoint_manager_task_list(filter_endpoint=LANDING)
+    assert task["status"] == "SUCCEEDED"
+    created = GroupsClient(app=app).create_group({"name": "Service-owned", "description": ""})
+    assert created["my_memberships"][0]["identity_id"] == CLIENT_ID
+
+    # And the tokens were really fetched from here, one per service.
+    _, state, _ = pointed.get("/_fauxbus/state")
+    assert sorted(t["resource_server"] for t in state["tokens"].values()) == [
+        "groups.api.globus.org",
+        "transfer.api.globus.org",
+    ]

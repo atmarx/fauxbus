@@ -34,9 +34,9 @@ def get_my_groups(ctx: Ctx) -> tuple[int, Any]:
     unknown = set(statuses) - set(STATUSES)
     if unknown:
         raise validation_error(f"unknown membership statuses: {sorted(unknown)}")
-    groups = ctx.world.my_groups(ctx.identity, statuses or None)
+    found = ctx.world.my_groups(ctx.identity, statuses or None)
     # RECORDED: a bare JSON array, no pagination envelope.
-    return 200, [ctx.world.my_groups_doc(g, ctx.identity) for g in groups]
+    return 200, [ctx.world.my_groups_doc(g, memberships) for g, memberships in found]
 
 
 def create_group(ctx: Ctx) -> tuple[int, Any]:

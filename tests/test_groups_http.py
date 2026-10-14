@@ -127,8 +127,10 @@ def test_my_groups_statuses_filter(pinned):
     gid = make_group(pinned)["id"]
     batch(pinned, gid, {"invite": [{"identity_id": BOB}]})
 
-    _, all_groups, _ = pinned.get("/v2/groups/my_groups", token=B)
-    assert len(all_groups) == 1
+    # DOCUMENTED: no filter means statuses=active, so an invitation stays
+    # out of the list until it is asked for by name.
+    _, unfiltered, _ = pinned.get("/v2/groups/my_groups", token=B)
+    assert unfiltered == []
 
     _, active_only, _ = pinned.get("/v2/groups/my_groups?statuses=active", token=B)
     assert active_only == []

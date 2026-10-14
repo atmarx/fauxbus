@@ -680,6 +680,37 @@ def test_openid_puts_auth_on_top_whatever_order_the_scopes_came_in(oidc):
     assert created["my_memberships"][0]["identity_id"] == ALICE_GLOBUSID
 
 
+def test_my_groups_follows_the_person_across_linked_identities(oidc):
+    """DOCUMENTED: my_groups covers "the user and its linked identities".
+
+    alice creates a group signed in as her Globus ID identity, then signs
+    in to the campus client, which only takes her university identity.
+    Same person, different identity on the token, and the group is still
+    hers.  bob, who has no link to anyone, sees nothing.
+    """
+    code, _, _ = login(oidc, scope=f"openid {GROUPS_SCOPE}")
+    _, doc = exchange(oidc, code)
+    (groups,) = doc["other_tokens"]
+    _, created, _ = oidc.post("/v2/groups", {"name": "Alice's lab", "description": ""}, token=groups["access_token"])
+
+    code, _, _ = login(oidc, client=CAMPUS_CLIENT, redirect_uri=CAMPUS_REDIRECT, scope=f"openid {GROUPS_SCOPE}")
+    _, doc = exchange(oidc, code, client=(CAMPUS_CLIENT, CAMPUS_SECRET), redirect_uri=CAMPUS_REDIRECT)
+    assert claims_of(doc["id_token"])["sub"] == ALICE_UNIVERSITY
+    (campus_groups,) = doc["other_tokens"]
+
+    status, listing, _ = oidc.get("/v2/groups/my_groups", token=campus_groups["access_token"])
+    assert status == 200
+    (entry,) = listing
+    assert entry["id"] == created["id"]
+    # The membership that put her there is the linked identity's, as stored.
+    assert [m["identity_id"] for m in entry["my_memberships"]] == [ALICE_GLOBUSID]
+
+    code, _, _ = login(oidc, account=BOB_GLOBUSID, scope=f"openid {GROUPS_SCOPE}")
+    _, doc = exchange(oidc, code)
+    (bob_groups,) = doc["other_tokens"]
+    assert oidc.get("/v2/groups/my_groups", token=bob_groups["access_token"])[1] == []
+
+
 # ---------------------------------------------------------------- the clocks
 
 
