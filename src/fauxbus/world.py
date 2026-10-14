@@ -34,6 +34,7 @@ from .auth import (
 )
 from .errors import (
     ApiError,
+    TransferError,
     auth_forbidden,
     auth_unauthorized,
     endpoint_not_found,
@@ -2242,13 +2243,23 @@ class World:
     ) -> dict[str, Any]:
         """One page of a task's successful-transfer list, marker-paged.
 
-        PROVISIONAL for any task that is not SUCCEEDED: Fauxbus answers
-        with the files that have arrived so far, which for a FAILED task
-        is the part that made it.  The SDK's docstring says "for a
-        completed Task," and whether the real service refuses a running
-        one, or answers it the way Fauxbus does, is unrecorded.  A
-        consumer that reads a FAILED task's partial list — to learn
-        whose transfer stopped and where — is relying on this answer.
+        Only for a finished task.  DOCUMENTED (docs.globus.org/api/
+        transfer/task, read 2026-10-14): the list is for tasks "that are
+        completed (have status SUCCEEDED or FAILED)", and the service
+        "returns 400 ClientError.BadRequest if the task is not yet
+        complete."  So a FAILED task answers with the part that made it
+        — a consumer can learn whose transfer stopped and how far it got
+        — and a running one is refused.  That sentence is on the
+        reference's page for the owner's own ``/task/<id>/
+        successful_transfers``; the endpoint-manager page does not
+        restate it, and Fauxbus applying the same rule there is
+        PROVISIONAL.
+
+        The reference also says the paths "are relative to the guest
+        collection root, as submitted in the transfer request" — they
+        are whatever the submitter typed, not a normalized absolute
+        path, which is worth knowing before a consumer parses one.
+        Fauxbus stores and returns them as the harness gave them.
         """
         unknown = sorted(set(query) - {"marker"})
         if unknown:
@@ -2262,13 +2273,20 @@ class World:
                 f"identity {caller.identity_id} has no activity_monitor role (or a stronger "
                 f"one) on a subscribed collection this task touched"
             )
+        if task.status in TASK_RUNNING:
+            raise TransferError(
+                400,
+                "ClientError.BadRequest",
+                f"Task {task.task_id} is {task.status}; successful transfers are listed "
+                f"only for a completed task",
+            )
         try:
             marker = int(query.get("marker", "0"))
         except ValueError:
             raise transfer_bad_request(f"marker {query['marker']!r} is not an integer") from None
         if marker < 0:
             raise transfer_bad_request("marker may not be negative")
-        done = task.files[: self.files_done_now(task)]
+        done = task.files[: task.files_done]
         rows = done[marker : marker + SUCCESSFUL_TRANSFERS_PAGE]
         # PROVISIONAL: the marker is an offset into the list.  The
         # reference types it as an integer and the recording shows
@@ -2354,6 +2372,9 @@ class World:
             "completion_time": None if task.completion_time is None else _iso(task.completion_time),
             "deadline": _iso(task.request_time + TASK_DEADLINE),
             "delete_destination_extra": False,
+            # DOCUMENTED: set only "if store_base_path_info was set to
+            # true when a transfer task was submitted" — null for most
+            # real tasks, so null unless the harness says otherwise.
             "destination_base_path": task.destination_base_path,
             "destination_endpoint": destination,
             "destination_endpoint_display_name": destination_name,
@@ -2446,11 +2467,13 @@ class World:
     )
     MOVE_TASK_FIELDS = frozenset({"status", "duration", "files_succeeded", "faults", "fatal_error"})
 
-    # PROVISIONAL shape: what a FAILED task carries in ``fatal_error``
-    # when the harness does not say.  The reference describes the field
-    # as an object with a ``code`` and a ``description``; no fixture
-    # shows one, and the code here is Fauxbus's own word, named so that
-    # nobody mistakes it for a Globus one.
+    # What a FAILED task carries in ``fatal_error`` when the harness does
+    # not say.  The shape is DOCUMENTED (docs.globus.org/api/transfer/
+    # task: "for tasks with FAILED status, this is an object with code
+    # and description strings from the fatal event.  Otherwise, this is
+    # null"); no fixture shows one.  The code here is Fauxbus's own
+    # word, named so nobody mistakes it for a Globus one — a harness
+    # that cares which fatal event it was passes its own.
     DEFAULT_FATAL_ERROR: dict[str, Any] = {
         "code": "FAUXBUS_FAILED",
         "description": "failed on demand through the Fauxbus control plane",

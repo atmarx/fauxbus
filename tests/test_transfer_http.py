@@ -312,11 +312,10 @@ def test_a_duration_finishes_on_tick_with_files_arriving_on_the_way(transfer):
     _, doc, _ = transfer.get(get, token=ALICE_TOKEN)
     assert (doc["status"], doc["files_transferred"], doc["bytes_transferred"]) == ("ACTIVE", 2, 10)
     assert doc["is_ok"] is True
-    _, rows, _ = transfer.get(f"{get}/successful_transfers", token=ALICE_TOKEN)
-    assert [r["destination_path"] for r in rows["DATA"]] == [
-        "/landing/proj-a/f0000.dat",
-        "/landing/proj-a/f0001.dat",
-    ]
+    # The file list waits for the task to finish (DOCUMENTED: "400
+    # ClientError.BadRequest if the task is not yet complete").
+    status, err, _ = transfer.get(f"{get}/successful_transfers", token=ALICE_TOKEN)
+    assert (status, err["code"]) == (400, "ClientError.BadRequest")
 
     # Tick well past the due time: the task finished when it was due,
     # not when the harness looked.
@@ -357,7 +356,8 @@ def test_move_pause_resume_fail(transfer):
     assert (doc["status"], doc["files_transferred"], doc["faults"]) == ("FAILED", 6, 2)
     assert doc["fatal_error"] == {"code": "PERMISSION_DENIED", "description": "quota"}
     assert doc["subtasks_failed"] == 4
-    # A FAILED task's partial list is the part that made it (PROVISIONAL).
+    # A FAILED task's list is the part that made it (DOCUMENTED: the list
+    # is for tasks that are "completed (SUCCEEDED or FAILED)").
     _, rows, _ = transfer.get(
         f"/v0.10/endpoint_manager/task/{tid}/successful_transfers", token=ALICE_TOKEN
     )
