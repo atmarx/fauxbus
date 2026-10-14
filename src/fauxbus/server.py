@@ -1,7 +1,8 @@
 """The HTTP server: routing, auth, failure injection, and the 501 wall.
 
-Stdlib only.  The imitated surface lives under /v2/ and requires a
-bearer token; the control plane lives under /_fauxbus/ and never does.
+Stdlib only.  The imitated surface lives under /v2/ (Groups, Auth) and
+/v0.10/ (Transfer) and requires a bearer token; the control plane lives
+under /_fauxbus/ and never does.
 Anything unrouted gets a loud 501 pointing at the issue tracker — never
 a silent wrong answer.
 """
@@ -656,6 +657,7 @@ def make_server(
     from .control_api import register as register_control
     from .groups_api import register as register_groups
     from .oidc_api import register as register_oidc
+    from .transfer_api import register as register_transfer
 
     server = FauxbusServer(
         (host, port),
@@ -672,6 +674,7 @@ def make_server(
     register_auth(server)
     register_oidc(server)
     register_groups(server)
+    register_transfer(server)
     register_control(server)
     register_picker(server)
     return server
@@ -693,6 +696,7 @@ def boot_line(server: FauxbusServer) -> str:
     )
     return (
         f"fauxbus {__version__} listening on http://{host}:{port} — "
-        f"imitating: groups v2, auth v2 client_credentials + authorization_code "
+        f"imitating: groups v2, auth v2 client_credentials + authorization_code, "
+        f"transfer v0.10 endpoint_manager task monitoring "
         f"(globus-sdk {SDK_PIN} surface){strict}; {oidc}; control plane at /_fauxbus/"
     )

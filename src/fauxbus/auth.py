@@ -39,6 +39,11 @@ ANONYMOUS_TOKEN = ""
 # to Transfer fails, and that is the point of the field.
 AUTH_RESOURCE_SERVER = "auth.globus.org"
 GROUPS_RESOURCE_SERVER = "groups.api.globus.org"
+# RECORDED (the SDK's TransferScopes resolve to this resource server, and
+# its own multi-service test in this repo asks for it).  The token
+# endpoint has minted Transfer tokens since slice A; the task-monitoring
+# slice is the first thing in Fauxbus that will *accept* one.
+TRANSFER_RESOURCE_SERVER = "transfer.api.globus.org"
 
 # RECORDED (globus_sdk/testing/data/auth/oauth2_token_introspect.py,
 # 4.8.1): the ``iss`` an introspection document carries.  It is an https

@@ -316,3 +316,79 @@ def strict():
     yield Client(f"http://{host}:{port}")
     server.shutdown()
     server.server_close()
+
+
+# --- Transfer task monitoring: collections, roles, and who may watch ------
+#
+# The shape of the consumer that asked for this slice: one landing
+# collection, subscribed, where a service client holds activity_monitor
+# and nothing stronger.  A second collection whose subscription has
+# lapsed, to prove the roles there go quiet.  Sources are invented
+# per-test and never seeded — a researcher's laptop is nobody's
+# collection to register.
+LANDING = "00000000-0000-4000-8000-000000001a4d"
+LAPSED = "00000000-0000-4000-8000-000000001a95"
+LAPTOP = "00000000-0000-4000-8000-00000000e4a1"
+SUBSCRIPTION = "00000000-0000-4000-8000-0000005ab5c4"
+
+
+def transfer_seed(**extra: Any) -> dict[str, Any]:
+    """A world where CLIENT_ID watches LANDING and alice manages it.
+
+    bob and carol hold nothing anywhere, which is what makes them useful
+    for the refusals.
+    """
+    doc: dict[str, Any] = {
+        "identities": PINS,
+        "clients": CLIENTS,
+        "collections": {
+            LANDING: {
+                "display_name": "Example Landing",
+                "subscription_id": SUBSCRIPTION,
+                "roles": {CLIENT_ID: "activity_monitor", ALICE: "activity_manager"},
+            },
+            LAPSED: {
+                "display_name": "Lapsed DTN",
+                "subscription_id": None,
+                "roles": {CLIENT_ID: "activity_monitor", ALICE: "activity_monitor"},
+            },
+        },
+    }
+    doc.update(extra)
+    return doc
+
+
+def files(count: int, *, size: int = 10, root: str = "/landing/proj-a") -> list[dict[str, Any]]:
+    """``count`` files, each ``size`` bytes, named so their order is visible."""
+    return [
+        {
+            "source_path": f"/home/alice/run/f{i:04d}.dat",
+            "destination_path": f"{root}/f{i:04d}.dat",
+            "size": size,
+            "checksum": f"{i:064x}",
+            "checksum_algorithm": "sha256",
+        }
+        for i in range(count)
+    ]
+
+
+def make_task(fx: Client, **fields: Any) -> dict[str, Any]:
+    """Create a transfer task through the control plane: laptop → landing by default."""
+    doc = {
+        "owner_id": ALICE,
+        "source_endpoint_id": LAPTOP,
+        "destination_endpoint_id": LANDING,
+        "files": files(2),
+        **fields,
+    }
+    status, task, _ = fx.post("/_fauxbus/transfer/tasks", doc)
+    assert status == 200, task
+    return task
+
+
+@pytest.fixture
+def transfer(fx: Client) -> Client:
+    """A world seeded with the landing collection and its watchers."""
+    status, doc, _ = fx.post("/_fauxbus/seed", transfer_seed())
+    assert status == 200, doc
+    return fx

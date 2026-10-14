@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import BOB, PINS
+from conftest import BOB, PINS, files, make_task, transfer_seed
 
 TOKEN = "t-alice"
 
@@ -16,6 +16,7 @@ def test_index_names_itself(fx):
     assert doc["imitates"] == [
         "groups v2",
         "auth v2 (client_credentials, authorization_code + OIDC)",
+        "transfer v0.10 (endpoint_manager task monitoring)",
     ]
     assert doc["sdk_pin"] == "4.8.1"
     # A harness needs to know which auth posture it is talking to before
@@ -178,10 +179,23 @@ def test_tick_advances_logical_clock_only(fx):
 
 
 def test_seed_state_round_trip_is_byte_identical(fx):
+    # Transfer's collections and role grants (one lapsed) only arrive by
+    # seed, and seeding replaces the world, so they go first.
+    fx.post("/_fauxbus/seed", transfer_seed())
     # Build a non-trivial world through the imitated API...
     _, parent, _ = fx.post("/v2/groups", {"name": "parent", "description": "p"}, token="t-alice")
     fx.post("/v2/groups", {"name": "child", "parent_id": parent["id"]}, token="t-alice")
     fx.put("/v2/preferences", {"allow_add": False}, token="t-bob")
+    # ...and tasks in every shape the clock can leave one: running,
+    # paused mid-way, failed part-way, and finished by a tick.
+    make_task(fx, files=files(4), duration=10)
+    paused = make_task(fx, files=files(4), duration=100)
+    failed = make_task(fx, files=files(3), label="part-way")
+    make_task(fx, duration=1000)
+    fx.post("/_fauxbus/tick", {"seconds": 50})
+    fx.post(f"/_fauxbus/transfer/tasks/{paused['task_id']}", {"status": "INACTIVE"})
+    fx.post(f"/_fauxbus/transfer/tasks/{failed['task_id']}",
+            {"status": "FAILED", "files_succeeded": 1, "faults": 3})
     fx.post("/_fauxbus/tick", {"seconds": 7})
 
     _, first, _ = fx.get("/_fauxbus/state")
@@ -190,6 +204,7 @@ def test_seed_state_round_trip_is_byte_identical(fx):
     assert status == 200
     _, second, _ = fx.get("/_fauxbus/state")
 
+    assert len(first["transfer_tasks"]) == 4 and len(first["collections"]) == 2
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 

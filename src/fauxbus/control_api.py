@@ -23,7 +23,11 @@ def index(ctx: Ctx) -> tuple[int, Any]:
     return 200, {
         "fauxbus": __version__,
         "sdk_pin": SDK_PIN,
-        "imitates": ["groups v2", "auth v2 (client_credentials, authorization_code + OIDC)"],
+        "imitates": [
+            "groups v2",
+            "auth v2 (client_credentials, authorization_code + OIDC)",
+            "transfer v0.10 (endpoint_manager task monitoring)",
+        ],
         "require_issued_tokens": ctx.server.require_issued_tokens,
         # The *effective* values — world's if the seed set them, else the
         # boot flags'.  The state dump shows only the world's half, so
@@ -41,7 +45,9 @@ def index(ctx: Ctx) -> tuple[int, Any]:
             "GET  /_fauxbus/failures",
             "POST /_fauxbus/failures",
             "DELETE /_fauxbus/failures[?id=fail-N]",
-            "POST /_fauxbus/tick",
+            "POST /_fauxbus/tick (also finishes transfer tasks whose duration is up)",
+            "POST /_fauxbus/transfer/tasks (create a task: owner, collections, files)",
+            'POST /_fauxbus/transfer/tasks/<task_id> {"status": ...} (move a task along)',
             "GET  /_fauxbus/auth/login?request=... (account picker, for a browser)",
             'POST /_fauxbus/auth/session {"account": "<primary identity id>"} (headless sign-in)',
         ],
@@ -121,10 +127,32 @@ def tick(ctx: Ctx) -> tuple[int, Any]:
     seconds = body.get("seconds", 1)
     if not isinstance(seconds, int) or seconds < 1:
         raise ApiError(400, "BAD_REQUEST", "'seconds' must be a positive integer")
-    ctx.world.clock += seconds
-    # Logical time only — nothing consumes it in v0.1, but determinism is
-    # load-bearing from day one, not retrofitted (SPEC principle 3).
+    # Logical time only.  It was built on day one with nothing consuming
+    # it so that determinism would be load-bearing rather than
+    # retrofitted (SPEC principle 3); token and code expiry read it
+    # since the Auth slices, and since the Transfer slice a tick also
+    # finishes every ACTIVE task whose duration it carried past.
+    ctx.world.advance_clock(seconds)
     return 200, {"clock": ctx.world.clock}
+
+
+def create_transfer_task(ctx: Ctx) -> tuple[int, Any]:
+    # A test making a researcher's transfer happen.  The imitated
+    # surface only *reads* tasks — the endpoint-manager family has no
+    # submit — so creation is a harness act and lives here, out of band.
+    # Answers with the task in its seed form plus its id, which is what
+    # a test needs to hold on to.
+    task = ctx.world.create_transfer_task(ctx.body if ctx.body is not None else {})
+    return 200, {"task_id": task.task_id, **ctx.world.task_record(task)}
+
+
+def move_transfer_task(ctx: Ctx) -> tuple[int, Any]:
+    # {"status": "SUCCEEDED"} finishes it now; {"status": "FAILED",
+    # "files_succeeded": 3} fails it with three files through;
+    # {"status": "INACTIVE"} pauses it; {"status": "ACTIVE", "duration":
+    # 60} sets it running again.  World.move_transfer_task has the rules.
+    task = ctx.world.move_transfer_task(ctx.match.group(1), ctx.body if ctx.body is not None else {})
+    return 200, {"task_id": task.task_id, **ctx.world.task_record(task)}
 
 
 def register(server: FauxbusServer) -> None:
@@ -143,3 +171,5 @@ def register(server: FauxbusServer) -> None:
     add("POST", "/_fauxbus/failures", arm_failure, auth=False)
     add("DELETE", "/_fauxbus/failures", disarm_failures, auth=False)
     add("POST", "/_fauxbus/tick", tick, auth=False)
+    add("POST", "/_fauxbus/transfer/tasks", create_transfer_task, auth=False)
+    add("POST", "/_fauxbus/transfer/tasks/([^/]+)", move_transfer_task, auth=False)

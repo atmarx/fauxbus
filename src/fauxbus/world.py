@@ -1,5 +1,7 @@
 """The in-memory world: groups, memberships, policies, preferences,
-plus the OAuth2 client registry and the tokens it has issued.
+the OAuth2 client registry and the tokens it has issued, and — since the
+Transfer task-monitoring slice — collections, their role grants, and
+transfer tasks.
 
 Truth grades (see SPEC.md "Recorded, documented, provisional"):
 - Document shapes for groups, my_groups entries, policies, and DELETE
@@ -13,7 +15,9 @@ Truth grades (see SPEC.md "Recorded, documented, provisional"):
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -32,11 +36,15 @@ from .errors import (
     ApiError,
     auth_forbidden,
     auth_unauthorized,
+    endpoint_not_found,
     group_not_found,
     invalid_client,
     invalid_grant,
     invalid_request,
     not_implemented,
+    task_not_found,
+    transfer_bad_request,
+    transfer_permission_denied,
     validation_error,
 )
 from .ids import (
@@ -466,6 +474,181 @@ class IssuedToken:
     authenticated_at: int | None = None
 
 
+# --------------------------------------------------------------- transfer
+#
+# The task-monitoring slice.  What follows is bookkeeping and nothing
+# else: SPEC's bright line (2026-07-31) is that Fauxbus fakes the
+# Transfer *API* and never the data plane, so a "file" here is a row with
+# a path and a size, and "transferring" it is a counter going up.  No
+# byte moves, no path is ever opened.
+
+# DOCUMENTED (the SDK's own docstring for endpoint_manager_task_list:
+# "in-progress tasks will have status ACTIVE or INACTIVE, and completed
+# tasks will have status SUCCEEDED or FAILED").  INACTIVE is *not*
+# finished — it is a task Globus has stopped making progress on, for
+# credentials or a fault, that may yet resume.
+TASK_RUNNING = ("ACTIVE", "INACTIVE")
+TASK_TERMINAL = ("SUCCEEDED", "FAILED")
+TASK_STATUSES = TASK_RUNNING + TASK_TERMINAL
+
+# The roles on a collection that let an identity see *other people's*
+# tasks there.  DOCUMENTED (docs.globus.org/api/transfer/roles, read
+# 2026-10-14): ``activity_monitor`` may "view tasks and other activity to
+# or from the collection", ``activity_manager`` may do that and control
+# them, and ``administrator`` has "full capabilities".  The reference
+# names two more — ``access_manager`` (guest-collection ACLs) and
+# ``restricted_administrator`` — and neither one is about tasks, so the
+# seed refuses them loudly rather than storing a role that would do
+# nothing here.  Role *principals* are identities only: Globus also
+# grants roles to groups, and nobody has asked Fauxbus to model that.
+MONITOR_ROLES = ("activity_monitor", "activity_manager", "administrator")
+
+# DOCUMENTED (the "Get tasks" query-parameter table): ``limit`` defaults
+# to 100, and "the maximum allowed limit is 1000."
+TASK_LIST_DEFAULT_LIMIT = 100
+TASK_LIST_MAX_LIMIT = 1000
+
+# The query parameters endpoint_manager/task_list understands here.  The
+# real endpoint takes more (filter_task_id, filter_owner_id,
+# filter_is_paused, filter_min_faults, filter_local_user, and a
+# deprecated filter_username), and every one of those gets a loud 501
+# rather than being ignored.  Ignoring a filter is the silent wrong
+# answer principle 2 forbids in its purest form: the caller asked for
+# fewer tasks and got all of them, and the response looks perfect.
+TASK_LIST_PARAMS = frozenset(
+    {
+        "limit",
+        "last_key",
+        "filter_status",
+        "filter_endpoint",
+        "filter_endpoint_use",
+        "filter_completion_time",
+    }
+)
+
+# How many rows one page of successful_transfers carries.  PROVISIONAL:
+# the reference documents the ``marker``/``next_marker`` paging and no
+# page size, and the endpoint takes no ``limit``.  The number only
+# decides how many pages a long task spans; the SDK's paginator walks
+# them all whatever it is.
+SUCCESSFUL_TRANSFERS_PAGE = 100
+
+# RECORDED, from one example: the endpoint_manager_task_list fixture's
+# ``deadline`` is its ``request_time`` plus exactly one day.  Fauxbus
+# renders every task that way.
+TASK_DEADLINE = 86400
+
+
+@dataclass
+class Collection:
+    """A Globus collection, as far as task monitoring needs one.
+
+    Three things only.  A name for the ``*_display_name`` fields.  A
+    subscription, because the reference says "if the endpoint or
+    collection is unsubscribed, activity manager and monitor roles
+    become inactive" (DOCUMENTED, transfer/roles) — that is a real
+    failure a consumer meets when a DTN's subscription lapses, and a fake
+    with no subscription field could never show it.  And the role
+    grants, identity id → role name.
+    """
+
+    id: str
+    display_name: str
+    subscription_id: str | None
+    roles: dict[str, str] = field(default_factory=dict)
+
+    def monitors(self, identity_id: str) -> bool:
+        return self.subscription_id is not None and self.roles.get(identity_id) in MONITOR_ROLES
+
+
+@dataclass
+class TransferFile:
+    """One file in a task: where it came from, where it went, how big.
+
+    ``checksum`` and ``checksum_algorithm`` are whatever the harness
+    says, or null.  Fauxbus will not compute a checksum — there are no
+    bytes to compute one over — and it will not invent a plausible one
+    either, because a consumer that compares checksums against its own
+    copy would then be comparing against noise.
+    """
+
+    source_path: str
+    destination_path: str
+    size: int
+    checksum: str | None = None
+    checksum_algorithm: str | None = None
+
+
+@dataclass
+class TransferTask:
+    """A transfer task's bookkeeping, on the logical clock.
+
+    Progress is whole files, in list order: ``files_done`` is how many
+    of ``files`` had finished at the last moment anyone pinned it down,
+    and while the task is ACTIVE with a ``due_at`` the rest arrive
+    linearly between ``active_since`` and ``due_at`` (see
+    World.files_done_now).  Nothing is stored that the clock can derive,
+    which is what keeps the round trip honest: a dump taken mid-transfer
+    reloads to a task at the same point, because the point is a function
+    of the dump's own ``clock``.
+
+    ``request_time`` and ``completion_time`` are integer seconds on the
+    world clock, rendered as ISO 8601 on the wire.
+    """
+
+    task_id: str
+    owner_id: str
+    owner_string: str
+    source_endpoint_id: str
+    destination_endpoint_id: str
+    status: str
+    request_time: int
+    files: list[TransferFile]
+    completion_time: int | None = None
+    files_done: int = 0
+    active_since: int = 0
+    due_at: int | None = None
+    faults: int = 0
+    fatal_error: dict[str, Any] | None = None
+    label: str | None = None
+    source_base_path: str | None = None
+    destination_base_path: str | None = None
+
+
+def _iso(seconds: int) -> str:
+    """World-clock seconds as the recorded wire format: ``2024-02-06T06:59:02+00:00``."""
+    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
+
+
+def _parse_filter_instant(raw: str) -> float:
+    """One side of ``filter_completion_time``, as epoch seconds.
+
+    DOCUMENTED formats (the SDK docstring, quoting the reference):
+    ``YYYY-MM-DDTHH:MM:SS``, with ``+/-HH:MM`` or ``Z`` or neither; a
+    space may stand in for the ``T``; no zone means UTC.  The SDK
+    itself always sends the second form — ``isoformat(timespec=
+    "seconds")`` on an aware datetime gives ``+00:00`` — and requests
+    percent-encodes the ``+``.
+
+    One tolerance on top, for people with curl: an *unencoded* ``+`` in
+    a query string decodes as a space, so ``...T12:00:00+00:00`` arrives
+    as ``...T12:00:00 00:00``.  A trailing `` HH:MM`` after a time can
+    only have been an offset, so it is read as one.
+    """
+    text = raw.strip()
+    if re.search(r"\d{2}:\d{2}:\d{2} \d{2}:\d{2}$", text):
+        text = text[:-6] + "+" + text[-5:]
+    try:
+        instant = datetime.fromisoformat(text)
+    except ValueError:
+        raise transfer_bad_request(
+            f"filter_completion_time: {raw!r} is not an ISO 8601 date-time"
+        ) from None
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=UTC)
+    return instant.timestamp()
+
+
 class World:
     """All mutable state, plus its (de)serialization for seed/state.
 
@@ -504,6 +687,13 @@ class World:
         self.authorization_requests: dict[str, AuthorizationRequest] = {}
         self.authorization_codes: dict[str, AuthorizationCode] = {}
         self.sessions: dict[str, Session] = {}
+        # Transfer task monitoring.  Collections (with their role grants)
+        # are seeded and never change through the imitated surface —
+        # the slice reads tasks, it does not administer endpoints.  Tasks
+        # arrive by seed or through /_fauxbus/transfer/tasks and move
+        # along by control-plane call or by tick.
+        self.collections: dict[str, Collection] = {}
+        self.transfer_tasks: dict[str, TransferTask] = {}
 
     # ------------------------------------------------------------------ ids
 
@@ -1741,6 +1931,835 @@ class World:
                 allowed.add("request_join")
         return sorted(allowed)
 
+    # ------------------------------------------------------------- transfer
+    #
+    # The endpoint-manager family: tasks seen by someone who did not
+    # submit them, because they hold a role on a collection the task
+    # touched.  That distinction is the whole slice — the plain
+    # ``task_list`` returns only the caller's own tasks, and a service
+    # watching a landing collection never submits anything there.
+
+    def advance_clock(self, seconds: int) -> None:
+        """Move logical time forward, and let whatever was due finish.
+
+        The first thing in Fauxbus that ``tick`` *does* rather than
+        merely counts, which is what SPEC promised the clock was for on
+        day one.  A task that is ACTIVE with a ``due_at`` the new clock
+        has reached becomes SUCCEEDED — and its ``completion_time`` is
+        its ``due_at``, not the new clock.  A harness that ticks an hour
+        past a task due at +60s should see a task that finished at +60s;
+        stamping it with whenever the harness happened to look would
+        make the completion time a fact about the test, not the task.
+        """
+        self.clock += seconds
+        for task in self.transfer_tasks.values():
+            if task.status == "ACTIVE" and task.due_at is not None and task.due_at <= self.clock:
+                task.status = "SUCCEEDED"
+                task.completion_time = task.due_at
+                task.files_done = len(task.files)
+                task.due_at = None
+
+    def files_done_now(self, task: TransferTask) -> int:
+        """How many of a task's files have arrived, as of the world clock.
+
+        Whole files, in list order, arriving at an even pace between
+        ``active_since`` and ``due_at``.  Integer arithmetic on purpose:
+        the same clock always gives the same count, and a file is either
+        there or not — Globus's successful-transfer list has no
+        half-files in it either.  A task with no ``due_at`` (paused,
+        failed, or ACTIVE with no duration given) stays where it was
+        last pinned until the control plane moves it.
+        """
+        n = len(task.files)
+        if task.status == "SUCCEEDED":
+            return n
+        if task.status != "ACTIVE" or task.due_at is None:
+            return task.files_done
+        if self.clock >= task.due_at:
+            return n
+        elapsed = max(0, self.clock - task.active_since)
+        return task.files_done + (n - task.files_done) * elapsed // (task.due_at - task.active_since)
+
+    def _monitor_refusal(self, caller: Identity, collection_id: str) -> str | None:
+        """Why ``caller`` may not watch tasks on a collection, or None if they may.
+
+        Two different afternoons, so two different sentences: a role
+        that is missing, and a role that exists but went inactive when
+        the subscription did.  The second is the one worth spelling out —
+        it is the failure a consumer meets in production when a DTN's
+        subscription lapses, with every grant still visibly in place.
+        """
+        collection = self.collections.get(collection_id)
+        if collection is None:
+            return f"collection {collection_id} is not one Fauxbus has been told about"
+        role = collection.roles.get(caller.identity_id)
+        if role not in MONITOR_ROLES:
+            return (
+                f"identity {caller.identity_id} holds no activity_monitor, activity_manager or "
+                f"administrator role on collection {collection_id}"
+            )
+        if collection.subscription_id is None:
+            # DOCUMENTED for the two activity roles ("if the endpoint or
+            # collection is unsubscribed, activity manager and monitor
+            # roles become inactive").  PROVISIONAL that administrator
+            # loses endpoint-manager access the same way: the reference
+            # puts the whole endpoint-manager API behind a subscription,
+            # but says so only for the activity roles in as many words.
+            return (
+                f"collection {collection_id} is not subscribed, so the {role} role "
+                f"identity {caller.identity_id} holds there is inactive"
+            )
+        return None
+
+    def _task_visible(self, caller: Identity, task: TransferTask) -> bool:
+        # PROVISIONAL: a role on the task's source *or* its destination
+        # is enough.  The published reference says "source or
+        # destination collection" for every endpoint_manager task call;
+        # the SDK's docstrings for endpoint_manager_get_task and
+        # endpoint_manager_task_event_list say "the destination endpoint
+        # of the task."  The two disagree, and only a recording settles
+        # it.  Fauxbus takes the reference, which is the more permissive
+        # reading — SPEC's asymmetry again: a fake that refuses what the
+        # real service allows breaks working code, and a consumer that
+        # only ever watches a destination (Root Cellar does) passes
+        # under either.
+        return any(
+            self._monitor_refusal(caller, cid) is None
+            for cid in (task.source_endpoint_id, task.destination_endpoint_id)
+        )
+
+    def _transfer_task(self, task_id: str) -> TransferTask:
+        """Resolve a task id from the imitated surface, or TaskNotFound."""
+        try:
+            task_id = str(UUID(task_id))
+        except (ValueError, AttributeError, TypeError):
+            # PROVISIONAL: a malformed task id answers 404 TaskNotFound
+            # rather than a 400.  No task can have that id, which is
+            # true either way; which status the real service picks is
+            # unrecorded.
+            raise task_not_found(task_id) from None
+        task = self.transfer_tasks.get(task_id)
+        if task is None:
+            raise task_not_found(task_id)
+        return task
+
+    def endpoint_manager_get_task(self, caller: Identity, task_id: str) -> dict[str, Any]:
+        task = self._transfer_task(task_id)
+        if not self._task_visible(caller, task):
+            raise transfer_permission_denied(
+                f"identity {caller.identity_id} has no activity_monitor role (or a stronger "
+                f"one) on a subscribed collection this task touched"
+            )
+        return self.task_doc(task)
+
+    def endpoint_manager_task_list(self, caller: Identity, query: dict[str, str]) -> dict[str, Any]:
+        """``GET /v0.10/endpoint_manager/task_list``: filter, order, page.
+
+        In order: refuse what is not built, read the filters, decide
+        which collections the caller may look at, filter, sort the way
+        the reference says, page by ``last_key``.  Every refusal below
+        that answers 400 is PROVISIONAL as to *which* malformed requests
+        the real service refuses and with what message — the BadRequest
+        code and status are recorded, and the rules come from the SDK's
+        docstring, but nobody has watched the service apply them.
+        """
+        unknown = sorted(set(query) - TASK_LIST_PARAMS)
+        if unknown:
+            raise not_implemented(
+                f"Fauxbus does not implement endpoint_manager/task_list's {', '.join(unknown)}, "
+                f"and will not ignore a filter and hand back tasks the caller asked it to "
+                f"leave out. Real client code sends it?"
+            )
+
+        statuses = [s.strip() for s in query.get("filter_status", "").split(",") if s.strip()]
+        bad = sorted(set(statuses) - set(TASK_STATUSES))
+        if bad:
+            raise transfer_bad_request(
+                f"filter_status: {', '.join(bad)} is not a task status ({', '.join(TASK_STATUSES)})"
+            )
+
+        try:
+            limit = int(query.get("limit", TASK_LIST_DEFAULT_LIMIT))
+        except ValueError:
+            raise transfer_bad_request(f"limit: {query['limit']!r} is not an integer") from None
+        if not 1 <= limit <= TASK_LIST_MAX_LIMIT:
+            raise transfer_bad_request(f"limit must be between 1 and {TASK_LIST_MAX_LIMIT}")
+
+        endpoint = query.get("filter_endpoint")
+        use = query.get("filter_endpoint_use")
+        if use is not None and use not in ("source", "destination"):
+            raise transfer_bad_request("filter_endpoint_use must be 'source' or 'destination'")
+        if use is not None and endpoint is None:
+            # The SDK refuses this before it reaches the wire
+            # (GlobusSDKUsageError); a raw client is told here.
+            raise transfer_bad_request("filter_endpoint_use requires filter_endpoint")
+        if endpoint is None and not (statuses and set(statuses) <= set(TASK_RUNNING)):
+            # DOCUMENTED rule (SDK docstring): "for any query that doesn't
+            # specify a filter_status that is a subset of (ACTIVE,
+            # INACTIVE), at least one of filter_task_id or filter_endpoint
+            # is required."  filter_task_id is not built, so here it is
+            # filter_endpoint or nothing.
+            raise transfer_bad_request(
+                "filter_endpoint is required unless filter_status is a subset of ACTIVE,INACTIVE"
+            )
+
+        window = self._completion_window(query.get("filter_completion_time"))
+        after = self._decode_last_key(query["last_key"]) if query.get("last_key") else None
+
+        if endpoint is not None:
+            try:
+                endpoint = str(UUID(endpoint))
+            except ValueError:
+                # PROVISIONAL, the twin of the task-id case: a malformed
+                # collection id is a collection nobody has, so 404.
+                raise endpoint_not_found(endpoint) from None
+            if endpoint not in self.collections:
+                raise endpoint_not_found(endpoint)
+            refusal = self._monitor_refusal(caller, endpoint)
+            if refusal is not None:
+                raise transfer_permission_denied(refusal)
+            tasks = [
+                t
+                for t in self.transfer_tasks.values()
+                if (use != "destination" and t.source_endpoint_id == endpoint)
+                or (use != "source" and t.destination_endpoint_id == endpoint)
+            ]
+        else:
+            tasks = [t for t in self.transfer_tasks.values() if self._task_visible(caller, t)]
+
+        if statuses:
+            tasks = [t for t in tasks if t.status in statuses]
+        if window is not None:
+            tasks = [t for t in tasks if self._in_window(t, window)]
+
+        ordered = sorted(tasks, key=self._task_order)
+        if after is not None:
+            ordered = [t for t in ordered if self._task_order(t) > after]
+        page = ordered[:limit]
+        # RECORDED envelope (endpoint_manager_task_list.py): DATA,
+        # DATA_TYPE "task_list", has_next_page, last_key — and no total.
+        # The SDK's LastKeyPaginator reads has_next_page with a bare
+        # index, so it is present on every page, never omitted.
+        return {
+            "DATA": [self.task_doc(t) for t in page],
+            "DATA_TYPE": "task_list",
+            "has_next_page": len(ordered) > limit,
+            "last_key": self._encode_last_key(page[-1]) if page else None,
+        }
+
+    @staticmethod
+    def _completion_window(raw: str | None) -> tuple[float | None, float | None] | None:
+        """``filter_completion_time`` as (start, end) epoch seconds, None for a blank side.
+
+        The SDK's encoding, read from its source rather than assumed
+        (``services/transfer/client.py``, 4.8.1): a ``(start, end)``
+        tuple of datetimes becomes ``f"{start.isoformat(timespec=
+        'seconds')},{end.isoformat(...)}"`` — one comma, no brackets, a
+        string passed through untouched.  "A blank string may be used
+        for either the start or end (but not both)" is DOCUMENTED.
+        """
+        if raw is None:
+            return None
+        parts = raw.split(",")
+        if len(parts) != 2:
+            raise transfer_bad_request(
+                "filter_completion_time takes a start and an end separated by one comma"
+            )
+        start, end = (p.strip() or None for p in parts)
+        if start is None and end is None:
+            raise transfer_bad_request("filter_completion_time may leave one side blank, not both")
+        return (
+            None if start is None else _parse_filter_instant(start),
+            None if end is None else _parse_filter_instant(end),
+        )
+
+    @staticmethod
+    def _in_window(task: TransferTask, window: tuple[float | None, float | None]) -> bool:
+        start, end = window
+        if task.completion_time is None:
+            # DOCUMENTED: "If the end date is blank, the filter will also
+            # include all active tasks, since they will complete some
+            # time in the future."  With an end date, a task that has not
+            # completed has no completion time to be inside it.
+            return end is None
+        # PROVISIONAL: both bounds inclusive.  The reference says
+        # "in the specified range" and nothing about the edges.  A poller
+        # that overlaps its windows, as it should, cannot tell.
+        return (start is None or task.completion_time >= start) and (
+            end is None or task.completion_time <= end
+        )
+
+    @staticmethod
+    def _task_order(task: TransferTask) -> tuple[int, int, str]:
+        """The sort key, which is also what ``last_key`` encodes.
+
+        DOCUMENTED ordering: "Tasks that are still in progress are sorted
+        by request_time descending (newest first).  Completed tasks are
+        sorted by completion_time descending.  In progress tasks will be
+        sorted before completed tasks."  The task id breaks ties, which
+        on a logical clock are common (every task created before a tick
+        shares a request_time).
+        """
+        if task.status in TASK_RUNNING:
+            return (0, -task.request_time, task.task_id)
+        assert task.completion_time is not None
+        return (1, -task.completion_time, task.task_id)
+
+    @staticmethod
+    def _encode_last_key(task: TransferTask) -> str:
+        # PROVISIONAL, all of it, and the reference calls the value
+        # "opaque", so no consumer may read it.  The shape borrows the
+        # recorded example's ("complete,2024-02-06T06:59:02.291996"),
+        # which suggests the real key is the sort position too; Fauxbus
+        # adds the task id, because a timestamp alone cannot resume
+        # between two tasks that share one.  Keyset paging rather than
+        # an offset, so a task that appears between two page requests
+        # does not shift every later row by one.  Also PROVISIONAL: a
+        # last page still carries its key (the recording does) and an
+        # empty page carries null (nothing recorded).
+        group, negative_time, task_id = World._task_order(task)
+        word = "active" if group == 0 else "complete"
+        return f"{word},{_iso(-negative_time)},{task_id}"
+
+    @staticmethod
+    def _decode_last_key(raw: str) -> tuple[int, int, str]:
+        try:
+            word, instant, task_id = raw.split(",", 2)
+            group = {"active": 0, "complete": 1}[word]
+            parsed = datetime.fromisoformat(instant)
+            # A key Fauxbus wrote always carries +00:00; a hand-edited
+            # one without a zone is read as UTC rather than as whatever
+            # zone the machine running Fauxbus happens to be in.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            seconds = int(parsed.timestamp())
+        except (ValueError, KeyError):
+            raise transfer_bad_request(f"last_key {raw!r} is not one this service handed out") from None
+        return (group, -seconds, task_id)
+
+    def endpoint_manager_successful_transfers(
+        self, caller: Identity, task_id: str, query: dict[str, str]
+    ) -> dict[str, Any]:
+        """One page of a task's successful-transfer list, marker-paged.
+
+        PROVISIONAL for any task that is not SUCCEEDED: Fauxbus answers
+        with the files that have arrived so far, which for a FAILED task
+        is the part that made it.  The SDK's docstring says "for a
+        completed Task," and whether the real service refuses a running
+        one, or answers it the way Fauxbus does, is unrecorded.  A
+        consumer that reads a FAILED task's partial list — to learn
+        whose transfer stopped and where — is relying on this answer.
+        """
+        unknown = sorted(set(query) - {"marker"})
+        if unknown:
+            raise not_implemented(
+                f"Fauxbus does not implement successful_transfers' {', '.join(unknown)}. "
+                f"Real client code sends it?"
+            )
+        task = self._transfer_task(task_id)
+        if not self._task_visible(caller, task):
+            raise transfer_permission_denied(
+                f"identity {caller.identity_id} has no activity_monitor role (or a stronger "
+                f"one) on a subscribed collection this task touched"
+            )
+        try:
+            marker = int(query.get("marker", "0"))
+        except ValueError:
+            raise transfer_bad_request(f"marker {query['marker']!r} is not an integer") from None
+        if marker < 0:
+            raise transfer_bad_request("marker may not be negative")
+        done = task.files[: self.files_done_now(task)]
+        rows = done[marker : marker + SUCCESSFUL_TRANSFERS_PAGE]
+        # PROVISIONAL: the marker is an offset into the list.  The
+        # reference types it as an integer and the recording shows
+        # ``marker: 0`` on a first page and ``next_marker: 93979`` — an
+        # internal row id, most likely — so it is opaque to consumers
+        # either way.  One trap the offset happens to avoid, worth
+        # knowing about before anyone changes it: the SDK's
+        # NullableMarkerPaginator only sends a marker that is *truthy*,
+        # so a next_marker of 0 would be dropped and page one requested
+        # again, forever.  An offset past the first page is never 0.
+        following = marker + SUCCESSFUL_TRANSFERS_PAGE
+        return {
+            # RECORDED envelope (endpoint_manager_task_successful_transfers.py).
+            "DATA_TYPE": "successful_transfers",
+            "marker": marker,
+            "next_marker": following if following < len(done) else None,
+            "DATA": [
+                {
+                    # RECORDED: the fixture's rows carry these three.
+                    "DATA_TYPE": "successful_transfer",
+                    "source_path": f.source_path,
+                    "destination_path": f.destination_path,
+                    # DOCUMENTED, not recorded: the reference's
+                    # successful_transfer table adds these four.  The SDK
+                    # fixture shows none of them, so a consumer reading
+                    # ``size`` or ``checksum`` is leaning on the published
+                    # docs alone until a recording says so.
+                    "size": f.size,
+                    "checksum": f.checksum,
+                    "checksum_algorithm": f.checksum_algorithm,
+                    # PROVISIONAL value: the reference gives ``false`` as
+                    # its example and does not say what makes it true.
+                    "dynamic": False,
+                }
+                for f in rows
+            ],
+        }
+
+    def task_doc(self, task: TransferTask) -> dict[str, Any]:
+        """The task document, key for key as the recorded fixture has it.
+
+        RECORDED key set: every key in
+        ``globus_sdk/testing/data/transfer/endpoint_manager_task_list.py``
+        is here and nothing else is, because a consumer that reads
+        ``task["source_endpoint_display_name"]`` should not meet a
+        KeyError from the fake that the real service would never raise.
+
+        The *values* split three ways.  Modeled, and true to the world:
+        ids, owner, status, times, the file and byte counts, faults,
+        label, base paths, fatal_error.  Constant, and recorded: the
+        fixture's own values for things Fauxbus has no reason to vary
+        (``command``, ``type``, ``verify_checksum``, ``recursive_symlinks``).
+        And the rest — PROVISIONAL as values: ``deadline`` (one example's
+        one day), the ``subtasks_*`` counts (the fixture's six subtasks
+        for three files count directories Fauxbus does not have),
+        ``is_ok``, ``nice_status``, ``effective_bytes_per_second``,
+        ``username``, the legacy ``name#id`` endpoint strings, and every
+        ``*_local_user``/``*_host_*``/``*_mapped_*`` field, which are
+        null or the fixture's resting value because Fauxbus models no
+        hosts, mappings or local accounts.
+        """
+        n = len(task.files)
+        done = self.files_done_now(task)
+        transferred = sum(f.size for f in task.files[:done])
+        running = task.status in TASK_RUNNING
+        end = task.completion_time if task.completion_time is not None else self.clock
+        elapsed = max(0, end - task.request_time)
+
+        def endpoint(cid: str) -> tuple[str, str | None]:
+            collection = self.collections.get(cid)
+            name = collection.display_name if collection is not None else None
+            return f"{name or cid}#{cid}", name
+
+        source, source_name = endpoint(task.source_endpoint_id)
+        destination, destination_name = endpoint(task.destination_endpoint_id)
+        return {
+            "DATA_TYPE": "task",
+            "bytes_checksummed": 0,
+            "bytes_transferred": transferred,
+            "canceled_by_admin": None,
+            "canceled_by_admin_message": None,
+            "command": "API 0.10",
+            "completion_time": None if task.completion_time is None else _iso(task.completion_time),
+            "deadline": _iso(task.request_time + TASK_DEADLINE),
+            "delete_destination_extra": False,
+            "destination_base_path": task.destination_base_path,
+            "destination_endpoint": destination,
+            "destination_endpoint_display_name": destination_name,
+            "destination_endpoint_id": task.destination_endpoint_id,
+            "destination_host_endpoint": None,
+            "destination_host_endpoint_display_name": None,
+            "destination_host_endpoint_id": None,
+            "destination_host_path": None,
+            "destination_local_user": None,
+            "destination_local_user_status": None,
+            "destination_mapped_collection_display_name": None,
+            "destination_mapped_collection_id": None,
+            "directories": 0,
+            "effective_bytes_per_second": round(transferred / elapsed) if elapsed else 0,
+            "encrypt_data": False,
+            "fail_on_quota_errors": False,
+            "fatal_error": task.fatal_error,
+            "faults": task.faults,
+            "files": n,
+            "files_skipped": 0,
+            "files_transferred": done,
+            "filter_rules": None,
+            "history_deleted": False,
+            "is_ok": (task.status == "ACTIVE") if running else None,
+            "is_paused": False,
+            "label": task.label,
+            "nice_status": None,
+            "nice_status_details": None,
+            "nice_status_expires_in": None,
+            "nice_status_short_description": None,
+            "owner_id": task.owner_id,
+            "owner_string": task.owner_string,
+            "preserve_timestamp": False,
+            "recursive_symlinks": "ignore",
+            "request_time": _iso(task.request_time),
+            "skip_source_errors": False,
+            "source_base_path": task.source_base_path,
+            "source_endpoint": source,
+            "source_endpoint_display_name": source_name,
+            "source_endpoint_id": task.source_endpoint_id,
+            "source_host_endpoint": None,
+            "source_host_endpoint_display_name": None,
+            "source_host_endpoint_id": None,
+            "source_host_path": None,
+            "source_local_user": None,
+            "source_local_user_status": None,
+            "source_mapped_collection_display_name": None,
+            "source_mapped_collection_id": None,
+            "status": task.status,
+            "subtasks_canceled": 0,
+            "subtasks_expired": 0,
+            "subtasks_failed": n - done if task.status == "FAILED" else 0,
+            "subtasks_pending": n - done if running else 0,
+            "subtasks_retrying": 0,
+            "subtasks_skipped_errors": 0,
+            "subtasks_succeeded": done,
+            "subtasks_total": n,
+            "symlinks": 0,
+            "sync_level": None,
+            "task_id": task.task_id,
+            "type": "TRANSFER",
+            "username": task.owner_string,
+            "verify_checksum": True,
+        }
+
+    # ---------------------------------------------- transfer: control plane
+    #
+    # How a test makes a task happen.  The imitated surface only reads
+    # tasks (that is all the endpoint-manager family does), so creating
+    # one and moving it along are harness acts, out-of-band per
+    # principle 4 — the same way a group's subscription arrives by seed
+    # because no Groups endpoint writes it.
+
+    CREATE_TASK_FIELDS = frozenset(
+        {
+            "owner_id",
+            "owner_string",
+            "source_endpoint_id",
+            "destination_endpoint_id",
+            "files",
+            "status",
+            "duration",
+            "files_succeeded",
+            "faults",
+            "fatal_error",
+            "label",
+            "source_base_path",
+            "destination_base_path",
+        }
+    )
+    MOVE_TASK_FIELDS = frozenset({"status", "duration", "files_succeeded", "faults", "fatal_error"})
+
+    # PROVISIONAL shape: what a FAILED task carries in ``fatal_error``
+    # when the harness does not say.  The reference describes the field
+    # as an object with a ``code`` and a ``description``; no fixture
+    # shows one, and the code here is Fauxbus's own word, named so that
+    # nobody mistakes it for a Globus one.
+    DEFAULT_FATAL_ERROR: dict[str, Any] = {
+        "code": "FAUXBUS_FAILED",
+        "description": "failed on demand through the Fauxbus control plane",
+    }
+
+    def _move_options(self, doc: dict[str, Any], status: str, n: int) -> tuple[int | None, int | None]:
+        """Read ``duration`` and ``files_succeeded``, each only where it means something."""
+        duration = doc.get("duration")
+        if duration is not None:
+            if status != "ACTIVE":
+                raise validation_error("'duration' only applies to a task that is ACTIVE")
+            duration = _require_int(duration, "duration")
+            if duration < 1:
+                raise validation_error("'duration' must be at least 1 second")
+        succeeded = doc.get("files_succeeded")
+        if succeeded is not None:
+            if status not in ("FAILED", "INACTIVE"):
+                raise validation_error(
+                    "'files_succeeded' only applies to a task moving to FAILED or INACTIVE; "
+                    "SUCCEEDED means all of them"
+                )
+            succeeded = _require_int(succeeded, "files_succeeded")
+            if not 0 <= succeeded <= n:
+                raise validation_error(f"'files_succeeded' must be between 0 and {n}")
+        return duration, succeeded
+
+    def create_transfer_task(self, doc: dict[str, Any]) -> TransferTask:
+        """Start a task the way a researcher's submission would, from the harness.
+
+        It begins at the current clock, in whatever status the harness
+        names (ACTIVE by default).  ``duration`` sets it running toward
+        completion on the logical clock: ``tick`` past it and the task is
+        SUCCEEDED, with files arriving evenly on the way.  Leave it out
+        and the task stays where it is until moved.  A task created
+        already FAILED takes ``files_succeeded`` for how far it got.
+        """
+        doc = _require_mapping(doc, "task document")
+        unknown = sorted(set(doc) - self.CREATE_TASK_FIELDS)
+        if unknown:
+            raise validation_error(f"unknown task fields: {unknown}")
+        status = doc.get("status", "ACTIVE")
+        if status not in TASK_STATUSES:
+            raise validation_error(f"status {status!r} is not one of {TASK_STATUSES}")
+        files = doc.get("files") or []
+        n = len(files) if isinstance(files, list) else 0
+        duration, succeeded = self._move_options(doc, status, n)
+        terminal = status in TASK_TERMINAL
+        record = {
+            key: doc[key]
+            for key in (
+                "owner_id",
+                "owner_string",
+                "source_endpoint_id",
+                "destination_endpoint_id",
+                "files",
+                "faults",
+                "label",
+                "source_base_path",
+                "destination_base_path",
+            )
+            if key in doc
+        }
+        record.update(
+            status=status,
+            request_time=self.clock,
+            active_since=self.clock,
+            due_at=self.clock + duration if duration is not None else None,
+            completion_time=self.clock if terminal else None,
+            files_done=n if status == "SUCCEEDED" else (succeeded or 0),
+            fatal_error=(doc.get("fatal_error") or self.DEFAULT_FATAL_ERROR)
+            if status == "FAILED"
+            else None,
+        )
+        # Ids come from the same deterministic counter as everything
+        # else — but a seeded world may already hold the id the counter
+        # is about to produce (a dump carries the counter, a hand-written
+        # seed may not), so skip past any id in use.  Still
+        # deterministic: the same world always mints the same next id,
+        # and nothing seeded is ever written over.
+        while True:
+            task_id = self.next_id("transfer_task")
+            if task_id not in self.transfer_tasks:
+                break
+        task = self._task_from_doc(task_id, record)
+        self.transfer_tasks[task_id] = task
+        return task
+
+    def move_transfer_task(self, task_id: str, doc: dict[str, Any]) -> TransferTask:
+        """Move a task along: pause it, resume it, finish it, fail it.
+
+        A terminal task does not move again.  Globus never reports a
+        finished task finishing a second way, and a harness that tried
+        to make it would be testing a service that does not exist — the
+        consumer's own "terminal means terminal" rule is exactly the
+        kind of thing that should be tested against a fake that agrees.
+        """
+        doc = _require_mapping(doc, "move document")
+        unknown = sorted(set(doc) - self.MOVE_TASK_FIELDS)
+        if unknown:
+            raise validation_error(f"unknown move fields: {unknown}")
+        task = self.transfer_tasks.get(_require_uuid(task_id, "task id"))
+        if task is None:
+            raise ApiError(404, "NOT_FOUND", f"no transfer task {task_id} in this world")
+        if task.status in TASK_TERMINAL:
+            raise ApiError(
+                409,
+                "CONFLICT",
+                f"task {task_id} is {task.status}, and a finished task stays finished",
+            )
+        status = doc.get("status")
+        if status not in TASK_STATUSES:
+            raise validation_error(f"'status' is required, one of {TASK_STATUSES}")
+        n = len(task.files)
+        duration, succeeded = self._move_options(doc, status, n)
+        faults = _require_int(doc.get("faults", task.faults), "faults")
+        if faults < 0:
+            raise validation_error("'faults' may not be negative")
+        if doc.get("fatal_error") is not None and status != "FAILED":
+            raise validation_error("'fatal_error' only applies to a task moving to FAILED")
+        fatal = _require_mapping(doc.get("fatal_error") or self.DEFAULT_FATAL_ERROR, "fatal_error")
+        # Everything is validated; only now does the task change, so a
+        # refused move leaves it exactly as it was.  Pin the progress so
+        # far before anything changes the formula that computes it.
+        done = self.files_done_now(task)
+        task.faults = faults
+        task.status = status
+        task.due_at = None
+        if status == "ACTIVE":
+            task.files_done = done
+            task.active_since = self.clock
+            task.due_at = self.clock + duration if duration is not None else None
+        elif status == "INACTIVE":
+            task.files_done = succeeded if succeeded is not None else done
+        elif status == "SUCCEEDED":
+            task.files_done = n
+            task.completion_time = self.clock
+        else:  # FAILED
+            task.files_done = succeeded if succeeded is not None else done
+            task.completion_time = self.clock
+            task.fatal_error = dict(fatal)
+        return task
+
+    def task_record(self, task: TransferTask) -> dict[str, Any]:
+        """A task as the state dump holds it — the seed form, not the wire form."""
+        return {
+            "owner_id": task.owner_id,
+            "owner_string": task.owner_string,
+            "source_endpoint_id": task.source_endpoint_id,
+            "destination_endpoint_id": task.destination_endpoint_id,
+            "status": task.status,
+            "request_time": task.request_time,
+            "completion_time": task.completion_time,
+            "active_since": task.active_since,
+            "due_at": task.due_at,
+            "files_done": task.files_done,
+            "faults": task.faults,
+            "fatal_error": None if task.fatal_error is None else dict(task.fatal_error),
+            "label": task.label,
+            "source_base_path": task.source_base_path,
+            "destination_base_path": task.destination_base_path,
+            "files": [
+                {
+                    "source_path": f.source_path,
+                    "destination_path": f.destination_path,
+                    "size": f.size,
+                    "checksum": f.checksum,
+                    "checksum_algorithm": f.checksum_algorithm,
+                }
+                for f in task.files
+            ],
+        }
+
+    def _task_from_doc(self, task_id: str, t: Any) -> TransferTask:
+        """Validate one task record — the seed's door and the create door both.
+
+        One function for both on purpose: v0.2.11 found the policies
+        endpoint and the seed disagreeing about what a valid policy was,
+        and "one door's rules are every door's rules" has been the answer
+        since.  The consistency checks at the end are the ones a
+        hand-written seed is likeliest to get wrong — a SUCCEEDED task
+        with no completion time would render as finished and sort as
+        running.
+        """
+        what = f"transfer task {task_id}"
+        t = _require_mapping(t, what)
+        owner_id = _require_uuid(str(t.get("owner_id")), f"{what} owner_id")
+        source = _require_uuid(str(t.get("source_endpoint_id")), f"{what} source_endpoint_id")
+        destination = _require_uuid(
+            str(t.get("destination_endpoint_id")), f"{what} destination_endpoint_id"
+        )
+        status = t.get("status", "ACTIVE")
+        if status not in TASK_STATUSES:
+            raise validation_error(f"{what} status {status!r} is not one of {TASK_STATUSES}")
+        raw_files = t.get("files") or []
+        if not isinstance(raw_files, list):
+            raise validation_error(f"{what} 'files' must be a list")
+        files = []
+        for i, f in enumerate(raw_files):
+            f = _require_mapping(f, f"{what} files[{i}]")
+            for key in ("source_path", "destination_path"):
+                if not isinstance(f.get(key), str) or not f[key]:
+                    raise validation_error(f"{what} files[{i}] requires a non-empty {key!r}")
+            size = _require_int(f.get("size", 0), f"{what} files[{i}] size")
+            if size < 0:
+                raise validation_error(f"{what} files[{i}] size may not be negative")
+            files.append(
+                TransferFile(
+                    source_path=f["source_path"],
+                    destination_path=f["destination_path"],
+                    size=size,
+                    checksum=_optional_str(f.get("checksum"), f"{what} files[{i}] checksum"),
+                    checksum_algorithm=_optional_str(
+                        f.get("checksum_algorithm"), f"{what} files[{i}] checksum_algorithm"
+                    ),
+                )
+            )
+        n = len(files)
+
+        def optional_int(key: str) -> int | None:
+            return None if t.get(key) is None else _require_int(t[key], f"{what} {key}")
+
+        request_time = _require_int(t.get("request_time", self.clock), f"{what} request_time")
+        completion_time = optional_int("completion_time")
+        due_at = optional_int("due_at")
+        active_since = _require_int(t.get("active_since", request_time), f"{what} active_since")
+        files_done = _require_int(
+            t.get("files_done", n if status == "SUCCEEDED" else 0), f"{what} files_done"
+        )
+        faults = _require_int(t.get("faults", 0), f"{what} faults")
+        fatal_error = t.get("fatal_error")
+        if fatal_error is not None:
+            fatal_error = dict(_require_mapping(fatal_error, f"{what} fatal_error"))
+
+        if not 0 <= files_done <= n:
+            raise validation_error(f"{what} files_done must be between 0 and {n}")
+        if faults < 0:
+            raise validation_error(f"{what} faults may not be negative")
+        if status in TASK_TERMINAL:
+            if completion_time is None:
+                raise validation_error(f"{what} is {status}, so it needs a completion_time")
+            if due_at is not None:
+                raise validation_error(f"{what} is {status}; a finished task has no due_at")
+            if status == "SUCCEEDED" and files_done != n:
+                raise validation_error(f"{what} SUCCEEDED, so files_done must be all {n} files")
+        else:
+            if completion_time is not None:
+                raise validation_error(f"{what} is {status} and cannot have a completion_time")
+            if due_at is not None and (status != "ACTIVE" or due_at <= active_since):
+                raise validation_error(
+                    f"{what}: due_at belongs only to an ACTIVE task, after its active_since"
+                )
+
+        return TransferTask(
+            task_id=task_id,
+            owner_id=owner_id,
+            owner_string=str(t.get("owner_string") or self.username_for(owner_id)),
+            source_endpoint_id=source,
+            destination_endpoint_id=destination,
+            status=status,
+            request_time=request_time,
+            files=files,
+            completion_time=completion_time,
+            files_done=files_done,
+            active_since=active_since,
+            due_at=due_at,
+            faults=faults,
+            fatal_error=fatal_error,
+            label=_optional_str(t.get("label"), f"{what} label"),
+            source_base_path=_optional_str(t.get("source_base_path"), f"{what} source_base_path"),
+            destination_base_path=_optional_str(
+                t.get("destination_base_path"), f"{what} destination_base_path"
+            ),
+        )
+
+    def _load_transfer(self, doc: dict[str, Any]) -> None:
+        """The seed's Transfer sections: collections with their roles, then tasks.
+
+        Tasks do not have to name a seeded collection.  A researcher's
+        laptop is the source of most real transfers into a landing
+        collection, and making a harness register every source it
+        invents would be ceremony with nothing behind it; an unknown
+        collection simply grants nobody anything.
+        """
+        for cid, c in _require_mapping(doc.get("collections"), "collections").items():
+            cid = _require_uuid(str(cid), "collection id")
+            c = _require_mapping(c, f"collection {cid}")
+            subscription = c.get("subscription_id")
+            if subscription is not None:
+                subscription = _require_uuid(str(subscription), f"collection {cid} subscription_id")
+            roles: dict[str, str] = {}
+            for iid, role in _require_mapping(c.get("roles"), f"collection {cid} roles").items():
+                iid = _require_uuid(str(iid), f"collection {cid} role principal")
+                if role not in MONITOR_ROLES:
+                    raise validation_error(
+                        f"collection {cid}: role {role!r} is not one Fauxbus models. The task-"
+                        f"monitoring slice knows {', '.join(MONITOR_ROLES)}; Globus's "
+                        f"access_manager and restricted_administrator do not reach tasks."
+                    )
+                roles[iid] = role
+            self.collections[cid] = Collection(
+                id=cid,
+                display_name=str(c.get("display_name") or cid),
+                subscription_id=subscription,
+                roles=roles,
+            )
+        for tid, t in _require_mapping(doc.get("transfer_tasks"), "transfer_tasks").items():
+            tid = _require_uuid(str(tid), "transfer task id")
+            self.transfer_tasks[tid] = self._task_from_doc(tid, t)
+
     # ----------------------------------------------------------- seed/state
 
     def dump(self) -> dict[str, Any]:
@@ -1846,6 +2865,21 @@ class World:
             "sessions": {
                 sid: {"account": x.account, "authenticated_at": x.authenticated_at}
                 for sid, x in sorted(self.sessions.items())
+            },
+            # Transfer.  Collections carry their role grants; tasks are
+            # in the seed form (task_record), which stores the pinned
+            # progress and the clock marks rather than anything the
+            # clock can derive — see TransferTask.
+            "collections": {
+                cid: {
+                    "display_name": c.display_name,
+                    "subscription_id": c.subscription_id,
+                    "roles": dict(sorted(c.roles.items())),
+                }
+                for cid, c in sorted(self.collections.items())
+            },
+            "transfer_tasks": {
+                tid: self.task_record(t) for tid, t in sorted(self.transfer_tasks.items())
             },
             "groups": {
                 gid: {
@@ -2000,6 +3034,9 @@ class World:
                 ),
             )
         self._load_logins_in_flight(doc)
+        # After pins and clients, because a task's default owner_string
+        # is whatever username_for says about its owner.
+        self._load_transfer(doc)
         for gid, g in _require_mapping(doc.get("groups"), "groups").items():
             gid = _require_uuid(str(gid), "group id")
             if not isinstance(g, dict) or not g.get("name"):
@@ -2256,3 +3293,8 @@ class World:
         self.authorization_requests = {}
         self.authorization_codes = {}
         self.sessions = {}
+        # Collections and their role grants go too: a role that outlived
+        # a reset would let the next test watch tasks it never set up a
+        # right to see.
+        self.collections = {}
+        self.transfer_tasks = {}

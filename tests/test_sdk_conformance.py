@@ -9,7 +9,10 @@ base_url alone, which is the whole point.
 
 from __future__ import annotations
 
+import ast
+import datetime as dt
 import os
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -27,15 +30,22 @@ else:
     globus_sdk = pytest.importorskip("globus_sdk")
 
 from conftest import (  # noqa: E402
+    ALICE,
     ALICE_GLOBUSID,
     CLIENT_ID,
     CLIENT_SECRET,
     GROUPS_SCOPE,
+    LANDING,
+    LAPSED,
+    LAPTOP,
     LOGIN_CLIENT,
     LOGIN_REDIRECT,
     LOGIN_SECRET,
     TRANSFER_SCOPE,
+    files,
+    make_task,
     oidc_seed,
+    transfer_seed,
 )
 from globus_sdk import (  # noqa: E402
     AccessTokenAuthorizer,
@@ -48,6 +58,8 @@ from globus_sdk import (  # noqa: E402
     GroupsAPIError,
     GroupsClient,
     GroupsManager,
+    TransferAPIError,
+    TransferClient,
 )
 
 from fauxbus import signing  # noqa: E402
@@ -541,3 +553,232 @@ def test_a_spent_code_fails_through_the_sdk_like_the_recorded_invalid_grant(fx):
         "error": "invalid_grant",
         "error_description": "that authorization code has already been redeemed; codes are one-use.",
     }
+
+
+# ------------------------------------- transfer: endpoint_manager task monitoring
+#
+# The consumer this slice was built for is a poller (Root Cellar's
+# globus_watch), and the tests below call the SDK exactly the way it
+# does: a confidential client, ClientCredentialsAuthorizer for the
+# Transfer scope, one base_url for Auth and Transfer both, and the
+# paginated endpoint_manager_* calls with the same arguments.  If the
+# consumer's own code changes shape, these should change with it.
+
+
+def watcher(base_url: str) -> TransferClient:
+    """``SdkTaskSource._tc``, verbatim but for the names."""
+    auth = ConfidentialAppAuthClient(CLIENT_ID, CLIENT_SECRET, base_url=base_url)
+    authorizer = ClientCredentialsAuthorizer(auth, TRANSFER_SCOPE)
+    return TransferClient(authorizer=authorizer, base_url=base_url)
+
+
+def recorded_task_keys() -> set[str]:
+    """The task document's key set, read out of the SDK's own fixture source.
+
+    Read with ``ast`` rather than imported, because importing
+    ``globus_sdk.testing`` pulls in ``responses``, which the conformance
+    extra does not install and which Fauxbus has no other use for.  The
+    document is the dict literal whose ``DATA_TYPE`` is ``"task"``; its
+    keys are string constants even where its values are f-strings.
+    """
+    source = (
+        Path(globus_sdk.__file__).parent
+        / "testing/data/transfer/endpoint_manager_task_list.py"
+    ).read_text()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Dict):
+            pairs = {
+                k.value: v
+                for k, v in zip(node.keys, node.values, strict=True)
+                if isinstance(k, ast.Constant)
+            }
+            data_type = pairs.get("DATA_TYPE")
+            if isinstance(data_type, ast.Constant) and data_type.value == "task":
+                return set(pairs)
+    raise AssertionError("no task document in the SDK's endpoint_manager_task_list fixture")
+
+
+# A logical clock seeded to a real second, the way a consumer comparing
+# against its own ``now`` has to (SPEC: introspection's "seed the clock"
+# advice, which Transfer's timestamps need just as much).
+NOON = dt.datetime(2026, 10, 14, 12, 0, 0, tzinfo=dt.UTC)
+
+
+@pytest.fixture
+def watched(fx):
+    status, doc, _ = fx.post("/_fauxbus/seed", transfer_seed(clock=int(NOON.timestamp())))
+    assert status == 200, doc
+    return fx
+
+
+def test_task_documents_carry_the_recorded_key_set(watched):
+    make_task(watched, status="SUCCEEDED")
+    tc = watcher(watched.base_url)
+    (doc,) = tc.endpoint_manager_task_list(filter_endpoint=LANDING, filter_status="SUCCEEDED")
+    assert set(doc) == recorded_task_keys()
+    assert set(tc.endpoint_manager_get_task(doc["task_id"]).data) == recorded_task_keys()
+
+
+def test_the_consumers_poll_runs_unmodified(watched):
+    """globus_watch's three calls, with its arguments, against a world in motion.
+
+    The window is a datetime pair, which the SDK turns into
+    ``"<start>,<end>"`` with ``isoformat(timespec="seconds")``;
+    filter_status is a tuple, which it comma-joins.  Fauxbus parsing both
+    correctly is what this test proves, because a mismatch in either
+    would return the wrong tasks rather than an error.
+    """
+    before = make_task(watched, status="SUCCEEDED")  # completes at NOON, outside
+    watched.post("/_fauxbus/tick", {"seconds": 3600})
+    done = make_task(watched, files=files(3, size=1000), duration=60)
+    failed = make_task(watched, files=files(5))
+    watched.post(f"/_fauxbus/transfer/tasks/{failed['task_id']}",
+                 {"status": "FAILED", "files_succeeded": 2})
+    running = make_task(watched, duration=10_000)
+    paused = make_task(watched, status="INACTIVE")
+    outbound = make_task(watched, source_endpoint_id=LANDING, destination_endpoint_id=LAPTOP,
+                         status="SUCCEEDED")
+    watched.post("/_fauxbus/tick", {"seconds": 120})  # `done` finishes at +3660
+
+    tc = watcher(watched.base_url)
+    now = NOON + dt.timedelta(seconds=3720)
+    since = NOON + dt.timedelta(minutes=30)
+    terminal = [
+        dict(t)
+        for t in tc.paginated.endpoint_manager_task_list(
+            filter_endpoint=LANDING,
+            filter_endpoint_use="destination",
+            filter_status=("SUCCEEDED", "FAILED"),
+            filter_completion_time=(since, now),
+            query_params={"limit": 1000},
+        ).items()
+    ]
+    active = [
+        dict(t)
+        for t in tc.paginated.endpoint_manager_task_list(
+            filter_endpoint=LANDING,
+            filter_endpoint_use="destination",
+            filter_status=("ACTIVE", "INACTIVE"),
+            query_params={"limit": 1000},
+        ).items()
+    ]
+    assert [t["task_id"] for t in terminal] == [done["task_id"], failed["task_id"]]
+    assert before["task_id"] not in {t["task_id"] for t in terminal}
+    assert outbound["task_id"] not in {t["task_id"] for t in terminal + active}
+    assert {t["task_id"] for t in active} == {running["task_id"], paused["task_id"]}
+
+    # The fields globus_watch._sight reads, parsed the way it parses them.
+    finished = terminal[0]
+    assert dt.datetime.fromisoformat(finished["completion_time"]) == NOON + dt.timedelta(
+        seconds=3660
+    )
+    assert finished["owner_id"] == ALICE
+    assert (finished["files_transferred"], finished["bytes_transferred"]) == (3, 3000)
+    assert finished["faults"] == 0
+
+    rows = [dict(r) for r in tc.paginated.endpoint_manager_task_successful_transfers(
+        done["task_id"]).items()]
+    assert [r["destination_path"] for r in rows] == [
+        "/landing/proj-a/f0000.dat", "/landing/proj-a/f0001.dat", "/landing/proj-a/f0002.dat",
+    ]
+    # The three fields globus_watch._read stores beside the path.
+    assert {(r["size"], r["checksum_algorithm"]) for r in rows} == {(1000, "sha256")}
+    assert rows[0]["checksum"] == f"{0:064x}"
+
+
+def test_last_key_pagination_really_pages_through_the_sdk(watched):
+    made = []
+    for _ in range(5):
+        made.append(make_task(watched, status="SUCCEEDED")["task_id"])
+        watched.post("/_fauxbus/tick", {"seconds": 1})
+    paginator = watcher(watched.base_url).paginated.endpoint_manager_task_list(
+        filter_endpoint=LANDING, filter_status="SUCCEEDED", query_params={"limit": 2}
+    )
+    pages = list(paginator.pages())
+    assert [len(p["DATA"]) for p in pages] == [2, 2, 1]
+    assert [t["task_id"] for p in pages for t in p] == list(reversed(made))
+
+
+def test_next_marker_pagination_really_pages_through_the_sdk(watched):
+    task = make_task(watched, status="SUCCEEDED", files=files(250))
+    paginator = watcher(watched.base_url).paginated.endpoint_manager_task_successful_transfers(
+        task["task_id"]
+    )
+    pages = list(paginator.pages())
+    assert [len(p["DATA"]) for p in pages] == [100, 100, 50]
+    paths = [r["destination_path"] for p in pages for r in p]
+    assert len(set(paths)) == 250
+
+
+def test_permission_denied_parses_like_the_recorded_document(watched):
+    """``.code`` and ``.message`` from Transfer's own dialect.
+
+    The client holds activity_monitor on LAPSED, whose subscription is
+    gone — the roles-go-inactive rule, met through the SDK.
+    """
+    tc = watcher(watched.base_url)
+    with pytest.raises(TransferAPIError) as exc:
+        tc.endpoint_manager_task_list(filter_endpoint=LAPSED, filter_status="SUCCEEDED")
+    assert exc.value.http_status == 403
+    assert exc.value.code == "PermissionDenied"
+    assert "not subscribed" in exc.value.message
+    assert exc.value.raw_json["resource"] == "/v0.10/endpoint_manager/task_list"
+    assert exc.value.request_id == exc.value.raw_json["request_id"]
+
+
+def test_an_unbuilt_transfer_route_is_a_loud_501_through_the_sdk(watched):
+    task = make_task(watched)
+    with pytest.raises(TransferAPIError) as exc:
+        watcher(watched.base_url).endpoint_manager_task_event_list(task["task_id"])
+    assert exc.value.http_status == 501
+    assert exc.value.code == "NOT_IMPLEMENTED"
+    assert "file an issue" in exc.value.message.lower()
+
+
+def test_sdk_retries_through_an_injected_429_on_the_task_list(watched):
+    make_task(watched)
+    watched.post(
+        "/_fauxbus/failures",
+        {
+            "method": "GET",
+            "path": "/v0.10/endpoint_manager/task_list",
+            "status": 429,
+            "headers": {"Retry-After": "0"},
+            "times": 1,
+        },
+    )
+    tasks = list(watcher(watched.base_url).endpoint_manager_task_list(
+        filter_endpoint=LANDING, filter_status="ACTIVE"))
+    assert len(tasks) == 1
+    _, armed, _ = watched.get("/_fauxbus/failures")
+    assert armed["failures"] == []
+
+
+def test_an_injected_failure_reaches_the_consumer_as_a_transfer_error(watched):
+    """Fail on demand, in Transfer's own words, on the file-list call.
+
+    The failure a poller must survive is the one this arms: a task whose
+    successful-transfer list will not read.  The armed body is Transfer's
+    recorded error shape, so the SDK parses it exactly as it would the
+    real thing.
+    """
+    task = make_task(watched, status="SUCCEEDED")
+    path = f"/v0.10/endpoint_manager/task/{task['task_id']}/successful_transfers"
+    watched.post(
+        "/_fauxbus/failures",
+        {
+            "method": "GET",
+            "path": path,
+            "status": 404,
+            "body": {"code": "TaskNotFound", "message": "gone", "request_id": "injected1",
+                     "resource": path},
+            "times": 1,
+        },
+    )
+    tc = watcher(watched.base_url)
+    with pytest.raises(TransferAPIError) as exc:
+        list(tc.paginated.endpoint_manager_task_successful_transfers(task["task_id"]).items())
+    assert (exc.value.http_status, exc.value.code) == (404, "TaskNotFound")
+    # Disarmed after one use: the next poll reads it.
+    rows = list(tc.paginated.endpoint_manager_task_successful_transfers(task["task_id"]).items())
+    assert len(rows) == 2

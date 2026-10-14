@@ -10,10 +10,14 @@ dialect — RFC 6749 §5.2's ``{"error": ..., "error_description": ...}``
 — and Globus really does send that one there.  ``OAuthError`` below
 carries it, and its docstring is the argument for why the two shapes
 have to coexist rather than one being normalized into the other.
+Globus Auth's own resources (userinfo) speak a third, ``AuthServiceError``,
+and the Transfer API a fourth, ``TransferError``.  Each one is recorded
+in the SDK's fixtures; none of them is Fauxbus's invention.
 """
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from . import ISSUES_URL
@@ -200,3 +204,80 @@ def auth_unauthorized() -> AuthServiceError:
 
 def auth_forbidden() -> AuthServiceError:
     return AuthServiceError(403, "FORBIDDEN", "Call must be authenticated", "Unauthorized")
+
+
+class TransferError(ApiError):
+    """Globus Transfer's error document — the fourth dialect, and recorded too.
+
+    Transfer predates the shapes the rest of Globus settled on, and its
+    errors say so.  The SDK's fixtures show one document everywhere it
+    records a Transfer failure (``set_subscription_admin_verified.py``,
+    ``operation_stat.py``, ``submit_transfer.py`` under
+    ``globus_sdk/testing/data/transfer/``, 4.8.1)::
+
+        {"code": "PermissionDenied", "message": "...",
+         "request_id": "BHI2BHt8N", "resource": "/v0.10/..."}
+
+    ``message``, not ``detail`` — GlobusAPIError reads either into
+    ``.message``, so a consumer cannot tell, but a raw-JSON reader can,
+    and the fake says what the service says.  The codes are CamelCase
+    words rather than the SHOUTING_SNAKE the rest of Fauxbus uses for
+    its own errors, because these are Globus's codes and those are not.
+
+    ``resource`` is the request path, ``/v0.10`` and all, exactly as the
+    recordings show it.  World methods do not know the path, so they
+    raise with ``resource=None`` and the Transfer handlers fill it in on
+    the way out (see transfer_api).
+
+    ``request_id`` is nine random-looking characters in every recording.
+    Fauxbus hashes the code and the resource into nine characters
+    instead (principle 3), so the same failure on the same path renders
+    the same bytes on every run — and still *looks* like a request id
+    to a consumer that logs it.
+    """
+
+    def __init__(self, status: int, code: str, message: str, resource: str | None = None) -> None:
+        super().__init__(status, code, message)
+        self.resource = resource
+
+    def body(self) -> dict[str, Any]:
+        resource = self.resource or ""
+        digest = hashlib.sha256(f"{self.code}:{resource}".encode()).digest()
+        # Base62 over the digest, nine characters, the recorded length.
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        n = int.from_bytes(digest, "big")
+        request_id = ""
+        for _ in range(9):
+            n, r = divmod(n, 62)
+            request_id += alphabet[r]
+        return {
+            "code": self.code,
+            "message": self.detail,
+            "request_id": request_id,
+            "resource": resource,
+        }
+
+
+# The four codes the task-monitoring slice can answer with.  The *codes*
+# and statuses are DOCUMENTED — the "Common errors" table of the
+# published reference (docs.globus.org/api/transfer/
+# advanced_collection_management, read 2026-10-14) lists PermissionDenied
+# 403, TaskNotFound 404 and EndpointNotFound 404, and BadRequest 400 is
+# RECORDED in the SDK's own fixtures.  The *messages* are Fauxbus's own:
+# a recording would only replace the sentence, never the shape.
+
+
+def transfer_permission_denied(message: str) -> TransferError:
+    return TransferError(403, "PermissionDenied", message)
+
+
+def task_not_found(task_id: str) -> TransferError:
+    return TransferError(404, "TaskNotFound", f"Task {task_id} not found")
+
+
+def endpoint_not_found(endpoint_id: str) -> TransferError:
+    return TransferError(404, "EndpointNotFound", f"Endpoint {endpoint_id} not found")
+
+
+def transfer_bad_request(message: str) -> TransferError:
+    return TransferError(400, "BadRequest", message)
