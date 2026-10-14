@@ -63,3 +63,30 @@ def test_example_seed_pins_work_on_the_wire(fx):
     # bob rides too — active member, not just present in the file
     _, groups, _ = fx.get("/v2/groups/my_groups", token="t-bob")
     assert [m["role"] for g in groups for m in g["my_memberships"]] == ["member"]
+
+
+def test_example_seed_lets_its_dispatcher_watch_the_landing(fx):
+    # The poller pattern the Transfer slice exists for, from the shipped
+    # file alone: the dispatcher client takes a Transfer token with its
+    # own secret and reads the landing collection as an activity monitor.
+    doc = example_seed()
+    fx.post("/_fauxbus/seed", doc)
+    dispatcher = "00000000-0000-4000-8000-0000000c11e7"
+    status, token, _ = fx.form_post(
+        "/v2/oauth2/token",
+        {"grant_type": "client_credentials",
+         "scope": "urn:globus:auth:scope:transfer.api.globus.org:all"},
+        basic=(dispatcher, doc["clients"][dispatcher]["secret"]),
+    )
+    assert status == 200
+    (landing,) = doc["collections"]
+    status, page, _ = fx.get(
+        f"/v0.10/endpoint_manager/task_list?filter_endpoint={landing}"
+        f"&filter_endpoint_use=destination&filter_status=SUCCEEDED,FAILED",
+        token=token["access_token"],
+    )
+    assert status == 200
+    (task,) = page["DATA"]
+    # The seeded clock is a real 2026 second, so the times read as one.
+    assert task["completion_time"] == "2026-01-01T00:00:00+00:00"
+    assert task["files_transferred"] == 2

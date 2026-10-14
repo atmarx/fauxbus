@@ -50,7 +50,16 @@
       "username": "00000000-0000-4000-8000-0000000c11e7@clients.auth.globus.org"
     }
   },
-  "clock": 0,
+  "clock": 1767225600,
+  "collections": {
+    "00000000-0000-4000-8000-000000001a4d": {
+      "display_name": "Night Owl Landing",
+      "roles": {
+        "00000000-0000-4000-8000-0000000c11e7": "activity_monitor"
+      },
+      "subscription_id": "00000000-0000-4000-8000-0000005ab5c4"
+    }
+  },
   "counters": {
     "group": 1
   },
@@ -119,5 +128,40 @@
   "preferences": {},
   "sessions": {},
   "tokens": {},
+  "transfer_tasks": {
+    "00000000-0000-4000-8000-00000000ba5e": {
+      "active_since": 1767225540,
+      "completion_time": 1767225600,
+      "destination_base_path": "/landing/night-owl/",
+      "destination_endpoint_id": "00000000-0000-4000-8000-000000001a4d",
+      "due_at": null,
+      "fatal_error": null,
+      "faults": 0,
+      "files": [
+        {
+          "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+          "checksum_algorithm": "sha256",
+          "destination_path": "/landing/night-owl/run/a.dat",
+          "size": 1024,
+          "source_path": "/home/alice/run/a.dat"
+        },
+        {
+          "checksum": "1111111111111111111111111111111111111111111111111111111111111111",
+          "checksum_algorithm": "sha256",
+          "destination_path": "/landing/night-owl/run/b.dat",
+          "size": 2048,
+          "source_path": "/home/alice/run/b.dat"
+        }
+      ],
+      "files_done": 2,
+      "label": "night run",
+      "owner_id": "00000000-0000-4000-8000-00000000000a",
+      "owner_string": "alice@example.org",
+      "request_time": 1767225540,
+      "source_base_path": null,
+      "source_endpoint_id": "00000000-0000-4000-8000-00000000e4a1",
+      "status": "SUCCEEDED"
+    }
+  },
   "version": 0
 }
