@@ -1013,7 +1013,9 @@ dialect, because those are the fake speaking about itself.
   `?canonical=true` the document is also pinned as what reset restores —
   the over-HTTP twin of booting with `--seed`, for harnesses that can't
   mount files.  `DELETE /_fauxbus/seed` forgets the pin (the current
-  world is untouched).
+  world is untouched).  A section the running version does not know is
+  a 422 that names it (since v0.2.24); the known sections are exactly
+  the ones `GET /_fauxbus/state` writes.
 - `GET  /_fauxbus/state` — dump everything, for assertions.  Your test
   checks what's *actually in the directory*, not what your code claims it
   did.
@@ -1168,7 +1170,9 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
      OIDC client beside the Keycloak one, plus a headless `UserApp`
      example.  Proof that Fauxbus is a Globus login fake, not a
      Keycloak special case.
-  7. **Release 0.4.0.**
+  7. **Release 0.5.0.**  (0.4.0 went out on 2026-10-14 carrying
+     Transfer task monitoring and step 1, because Root Cellar's dev
+     stack needed the Transfer slice from PyPI.)
 
   Steps 2 and 3 come first among the real work because they are the
   first two refusals a real app hits: most Globus apps are native
@@ -1397,6 +1401,62 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **Package release: fauxbus 0.4.0** (2026-10-14, tag `v0.4.0`) —
+  **Transfer task monitoring reaches consumers**, with the login shim's
+  first step and everything since 0.3.0.  A minor: new imitated surface
+  (the three `endpoint_manager_*` task routes), new control plane
+  (`/_fauxbus/transfer/tasks`, a `tick` that finishes tasks), new seed
+  sections (`collections`, `transfer_tasks`).  Cut now rather than at
+  the end of the login shim (Andrew, 2026-10-14) because Root Cellar's
+  Globus door is built and its dev stack installs Fauxbus only from
+  PyPI; the shim's release becomes 0.5.0.
+
+  **Two behaviours an 0.3.0 consumer could have relied on changed, on
+  purpose.**  `my_groups` with no `statuses` filter now means `active`,
+  as Globus documents, so invitations and removed members no longer
+  show up unasked (v0.2.23).  And a seed carrying a section this
+  version does not know is now a 422 naming it, where it used to be
+  skipped (v0.2.24).
+
+  What a consumer gets, in the order it landed: Transfer task
+  monitoring (v0.2.22); apps pointed at Fauxbus by environment alone,
+  `my_groups` as documented, linked identities in `my_groups` (v0.2.23);
+  loud refusal of unknown seed sections (v0.2.24).
+
+  **Proved by its consumer before the tag existed.**  Root Cellar's
+  Globus road ran end to end on its dev database and iRODS with this
+  Transfer slice from main: through the real globus-sdk into its
+  watcher, its GridFTP-log witness, its fold and its conveyor, with the
+  sender recorded as the one who submitted the task.  Its `my_groups`
+  use (the service identity listing groups it administers) is
+  untouched by the `active` default, and its seed generator writes
+  only sections 0.4.0 knows.
+
+  **Re-pin handshake:** Root Cellar moves `FAUXBUS_VERSION` to `0.4.0`
+  in one commit, with the seed's `collections` and a `clock` set to a
+  real second (a world at clock zero finishes its tasks in 1970, and a
+  poller windowing by wall time finds nothing).  Rebuild with `--pull`.
+  Its own seat carries that.
+
+  **PROVISIONAL inventory: 45 markers**, up from 0.3.0's 31: thirteen
+  from Transfer, one from linked identities, each on the recording
+  list.  The real-Globus leg of the conformance tether is still unrun,
+  and the sharpest gap is Transfer's: the successful-transfers rows a
+  consumer reads `size` and `checksum` from are graded against the
+  published reference, because the SDK's fixture carries neither.
+
+- **v0.2.24** (2026-10-14) — **A seed section this version does not
+  know is refused by name.**  Found while preparing 0.4.0: 0.3.0,
+  handed main's example seed, took its `collections` and
+  `transfer_tasks` sections and dropped them without a word, so a
+  consumer that updated its seed before its pin would have watched
+  every Transfer call 501 with nothing pointing at why.  `World.load`'s
+  own comment promised loud validation; for unknown sections it had
+  never delivered it.  The known set is read off `dump()`, so whatever
+  the world can save it can load, and the list cannot drift.  0.3.0 is
+  burned and keeps the old behaviour; from 0.4.0 on, a seed written for
+  a newer Fauxbus fails at the seed call.  266 tests.
 
 - **v0.2.23** (2026-10-14) — **Login shim, step 1: an app points at
   Fauxbus by environment alone, and `my_groups` stops letting removed

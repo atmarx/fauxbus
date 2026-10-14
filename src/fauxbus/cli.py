@@ -71,8 +71,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "version":
         print(
-            f"fauxbus {__version__} (imitating the globus-sdk {SDK_PIN} GroupsClient "
-            f"and the Auth token, introspection, and OIDC authorization-code surface)"
+            f"fauxbus {__version__} (imitating the globus-sdk {SDK_PIN} GroupsClient, "
+            f"the Auth token, introspection, and OIDC authorization-code surface, "
+            f"and Transfer endpoint_manager task monitoring)"
         )
         return 0
 
