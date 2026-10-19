@@ -168,8 +168,9 @@ directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Building slice A added four more to that list, slice A.2 three more,
 multi-resource-server responses two, slice B five, Transfer task
-monitoring nine, and the login shim's first step one — and it is worth noticing that every one of them is a
-question the audit could not have asked before the code existed:
+monitoring nine, and the login shim's first two steps one each — and it
+is worth noticing that every one of them is a question the audit could
+not have asked before the code existed:
 
 1. **The status for a token presented to the wrong resource server.**
    Fauxbus answers 403 — the token is genuine and introspects fine, it
@@ -302,6 +303,17 @@ question the audit could not have asked before the code existed:
     identity alone, which is the conservative reading — a fake that
     refuses where the real service allows breaks a test loudly, and
     the reverse lets a bug through quietly.
+25. **How Globus treats a native app at the edges.**  The happy path
+    is the SDK's: `client_id` in the body, PKCE S256, the code
+    redeemed.  Four edges are inferred and marked: that every native
+    client may use `{auth}/v2/web/auth-code` without registering it
+    (`World.login_client`; the SDK defaults to it unconditionally);
+    what a native app presenting a secret gets
+    (`World.authenticate_client`); what it gets asking for
+    `client_credentials` (`unauthorized_client`, 400, in `errors.py`);
+    and that it may not introspect (`auth_api.introspect`).  Fauxbus
+    refuses all three where it could have allowed them, for the
+    reason in item 24.
 
 And `identity_set`, already at the top of this list since v0.2.15, now
 has code to point at: its entry shape and its order are two
@@ -758,7 +770,7 @@ always present, `resource_server` flipped to `auth.globus.org` with
 service's scope was named first, since `id_token` is only ever read from
 the top level — and the authorize request's `state` echoed in the body,
 as the SDK's default fixture shows.  A public (native-app) client's
-exchange is a 501: Fauxbus registers confidential clients only.
+exchange was a 501 here; login shim step 2 built it (v0.2.25).
 
 **Signing is RS512 in `signing.py`, stdlib only.**  The zero-dependency
 rule held: the switch from the probe's RS256 was one constant, the
@@ -1141,9 +1153,9 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
      which is the group-gated-login story most consumers want.  Nearly
      free, and it becomes the harness every later step is judged by.
   2. **Native-app (public) clients with PKCE, and the
-     `/v2/web/auth-code` page.**  Today a public client's exchange is a
-     501.  This unlocks `NativeAppAuthClient` and the SDK's `UserApp`,
-     so every CLI and notebook built on globus-sdk.  The SDK sends
+     `/v2/web/auth-code` page.**  *Done in v0.2.25.*  It was a 501.
+     This unlocks `NativeAppAuthClient` and the SDK's `UserApp`, so
+     every CLI and notebook built on globus-sdk.  The SDK sends
      those clients to `{auth}/v2/web/auth-code` to display the code;
      like authorize, that page is a browser surface the SDK cannot
      ground, so it is graded against what the SDK does with it.
@@ -1445,6 +1457,48 @@ a confession, not an infringement: it's *faux*.
   and the sharpest gap is Transfer's: the successful-transfers rows a
   consumer reads `size` and `checksum` from are graded against the
   published reference, because the SDK's fixture carries neither.
+
+- **v0.2.25** (2026-10-19) — **Login shim, step 2: native apps sign
+  in.**  A client seeded `"public_client": true` has no secret, names
+  itself with `client_id` in the form body, and proves the login is its
+  own with PKCE.  `NativeAppAuthClient` and the SDK's `UserApp` now run
+  unmodified against Fauxbus, pointed by environment alone, and both
+  are in the conformance suite.  The field name is Globus's own, from
+  the client documents the SDK records; a confidential client that
+  forgot its secret is still a 422 at the seed door, not a native app
+  by accident.
+
+  **The auth-code page.**  With no redirect URI of its own, the SDK
+  sends a native app's browser to `{auth}/v2/web/auth-code`, and a
+  person copies the code from there.  Fauxbus serves a plain page that
+  shows the code (or the error), escapes everything on it, and says it
+  is not Globus.  Every public client may use it without registering
+  it, matched exactly against the *issuer*, because the browser has to
+  reach it.  Tests read the code off the redirect's `Location`, never
+  off the page.
+
+  **What a native app may not do,** each refused with the reason in the
+  error: redeem a code issued without a PKCE challenge (authorize won't
+  issue one; a seeded one is refused at the exchange), ask for
+  `client_credentials` (`unauthorized_client`), present a secret, or
+  introspect.  It may revoke its own tokens by `client_id` alone, as
+  RFC 7009 allows and the SDK's native client does — a CLI's logout.
+  The one change an existing consumer could hit: a confidential client
+  sending `client_id` without its secret was a 501 and is now
+  `invalid_client`.
+
+  **One shape change in dumps:** every client now carries
+  `public_client`, `false` for the confidential ones.  Seeds without it
+  load as before; a consumer that byte-compares its seed to Fauxbus's
+  dump (as `examples/seed.json` does) gains one line per client.  The
+  page renderer moved from the account picker to `server.html_page`,
+  so both pages share one footer that says whose they are not.
+
+  279 tests, up from 266; 39 through the real globus-sdk, up from 37.
+
+  **PROVISIONAL inventory: 49 markers**, up four from 45, **one new
+  obligation** (recording list 25, how Globus treats a native app at
+  the edges).
 
 - **v0.2.24** (2026-10-14) — **A seed section this version does not
   know is refused by name.**  Found while preparing 0.4.0: 0.3.0,

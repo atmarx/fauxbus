@@ -92,9 +92,30 @@ export GLOBUS_SDK_SERVICE_URL_TRANSFER=http://localhost:9800/
 
 All three are the bare root, Groups included: the SDK's own paths
 already start with `/v2/`.  In a pytest suite, `monkeypatch.setenv` does
-the same per test.  This covers `ConfidentialAppAuthClient` login flows
-and the SDK's `ClientApp`, which fetches its own tokens; the conformance
-suite runs both this way.  (`UserApp` and native-app clients are next.)
+the same per test.  This covers `ConfidentialAppAuthClient` login flows,
+native apps (`NativeAppAuthClient`, and the SDK's `UserApp`), and the
+SDK's `ClientApp`, which fetches its own tokens; the conformance suite
+runs all of them this way.
+
+A native app is a client with no secret.  Seed it as one:
+
+```json
+"clients": {
+  "00000000-0000-4000-8000-0000000a7170": {"public_client": true, "name": "My CLI"}
+}
+```
+
+It proves its login with PKCE, which the SDK does for you, and with no
+redirect URI of its own the SDK sends the browser to
+`/v2/web/auth-code` on the auth service, where a person would copy the
+code.  Fauxbus serves that page and allows it for every native client,
+matched against the issuer, so point `GLOBUS_SDK_SERVICE_URL_AUTH` at
+the same name you gave `--issuer`.  A test never needs the page: the
+code is already in the `Location` header of the redirect that leads to
+it.  For `UserApp`, subclass the SDK's `CommandLineLoginFlowManager`
+and override `print_authorize_url` and `prompt_for_code` to walk that
+redirect instead of a terminal — the conformance suite's
+`test_the_sdks_user_app_runs_unmodified` is a working copy.
 
 Then drive the person from the test.  Seed accounts and a login client
 (see "Brokered login" below).  `POST /_fauxbus/auth/session` signs a
