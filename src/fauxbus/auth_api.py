@@ -44,6 +44,7 @@ from .errors import (
     invalid_client,
     invalid_request,
     not_implemented,
+    unauthorized_client,
     unsupported_grant_type,
 )
 from .oidc_api import require_issuer
@@ -80,7 +81,8 @@ def _authenticate_client(ctx: Ctx, form: dict[str, str]) -> OAuthClient:
 
     RFC 6749 §2.3.1 allows a confidential client to present its
     credentials two ways, and Fauxbus accepts both because its two known
-    consumers split across them:
+    consumers split across them — plus the third way, which is no
+    credential at all:
 
     - **HTTP Basic** — what globus-sdk sends (``ConfidentialAppAuthClient``
       installs a ``BasicAuthorizer``), and what the RFC prefers.
@@ -88,6 +90,8 @@ def _authenticate_client(ctx: Ctx, form: dict[str, str]) -> OAuthClient:
       brokers commonly send (Keycloak calls it ``client_secret_post``),
       which matters because a broker is exactly the consumer Slice B is
       being built for.
+    - **``client_id`` alone** in the form — a public client (RFC 6749
+      §2.3), which has no secret to present.  Login shim step 2.
 
     The RFC says a client MUST NOT use more than one method at once, and
     the reason is not pedantry: if the two disagree, the server has to
@@ -105,23 +109,18 @@ def _authenticate_client(ctx: Ctx, form: dict[str, str]) -> OAuthClient:
         client_id, secret = basic
     elif in_body:
         client_id, secret = form.get("client_id", ""), form.get("client_secret", "")
-        if client_id and not secret and form.get("grant_type") == "authorization_code":
-            # A client_id with no secret on a code exchange is not a
-            # malformed request — it is how a *public* client (a native
-            # app; globus-sdk's NativeAppAuthClient) authenticates, with
-            # PKCE standing in for the secret.  Globus supports those.
-            # Fauxbus registers confidential clients only, so this is our
-            # gap, and calling it invalid_request would blame the caller.
-            raise not_implemented(
-                "this looks like a public (native app) client exchanging a code with no "
-                "secret. Fauxbus registers confidential clients only. Real client code "
-                "needs a native app flow?"
-            )
-        if not client_id or not secret:
+        if not client_id:
             raise invalid_request(
-                "in-body client authentication requires both 'client_id' and "
-                "'client_secret'."
+                "in-body client authentication requires 'client_id' (and 'client_secret', "
+                "unless the client is a public native app)."
             )
+        if not secret:
+            # A client_id with no secret is not a malformed request — it
+            # is how a *public* client (a native app; globus-sdk's
+            # NativeAppAuthClient) identifies itself, with PKCE standing
+            # in for the secret it cannot keep.  Whether this client may
+            # do that is the registry's call, not the wire's.
+            return ctx.world.identify_public_client(client_id)
     else:
         raise invalid_client(
             "no client credentials. Send an Authorization: Basic header (what globus-sdk "
@@ -189,6 +188,16 @@ def token(ctx: Ctx) -> tuple[int, Any]:
     form = _require_form(ctx)
     client = _authenticate_client(ctx, form)
     grant_type = _require_grant(form)
+    if client.public_client and grant_type != "authorization_code":
+        # RFC 6749 §4.4: the client-credentials grant is for confidential
+        # clients only, and the reason is in the name — a client with no
+        # credential cannot be granted a token on the strength of it.  A
+        # native app acts for a person, so its every token starts with a
+        # person signing in.
+        raise unauthorized_client(
+            f"client {client.client_id!r} is a public (native app) client; it gets tokens "
+            f"by the authorization-code grant with PKCE, never by grant_type={grant_type!r}."
+        )
     if grant_type == "authorization_code":
         return _authorization_code(ctx, client, form)
     return _client_credentials(ctx, client, form, grant_type)
@@ -375,7 +384,17 @@ def introspect(ctx: Ctx) -> tuple[int, Any]:
     for, and this is the endpoint that makes the difference show.
     """
     form = _require_form(ctx)
-    _authenticate_client(ctx, form)
+    if _authenticate_client(ctx, form).public_client:
+        # Introspection answers a resource server, and a resource server
+        # is a service with a secret; globus-sdk gives NativeAppAuthClient
+        # no introspect method at all.  An endpoint that would tell any
+        # installed copy of an app about any token it found is one RFC
+        # 7662 §2.1 asks servers to close.  PROVISIONAL as to the real
+        # error, which is unrecorded.
+        raise invalid_client(
+            "a public (native app) client cannot introspect tokens; introspection is for "
+            "resource servers, which authenticate with a secret."
+        )
     token = _require_token_field(form)
     if form.get("include"):
         # ``include=identity_set`` asks for the token subject's linked
@@ -402,6 +421,11 @@ def revoke(ctx: Ctx) -> tuple[int, Any]:
     false}``, and the same document comes back whether anything was
     revoked or not — see ``World.revoke`` for why "nothing happened" and
     "it's gone" deliberately look identical from out here.
+
+    Public clients are welcome here, unlike next door: RFC 7009 §2.1
+    lets a client that cannot authenticate revoke by naming itself, and
+    globus-sdk's native client sends exactly that — ``client_id`` in the
+    body, no header.  A CLI's ``logout`` is this call.
     """
     form = _require_form(ctx)
     client = _authenticate_client(ctx, form)

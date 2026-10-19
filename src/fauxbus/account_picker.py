@@ -29,7 +29,7 @@ from typing import Any
 
 from .errors import ApiError, validation_error
 from .oidc_api import SESSION_COOKIE, code_redirect
-from .server import Ctx, FauxbusServer, Raw
+from .server import FAKE_NOTE, Ctx, FauxbusServer, Raw, html_page
 from .world import AuthorizationRequest, RequiredIdpUnsatisfied, Session
 
 LOGIN_PATH = "/_fauxbus/auth/login"
@@ -50,19 +50,15 @@ def session_cookie(session: Session) -> str:
     return f"{SESSION_COOKIE}={session.id}; Path=/; HttpOnly; SameSite=Lax"
 
 
+# The picker's footer says more than the shared one: it is the page a
+# person might otherwise type a password into.
+PICKER_NOTE = (
+    f"{FAKE_NOTE} Nothing here checks a password, and no account on this page is real."
+)
+
+
 def _page(status: int, title: str, body: str) -> tuple[int, Raw]:
-    html = (
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>{escape(title)} — Fauxbus</title>"
-        "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;"
-        "padding:0 1rem}form{margin:.75rem 0}button{font:inherit;padding:.5rem 1rem;"
-        "cursor:pointer}.note{color:#666;font-size:.9em}.no{color:#a33}</style></head><body>"
-        f"<h1>{escape(title)}</h1>{body}"
-        "<p class=\"note\">Fauxbus is a test fake, not Globus. Nothing here checks a "
-        "password, and no account on this page is real.</p></body></html>\n"
-    )
-    return status, Raw(html.encode("utf-8"), "text/html; charset=utf-8")
+    return html_page(status, title, body, PICKER_NOTE)
 
 
 def _pending(ctx: Ctx, request_id: str | None) -> AuthorizationRequest:

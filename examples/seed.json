@@ -35,6 +35,7 @@
   "clients": {
     "00000000-0000-4000-8000-00000000c0de": {
       "name": "Night Owl web login",
+      "public_client": false,
       "redirect_uris": [
         "http://localhost:8080/realms/nightowl/broker/fauxbus/endpoint"
       ],
@@ -44,6 +45,7 @@
     },
     "00000000-0000-4000-8000-0000000c11e7": {
       "name": "Night Owl dispatcher",
+      "public_client": false,
       "redirect_uris": [],
       "required_idp": null,
       "secret": "dispatcher-secret-not-a-real-one",

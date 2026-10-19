@@ -18,6 +18,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from typing import Any
@@ -86,6 +87,33 @@ def redirect(location: str, headers: dict[str, str] | None = None) -> tuple[int,
     example uses and what every OAuth client is written to follow.
     """
     return 302, Raw(), {"Location": location, **(headers or {})}
+
+
+# Said at the foot of every page Fauxbus renders.  The imitated pages
+# stand where Globus's own would, so each one says plainly whose it is
+# not: a page that could pass for Globus's is the one thing a fake of a
+# login service must never be.
+FAKE_NOTE = "Fauxbus is a test fake, not Globus."
+
+
+def html_page(status: int, title: str, body: str, note: str = FAKE_NOTE) -> tuple[int, Raw]:
+    """One plain page, shared by the account picker and the auth-code page.
+
+    ``title`` is escaped here; ``body`` is HTML the caller has already
+    escaped, because only the caller knows which parts are markup.
+    """
+    html = (
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{escape(title)} — Fauxbus</title>"
+        "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;"
+        "padding:0 1rem}form{margin:.75rem 0}button{font:inherit;padding:.5rem 1rem;"
+        "cursor:pointer}.note{color:#666;font-size:.9em}.no{color:#a33}"
+        "code{font-size:1.1em;word-break:break-all}</style></head><body>"
+        f"<h1>{escape(title)}</h1>{body}"
+        f"<p class=\"note\">{escape(note)}</p></body></html>\n"
+    )
+    return status, Raw(html.encode("utf-8"), "text/html; charset=utf-8")
 
 
 Handler = Callable[[Ctx], tuple[int, Any] | tuple[int, Any, dict[str, str]]]

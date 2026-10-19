@@ -39,6 +39,7 @@ from conftest import (
     LOGIN_CLIENT,
     LOGIN_REDIRECT,
     LOGIN_SECRET,
+    NATIVE_CLIENT,
     Client,
     oidc_seed,
 )
@@ -462,7 +463,14 @@ def test_a_verifier_for_a_code_with_no_challenge_is_refused(oidc):
     assert exchange(oidc, code, code_verifier="v" * 50)[1]["error"] == "invalid_grant"
 
 
-def test_a_public_client_exchange_is_fauxbus_gap(oidc):
+def test_a_confidential_client_cannot_pass_as_public(oidc):
+    """Leaving the secret off does not turn a confidential client into a native app.
+
+    This was a 501 until login shim step 2.  Now public clients exist,
+    and the danger is the other way round: a request with only
+    ``client_id`` must not mint tokens for a client whose one real
+    credential was never shown.
+    """
     code, _, _ = login(oidc)
     status, doc, _ = oidc.form_post(
         TOKEN,
@@ -471,10 +479,212 @@ def test_a_public_client_exchange_is_fauxbus_gap(oidc):
             "code": code,
             "redirect_uri": LOGIN_REDIRECT,
             "client_id": LOGIN_CLIENT,
-            "code_verifier": "v" * 50,
         },
     )
-    assert status == 501
+    assert status == 401 and doc["error"] == "invalid_client"
+    assert "confidential" in doc["error_description"]
+    assert exchange(oidc, code)[0] == 200  # the refusal did not spend the code
+
+
+# ------------------------------------------- login shim step 2: native apps
+#
+# A public client has no secret.  It identifies itself with ``client_id``
+# in the form body, proves it is finishing its own login with PKCE, and
+# — unless it names a redirect of its own — lands the browser on the
+# issuer's ``/v2/web/auth-code`` page.  test_sdk_conformance.py drives
+# the same flow through NativeAppAuthClient and UserApp.
+
+VERIFIER = "native-verifier-" + "v" * 40
+
+
+def auth_code_page(fx: Client) -> str:
+    return fx.base_url + "/v2/web/auth-code"
+
+
+def native_login(fx: Client, account: str = ALICE_GLOBUSID, **extra: str) -> dict[str, str]:
+    """The browser leg for the native client; returns the auth-code page's query."""
+    kw = {
+        "client": NATIVE_CLIENT,
+        "redirect_uri": auth_code_page(fx),
+        "nonce": None,
+        "code_challenge": s256(VERIFIER),
+        "code_challenge_method": "S256",
+        **extra,
+    }
+    status, headers, _ = fx.browse(authorize_path(**kw))
+    assert status == 302, headers
+    status, headers, _ = pick(fx, headers["Location"], account)
+    assert status == 302, headers
+    assert headers["Location"].startswith(auth_code_page(fx) + "?")
+    return query_of(headers["Location"])
+
+
+def native_exchange(fx: Client, code: str, **extra: str) -> tuple[int, Any]:
+    fields = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": auth_code_page(fx),
+        "client_id": NATIVE_CLIENT,
+        "code_verifier": VERIFIER,
+        **extra,
+    }
+    status, doc, _ = fx.form_post(TOKEN, fields)
+    return status, doc
+
+
+def test_a_native_app_signs_in_with_pkce_and_no_secret(oidc):
+    callback = native_login(oidc, scope=f"openid {GROUPS_SCOPE}")
+    assert callback["state"] == "st-1"
+    status, doc = native_exchange(oidc, callback["code"])
+    assert status == 200, doc
+    assert doc["resource_server"] == "auth.globus.org"
+    assert claims_of(doc["id_token"])["aud"] == NATIVE_CLIENT
+    # The Groups token acts as the person, exactly as a confidential
+    # client's would: who the client is changes how it proves itself,
+    # never whose token it gets.
+    (groups,) = doc["other_tokens"]
+    status, created, _ = oidc.post(
+        "/v2/groups", {"name": "From the CLI"}, token=groups["access_token"]
+    )
+    assert status == 200
+    assert created["my_memberships"][0]["identity_id"] == ALICE_GLOBUSID
+
+
+def test_the_auth_code_page_shows_the_code_and_escapes_everything(oidc):
+    callback = native_login(oidc, state="<script>alert(1)</script>")
+    status, headers, page = oidc.browse(
+        "/v2/web/auth-code?" + urlencode({"code": callback["code"], "state": callback["state"]})
+    )
+    assert status == 200 and headers["Content-Type"].startswith("text/html")
+    assert f'<code id="auth-code">{callback["code"]}</code>'.encode() in page
+    assert b"<script>" not in page and b"&lt;script&gt;" in page
+    assert b"not Globus" in page  # the page says whose it is not
+
+    status, _, page = oidc.browse("/v2/web/auth-code?error=invalid_request&error_description=%3Cb%3E")
+    assert status == 200 and b"invalid_request" in page and b"<b>" not in page
+
+
+def test_a_native_app_without_pkce_is_sent_back_with_an_error(oidc):
+    status, headers, _ = oidc.browse(
+        authorize_path(client=NATIVE_CLIENT, redirect_uri=auth_code_page(oidc))
+    )
+    assert status == 302
+    callback = query_of(headers["Location"])
+    assert headers["Location"].startswith(auth_code_page(oidc) + "?")
+    assert callback["error"] == "invalid_request" and "PKCE" in callback["error_description"]
+    _, state, _ = oidc.get("/_fauxbus/state")
+    assert state["authorization_requests"] == {}  # nothing parked for a code nobody could redeem
+
+
+def test_a_native_app_needs_its_verifier(oidc):
+    code = native_login(oidc)["code"]
+    status, doc = native_exchange(oidc, code, code_verifier="w" * 50)
+    assert status == 401 and doc["error"] == "invalid_grant"
+    status, doc, _ = oidc.form_post(
+        TOKEN,
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": auth_code_page(oidc),
+            "client_id": NATIVE_CLIENT,
+        },
+    )
+    assert status == 401 and doc["error"] == "invalid_grant"
+    assert native_exchange(oidc, code)[0] == 200
+
+
+def test_a_public_client_cannot_redeem_a_code_with_no_challenge(oidc):
+    """authorize never issues one, so the only way in is a seed — refused there too."""
+    code = native_login(oidc)["code"]
+    _, state, _ = oidc.get("/_fauxbus/state")
+    state["authorization_codes"][code]["code_challenge"] = None
+    assert oidc.post("/_fauxbus/seed", state)[0] == 200
+    status, doc = native_exchange(oidc, code, code_verifier="")
+    assert status == 401 and doc["error"] == "invalid_grant"
+    assert "PKCE" in doc["error_description"]
+
+
+def test_the_auth_code_page_is_a_native_apps_privilege_and_the_issuers_name(oidc):
+    # A confidential client must register its redirects; the page is not free for it.
+    status, headers, _ = oidc.browse(
+        authorize_path(
+            redirect_uri=auth_code_page(oidc),
+            code_challenge=s256(VERIFIER),
+            code_challenge_method="S256",
+        )
+    )
+    assert status == 400 and "Location" not in headers
+    # And a native app reaching Fauxbus by another name does not match:
+    # the page belongs to the issuer, the name the browser uses.
+    elsewhere = auth_code_page(oidc).replace("127.0.0.1", "localhost")
+    status, headers, _ = oidc.browse(
+        authorize_path(
+            client=NATIVE_CLIENT,
+            redirect_uri=elsewhere,
+            code_challenge=s256(VERIFIER),
+            code_challenge_method="S256",
+        )
+    )
+    assert status == 400 and "Location" not in headers
+
+
+def test_a_native_app_never_gets_client_credentials(oidc):
+    status, doc, _ = oidc.form_post(
+        TOKEN, {"grant_type": "client_credentials", "scope": GROUPS_SCOPE, "client_id": NATIVE_CLIENT}
+    )
+    assert status == 400 and doc["error"] == "unauthorized_client"
+
+
+def test_a_native_app_presenting_a_secret_is_refused(oidc):
+    code = native_login(oidc)["code"]
+    status, doc = native_exchange(oidc, code, client_secret="made-up")
+    assert status == 401 and doc["error"] == "invalid_client"
+    assert native_exchange(oidc, code)[0] == 200
+
+
+def test_a_native_app_may_revoke_but_not_introspect(oidc):
+    """RFC 7009 lets a public client revoke its own tokens; introspection is a resource server's."""
+    _, doc = native_exchange(oidc, native_login(oidc)["code"])
+    access = doc["access_token"]
+    status, refusal, _ = oidc.form_post(
+        "/v2/oauth2/token/introspect", {"token": access, "client_id": NATIVE_CLIENT}
+    )
+    assert status == 401 and refusal["error"] == "invalid_client"
+
+    status, body, _ = oidc.form_post(
+        "/v2/oauth2/token/revoke", {"token": access, "client_id": NATIVE_CLIENT}
+    )
+    assert status == 200 and body == {"active": False}
+    status, info, _ = oidc.form_post(
+        "/v2/oauth2/token/introspect", {"token": access}, basic=(CLIENT_ID, CLIENT_SECRET)
+    )
+    assert info["active"] is False
+
+
+def test_a_public_client_is_seeded_without_a_secret_or_not_at_all(fx):
+    seed = oidc_seed(fx.base_url)
+    seed["clients"][NATIVE_CLIENT]["secret"] = "a native app cannot keep this"
+    status, doc, _ = fx.post("/_fauxbus/seed", seed)
+    assert status == 422 and "may not have a 'secret'" in doc["detail"]
+
+    seed["clients"][NATIVE_CLIENT] = {"public_client": "yes"}
+    assert fx.post("/_fauxbus/seed", seed)[0] == 422
+
+    # A confidential client that forgot its secret is an error, not a
+    # native app by accident — and the error says how to ask for one.
+    seed["clients"][NATIVE_CLIENT] = {"name": "Forgot the secret"}
+    status, doc, _ = fx.post("/_fauxbus/seed", seed)
+    assert status == 422 and "public_client" in doc["detail"]
+
+
+def test_a_public_client_round_trips(oidc):
+    _, state, _ = oidc.get("/_fauxbus/state")
+    assert state["clients"][NATIVE_CLIENT]["public_client"] is True
+    assert state["clients"][NATIVE_CLIENT]["secret"] is None
+    assert state["clients"][LOGIN_CLIENT]["public_client"] is False
+    oidc.post("/_fauxbus/reset", {"to": "empty"})
+    oidc.post("/_fauxbus/seed", state)
+    assert oidc.get("/_fauxbus/state")[1] == state
 
 
 # ------------------------------------------------------------------ id token

@@ -1,4 +1,5 @@
-"""The imitated surface, OIDC half: discovery, keys, authorize, userinfo.
+"""The imitated surface, OIDC half: discovery, keys, authorize, userinfo,
+and the auth-code page a native app's login ends on.
 
 Auth slice B.  ``auth_api.py`` holds the token endpoint, where both
 grants are redeemed; this file holds everything a browser login touches
@@ -26,6 +27,7 @@ session cookie.
 
 from __future__ import annotations
 
+from html import escape
 from http.cookies import CookieError, SimpleCookie
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -33,7 +35,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from . import signing
 from .auth import OFFLINE_ACCESS_TYPE, REFRESH_SCOPE, parse_bearer, split_scopes
 from .errors import ApiError, not_implemented
-from .server import Ctx, FauxbusServer, redirect
+from .server import Ctx, FauxbusServer, html_page, redirect
 from .world import AuthorizationCode, AuthorizationRequest, RequiredIdpUnsatisfied, Session
 
 DISCOVERY_PATH = "/.well-known/openid-configuration"
@@ -44,6 +46,10 @@ DISCOVERY_PATH = "/.well-known/openid-configuration"
 # the case slice B exists for.
 JWKS_PATH = "/jwk.json"
 AUTHORIZE_PATH = "/v2/oauth2/authorize"
+# Where globus-sdk sends a native app's browser when the app has no
+# redirect URI of its own: ``slash_join(base_url, "/v2/web/auth-code")``
+# in NativeAppAuthClient's flow manager, 4.8.1.  See ``auth_code_page``.
+AUTH_CODE_PAGE_PATH = "/v2/web/auth-code"
 USERINFO_PATH = "/v2/oauth2/userinfo"
 
 # The Fauxbus-only session cookie the account picker sets.  The name says
@@ -216,8 +222,12 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
     # The code flow needs an issuer at the far end (the token endpoint
     # signs with it), so say so at the near end rather than after a
     # person has clicked through the picker.
-    require_issuer(ctx)
-    client = ctx.world.login_client(query.get("client_id", ""), query.get("redirect_uri", ""))
+    issuer = require_issuer(ctx)
+    client = ctx.world.login_client(
+        query.get("client_id", ""),
+        query.get("redirect_uri", ""),
+        auth_code_page=issuer.rstrip("/") + AUTH_CODE_PAGE_PATH,
+    )
     redirect_uri = query["redirect_uri"]
     state = query.get("state")
 
@@ -275,6 +285,18 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
         # RFC 7636 §4.2: an S256 challenge is BASE64URL(SHA256(...)),
         # which is always exactly 43 characters.
         return refuse("invalid_request", "an S256 code_challenge is 43 base64url characters.")
+    if client.public_client and challenge is None:
+        # RFC 8252 §6: a native app MUST use PKCE, because with no secret
+        # the challenge is all that keeps an intercepted code from being
+        # redeemed by whoever intercepted it.  Refused here, before a
+        # person clicks through the picker for a code nobody could
+        # safely redeem.  globus-sdk always sends one; this is for the
+        # hand-rolled client that forgot.
+        return refuse(
+            "invalid_request",
+            "a public (native app) client must send a PKCE code_challenge "
+            "(code_challenge_method=S256).",
+        )
     # Every scope must parse before anything is parked — the same
     # all-or-nothing rule as the token endpoint, and the same 501 for a
     # scope form Fauxbus cannot attribute to a service.
@@ -303,6 +325,57 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
     return picker_redirect(request)
 
 
+def auth_code_page(ctx: Ctx) -> tuple[int, Any]:
+    """``GET /v2/web/auth-code`` — the page that shows a person their code.
+
+    A native app has no web server to come back to, so when it names no
+    redirect URI of its own the SDK sends the browser here, and the
+    person copies the code off the page and pastes it into the app's
+    prompt (``CommandLineLoginFlowManager.prompt_for_code``).  On the
+    real service this is a page in Globus's web app.  Its markup is not
+    a contract anyone can hold Fauxbus to — the SDK never fetches it,
+    only names it — so it is graded by what the SDK *does* with it:
+    nothing, beyond putting it in ``redirect_uri``.  What matters is
+    that the URI exists, is allowed, and a person who lands on it can
+    read the code.
+
+    A test should never scrape this page.  The code is already in the
+    ``Location`` header of the redirect that points here, which is where
+    ``fauxbus.testing`` (step 4) will read it, and where a test driving
+    the browser leg by hand reads it today.
+
+    Errors arrive here too — authorize reports a client's mistake to the
+    client's redirect URI, and for a native app this is that URI — so
+    the page shows ``error`` and ``error_description`` instead of a
+    code when they are present.  Everything shown is escaped: every
+    value on this page came in on a query string anyone can write.
+    """
+    query = ctx.query
+    state = query.get("state")
+    tail = (
+        f"<p class=\"note\">State: <code>{escape(state)}</code></p>" if state is not None else ""
+    )
+    if "error" in query:
+        body = (
+            f"<p class=\"no\">The login did not finish: <code>{escape(query['error'])}</code></p>"
+            f"<p>{escape(query.get('error_description', ''))}</p>"
+        )
+        return html_page(200, "Login failed", body + tail)
+    code = query.get("code")
+    if not code:
+        return html_page(
+            200,
+            "No authorization code",
+            "<p>This page shows a native app's authorization code after a login, and "
+            "nothing was passed to it. Start the login again from the app.</p>",
+        )
+    body = (
+        "<p>Copy this code into the application that asked you to sign in:</p>"
+        f"<p><code id=\"auth-code\">{escape(code)}</code></p>"
+    )
+    return html_page(200, "Native App Authorization Code", body + tail)
+
+
 def userinfo(ctx: Ctx) -> tuple[int, Any]:
     """``GET``/``POST /v2/oauth2/userinfo`` — the ID token's claims, asked for live.
 
@@ -326,5 +399,8 @@ def register(server: FauxbusServer) -> None:
     server.add_route("GET", DISCOVERY_PATH, discovery, auth=False)
     server.add_route("GET", JWKS_PATH, jwks, auth=False)
     server.add_route("GET", AUTHORIZE_PATH, authorize, auth=False)
+    # A browser page with no credential in sight: the code on its query
+    # string is the thing being delivered, not a key to the page.
+    server.add_route("GET", AUTH_CODE_PAGE_PATH, auth_code_page, auth=False)
     server.add_route("GET", USERINFO_PATH, userinfo, auth=False)
     server.add_route("POST", USERINFO_PATH, userinfo, auth=False)

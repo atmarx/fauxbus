@@ -43,6 +43,7 @@ from conftest import (  # noqa: E402
     LOGIN_CLIENT,
     LOGIN_REDIRECT,
     LOGIN_SECRET,
+    NATIVE_CLIENT,
     TRANSFER_SCOPE,
     files,
     make_task,
@@ -62,9 +63,12 @@ from globus_sdk import (  # noqa: E402
     GroupsAPIError,
     GroupsClient,
     GroupsManager,
+    NativeAppAuthClient,
     TransferAPIError,
     TransferClient,
+    UserApp,
 )
+from globus_sdk.login_flows import CommandLineLoginFlowManager  # noqa: E402
 
 from fauxbus import signing  # noqa: E402
 from fauxbus.ids import identity_id_for_token  # noqa: E402
@@ -919,3 +923,81 @@ def test_the_sdks_own_client_app_runs_unmodified(pointed):
         "groups.api.globus.org",
         "transfer.api.globus.org",
     ]
+
+
+# ------------------------------------- login shim step 2: native-app clients
+#
+# Most apps built on Globus login are native apps: CLIs and notebooks
+# that cannot keep a secret.  They identify themselves by client id
+# alone, prove the login is theirs with PKCE, and with no redirect URI
+# of their own send the browser to the auth service's ``/v2/web/auth-code``
+# page, where a person copies the code back into the app.  Every app
+# here is unmodified SDK code, pointed at Fauxbus by environment only.
+
+
+def test_the_sdks_native_app_flow_runs_unmodified(pointed):
+    """``NativeAppAuthClient``: client id, PKCE, the auth-code page, no secret anywhere.
+
+    The browser leg reads the code off the redirect's ``Location`` —
+    the page itself is for a person, and a test has no business
+    scraping it.  The app then revokes its token the way a CLI's logout
+    does: by client id alone, which RFC 7009 permits a public client.
+    """
+    pointed.post(
+        "/_fauxbus/seed",
+        oidc_seed(pointed.base_url, oidc={"issuer": pointed.base_url, "signed_token_clock": "wall"}),
+    )
+    app = NativeAppAuthClient(NATIVE_CLIENT)
+    app.oauth2_start_flow(f"openid profile {GROUPS_SCOPE}")
+    url = app.oauth2_get_authorize_url()
+    # The SDK chose the redirect, from the environment's base URL.
+    redirect_uri = parse_qs(urlsplit(url).query)["redirect_uri"][0]
+    assert redirect_uri == pointed.base_url + "/v2/web/auth-code"
+
+    tokens = app.oauth2_exchange_code_for_tokens(browser_login(pointed, url))
+    claims = tokens.decode_id_token()
+    assert claims["sub"] == ALICE_GLOBUSID and claims["aud"] == NATIVE_CLIENT
+    created = groups_as(tokens).create_group({"name": "Made from a CLI", "description": ""})
+    assert created["my_memberships"][0]["identity_id"] == ALICE_GLOBUSID
+
+    access = tokens.by_resource_server["groups.api.globus.org"]["access_token"]
+    app.oauth2_revoke_token(access)
+    assert confidential_client(pointed.base_url).oauth2_token_introspect(access)["active"] is False
+
+
+def test_the_sdks_user_app_runs_unmodified(pointed):
+    """``UserApp``, the SDK's 4.x shape for an app a person runs, logs in through Fauxbus.
+
+    The one thing replaced is the person at the terminal.  The SDK's own
+    ``CommandLineLoginFlowManager`` prints a URL and reads a code from
+    stdin; this subclass hands the URL to the browser leg and returns the
+    code it comes back with.  Everything else — scope resolution, PKCE,
+    the exchange, the ID-token check that pins the app to one identity,
+    the Groups call — is the SDK's, and runs as shipped.
+    """
+    pointed.post(
+        "/_fauxbus/seed",
+        oidc_seed(pointed.base_url, oidc={"issuer": pointed.base_url, "signed_token_clock": "wall"}),
+    )
+
+    class BrowserInTheTest(CommandLineLoginFlowManager):
+        def print_authorize_url(self, authorize_url: str) -> None:
+            self.authorize_url = authorize_url
+
+        def prompt_for_code(self) -> str:
+            return browser_login(pointed, self.authorize_url)
+
+    app = UserApp(
+        "fauxbus-conformance",
+        client_id=NATIVE_CLIENT,
+        config=GlobusAppConfig(token_storage="memory", login_flow_manager=BrowserInTheTest),
+    )
+    gid = GroupsClient(app=app).create_group({"name": "UserApp's group", "description": ""})["id"]
+    assert gid in {g["id"] for g in GroupsClient(app=app).get_my_groups()}
+
+    # One login served both calls, and its tokens are alice's, minted for
+    # the native client — not for any confidential stand-in.
+    _, state, _ = pointed.get("/_fauxbus/state")
+    issued = list(state["tokens"].values())
+    assert {t["client_id"] for t in issued} == {NATIVE_CLIENT}
+    assert len(state["authorization_codes"]) == 1

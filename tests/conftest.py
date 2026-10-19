@@ -62,6 +62,9 @@ LOGIN_REDIRECT = "https://app.example.org/callback"
 CAMPUS_CLIENT = "00000000-0000-4000-8000-0000000ca305"
 CAMPUS_SECRET = "campus-secret-not-a-real-one"
 CAMPUS_REDIRECT = "https://campus.example.edu/broker/fauxbus/endpoint"
+# A public client — a native app, globus-sdk's NativeAppAuthClient.  No
+# secret and no redirect URIs: it rides the issuer's own auth-code page.
+NATIVE_CLIENT = "00000000-0000-4000-8000-0000000a7170"
 
 
 def oidc_seed(issuer: str, **extra: Any) -> dict[str, Any]:
@@ -122,6 +125,7 @@ def oidc_seed(issuer: str, **extra: Any) -> dict[str, Any]:
                 "redirect_uris": [CAMPUS_REDIRECT],
                 "required_idp": UNIVERSITY_IDP,
             },
+            NATIVE_CLIENT: {"public_client": True, "name": "Example CLI"},
         },
     }
     doc.update(extra)

@@ -150,6 +150,13 @@ def unsupported_grant_type(detail: str) -> OAuthError:
     return OAuthError(400, "unsupported_grant_type", detail)
 
 
+def unauthorized_client(detail: str) -> OAuthError:
+    # RFC 6749 §5.2: a grant Globus offers, asked for by a client not
+    # allowed to use it.  The 400 is the RFC's.  PROVISIONAL: the real
+    # status is unrecorded, and nothing a consumer does should hang on it.
+    return OAuthError(400, "unauthorized_client", detail)
+
+
 def invalid_scope(detail: str) -> OAuthError:
     return OAuthError(400, "invalid_scope", detail)
 

@@ -258,7 +258,7 @@ SIGNED_TOKEN_CLOCKS = ("logical", "wall")
 
 @dataclass
 class OAuthClient:
-    """A registered confidential client — a piece of software with credentials.
+    """A registered client — a piece of software, with or without a secret.
 
     The thing to internalize: in Globus Auth a client *is an identity*.
     ``client_id`` is an identity UUID, and a token minted for this client
@@ -276,14 +276,30 @@ class OAuthClient:
     would consult.  ``required_idp`` is DOCUMENTED ("in order to use this
     client a user must have an identity from this IdP in their identity
     set"), and it changes *who signs in*: see World.effective_identity.
+
+    Login shim step 2 added the other kind of client.  A *public* client
+    — globus-sdk's ``NativeAppAuthClient``, every CLI and notebook built
+    on it — ships inside software a user installs, so it cannot keep a
+    secret, and does not try: ``secret`` is ``None``.  It proves it is
+    finishing its own login with PKCE instead, and the code it is handed
+    is the only credential it ever holds.  The seed spells this
+    ``"public_client": true``, the field name Globus's own client
+    documents use (``get_client.py``, 4.8.1), rather than "no secret":
+    a confidential client whose secret was forgotten in a seed should be
+    an error at the door, not quietly become a different kind of client.
     """
 
     client_id: str
-    secret: str
+    secret: str | None
     name: str
     username: str
     redirect_uris: list[str] = field(default_factory=list)
     required_idp: str | None = None
+
+    @property
+    def public_client(self) -> bool:
+        # Derived, never stored: one field cannot disagree with itself.
+        return self.secret is None
 
 
 @dataclass
@@ -779,8 +795,49 @@ class World:
                 f"no client is registered with id {client_id!r}. Register one in the "
                 f"seed document's 'clients' section."
             )
+        if client.secret is None:
+            # Said plainly rather than left to the comparison below,
+            # which would report a "mismatch" against a secret that does
+            # not exist.  PROVISIONAL: what the real service does with a
+            # native app that presents a secret anyway is unobserved;
+            # refusing is the answer that cannot teach a bad habit.
+            raise invalid_client(
+                f"client {client_id!r} is a public (native app) client and has no secret. "
+                f"Send 'client_id' alone in the form body, the way globus-sdk's "
+                f"NativeAppAuthClient does."
+            )
         if client.secret != secret:
             raise invalid_client(f"the secret presented for client {client_id!r} does not match")
+        return client
+
+    def identify_public_client(self, client_id: str) -> OAuthClient:
+        """Name a public client — the whole of its "authentication."
+
+        RFC 6749 §2.3 is blunt about public clients: the server cannot
+        authenticate them, and ``client_id`` in the body only says which
+        client the request is *for*.  The proof arrives later and
+        elsewhere — PKCE, at redeem_code, which is why a public client
+        may never redeem a code that was issued without a challenge.
+
+        The confidential case is the one that matters here.  A
+        confidential client that leaves its secret off would otherwise
+        slip through this door as if it were public, and a request
+        without the client's one real credential would mint tokens in its
+        name.  Same ``invalid_client`` as a wrong secret, because it is
+        the same failure: the client did not prove it is itself.
+        """
+        client = self.clients.get(client_id)
+        if client is None:
+            raise invalid_client(
+                f"no client is registered with id {client_id!r}. Register one in the "
+                f"seed document's 'clients' section."
+            )
+        if not client.public_client:
+            raise invalid_client(
+                f"client {client_id!r} is confidential and must authenticate with its "
+                f"secret — Authorization: Basic, or 'client_secret' beside 'client_id'. "
+                f"Only a client seeded with \"public_client\": true may send its id alone."
+            )
         return client
 
     def scopes_by_resource_server(self, scopes: list[str]) -> dict[str, list[str]]:
@@ -1154,7 +1211,9 @@ class World:
 
     # ----------------------------------------------------------------- oidc
 
-    def login_client(self, client_id: str, redirect_uri: str) -> OAuthClient:
+    def login_client(
+        self, client_id: str, redirect_uri: str, *, auth_code_page: str | None = None
+    ) -> OAuthClient:
         """The two checks the authorize endpoint makes before it trusts a redirect URI.
 
         Everything after these may be reported by redirecting the browser
@@ -1169,6 +1228,18 @@ class World:
         the RFC 6749 §3.1.2.3 and OAuth security BCP require, it is what
         Keycloak does on its own side, and a fake that matched loosely
         would pass a test that production fails.
+
+        One URI a public client never has to register: ``auth_code_page``,
+        the issuer's own ``/v2/web/auth-code``.  It is where globus-sdk
+        sends a native app's login when the app names no redirect of its
+        own (``NativeAppAuthClient``'s default, and ``UserApp``'s), and the
+        URI is the authorization server's rather than the app's, so there
+        is nothing for the app to register.  PROVISIONAL: that Globus
+        allows it for every native client is inferred from the SDK
+        defaulting to it unconditionally.  Matched exactly like the rest,
+        against the *issuer* — not whatever base URL the SDK was given —
+        because the browser has to reach the page, and the issuer is the
+        name the browser uses.
         """
         if not client_id:
             raise invalid_request("'client_id' is required.")
@@ -1180,11 +1251,20 @@ class World:
             )
         if not redirect_uri:
             raise invalid_request("'redirect_uri' is required.")
-        if redirect_uri not in client.redirect_uris:
+        allowed = list(client.redirect_uris)
+        if client.public_client and auth_code_page is not None:
+            allowed.append(auth_code_page)
+        if redirect_uri not in allowed:
             raise invalid_request(
                 f"redirect_uri {redirect_uri!r} is not registered for client {client_id}. "
-                f"Registered: {client.redirect_uris or 'none'}. The match is exact — no "
+                f"Allowed: {allowed or 'none'}. The match is exact — no "
                 f"trailing-slash or case forgiveness."
+                + (
+                    " A native app's default page is matched against the configured issuer, "
+                    "so point the SDK at Fauxbus by the issuer's name."
+                    if client.public_client
+                    else ""
+                )
             )
         return client
 
@@ -1331,6 +1411,17 @@ class World:
             raise invalid_grant(
                 "redirect_uri does not match the one the authorization request used "
                 "(RFC 6749 §4.1.3: it must be identical)."
+            )
+        if record.code_challenge is None and client.public_client:
+            # A public client has no secret, so PKCE is the only thing
+            # tying this exchange to the browser that logged in.  Without
+            # a challenge, anyone who saw the code — in a log, in a
+            # shell's history, over a shoulder at the auth-code page —
+            # could redeem it.  authorize refuses to issue such a code;
+            # this catches one that arrived by seed instead.
+            raise invalid_grant(
+                "this code was issued without a PKCE challenge, and a public client "
+                "cannot redeem one: PKCE is its only proof it is finishing its own login."
             )
         if record.code_challenge is not None:
             # RFC 7636 §4.6, S256: BASE64URL(SHA256(verifier)) == challenge.
@@ -2839,6 +2930,7 @@ class World:
             "preferences": {i: dict(p) for i, p in sorted(self.preferences.items())},
             "clients": {
                 cid: {
+                    "public_client": c.public_client,
                     "secret": c.secret,
                     "name": c.name,
                     "username": c.username,
@@ -3013,8 +3105,22 @@ class World:
             # one call later, which is a confusing place to learn it.
             client_id = _require_uuid(str(client_id), "client_id")
             c = _require_mapping(c, f"clients[{client_id!r}]")
-            if not c.get("secret"):
-                raise validation_error(f"client {client_id} requires a non-empty 'secret'")
+            public = c.get("public_client", False)
+            if not isinstance(public, bool):
+                raise validation_error(f"client {client_id} 'public_client' must be true or false")
+            # Exactly one kind of proof per client, stated by the seed.
+            # A secret on a public client is refused rather than ignored:
+            # somebody believes it is being checked, and it never would be.
+            if public and c.get("secret") is not None:
+                raise validation_error(
+                    f"client {client_id} is a public client and may not have a 'secret' — "
+                    f"a native app cannot keep one, so Globus never issues it one."
+                )
+            if not public and not c.get("secret"):
+                raise validation_error(
+                    f"client {client_id} requires a non-empty 'secret' (or "
+                    f"\"public_client\": true, for a native app that authenticates with PKCE)"
+                )
             redirect_uris = c.get("redirect_uris") or []
             if not isinstance(redirect_uris, list):
                 raise validation_error(f"client {client_id} 'redirect_uris' must be a list")
@@ -3032,7 +3138,7 @@ class World:
                     )
             self.clients[client_id] = OAuthClient(
                 client_id=client_id,
-                secret=str(c["secret"]),
+                secret=None if public else str(c["secret"]),
                 name=str(c.get("name") or client_id),
                 username=str(c.get("username") or client_username(client_id)),
                 redirect_uris=[_require_redirect_uri(u, client_id) for u in redirect_uris],
