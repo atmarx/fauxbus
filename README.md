@@ -157,6 +157,25 @@ made-up tokens: it checks that a token was issued here, hasn't expired
 is good for the service being called.  Three production failures you
 otherwise cannot write a test for.
 
+That is also the mode for testing an app that stays signed in.  Ask for
+offline access the way your app already does (`refresh_tokens=True` on
+a flow, `request_refresh_tokens=True` on `UserApp`, or `offline_access`
+from a broker) and every token the login returns comes with a
+`refresh_token`.  Then tick past expiry and call again:
+
+```bash
+curl --json '{"seconds": 172801}' localhost:9800/_fauxbus/tick
+```
+
+The expired token gets a 401, the SDK refreshes and retries, and the
+call succeeds as the same person without anyone signing in.  The SDK
+does not notice a tick in advance (it times expiry on its own wall
+clock), so the 401 is what sets the refresh off, just as an
+early-dying token would in production.  Revoke the refresh token and
+the next refresh fails, which is your logout test.  The conformance
+suite's `test_the_sdks_user_app_keeps_working_past_expiry` is a working
+copy.
+
 ## Brokered login (OIDC)
 
 Seed people and a login client, give Fauxbus an issuer, and a real
@@ -236,13 +255,13 @@ Then make a researcher's transfer happen and move it along from the
 test:
 
 ```sh
-curl -X POST localhost:9800/_fauxbus/transfer/tasks -d '{
+curl localhost:9800/_fauxbus/transfer/tasks --json '{
   "owner_id": "<identity id>", "source_endpoint_id": "<anything>",
   "destination_endpoint_id": "<collection id>", "duration": 60,
   "files": [{"source_path": "/home/a/x.dat", "destination_path": "/landing/x.dat",
              "size": 1024, "checksum": "...", "checksum_algorithm": "sha256"}]}'
-curl -X POST localhost:9800/_fauxbus/tick -d '{"seconds": 60}'   # now SUCCEEDED
-curl -X POST localhost:9800/_fauxbus/transfer/tasks/<task id> -d '{"status": "FAILED"}'
+curl --json '{"seconds": 60}' localhost:9800/_fauxbus/tick   # now SUCCEEDED
+curl --json '{"status": "FAILED"}' localhost:9800/_fauxbus/transfer/tasks/<task id>
 ```
 
 A task with a `duration` finishes on `tick`, files arriving evenly on

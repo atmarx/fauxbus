@@ -168,7 +168,7 @@ directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Building slice A added four more to that list, slice A.2 three more,
 multi-resource-server responses two, slice B five, Transfer task
-monitoring nine, and the login shim's first two steps one each — and it
+monitoring nine, and the login shim's first three steps one each — and it
 is worth noticing that every one of them is a question the audit could
 not have asked before the code existed:
 
@@ -314,6 +314,25 @@ not have asked before the code existed:
     and that it may not introspect (`auth_api.introspect`).  Fauxbus
     refuses all three where it could have allowed them, for the
     reason in item 24.
+26. **How Globus handles a refresh token past the happy path.**  The
+    happy path is pinned twice over: the entry shape is RECORDED (the
+    dependent-token fixture puts `refresh_token` beside `access_token`,
+    and leaves it out when none was asked for), and that a refresh
+    response carries one at all is pinned from `UserApp`'s storage,
+    which would otherwise overwrite the saved token with None.  Five
+    edges are inferred and marked.  That the refresh token is **not
+    rotated** — the same string comes back (`World.token_response`).
+    That revoking one **takes its access tokens with it**, RFC 7009
+    §2.1's SHOULD (`World.revoke`).  That **introspecting a live one**
+    is a 501 rather than a guessed document (`World.introspect`).  That
+    **`offline_access` stays out of the issued tokens' `scope`**
+    (`oidc_api.authorize`).  And that a refresh brings back **no
+    `id_token`** (`auth_api._refresh_token`).  Rotation is the one to
+    settle first: Fauxbus chose not to rotate because a fake that
+    rotates against a service that does not would break consumers that
+    work in production — the direction item 24 says a fake must never
+    err in — but an app that forgets to save a rotated token would pass
+    here and fail there.
 
 And `identity_set`, already at the top of this list since v0.2.15, now
 has code to point at: its entry shape and its order are two
@@ -523,9 +542,10 @@ principle 2 at its sharpest, because the grant type is where a fake is
 most tempted to lie on its own behalf:
 
 - A grant Globus supports *and Fauxbus has built* runs.
-- A grant Globus supports and **Fauxbus has not built** — `authorization_code`,
-  `refresh_token`, the dependent-token grant — is **our** gap and gets a
-  loud 501 with a tracker link.  Answering `unsupported_grant_type` there
+- A grant Globus supports and **Fauxbus has not built** — the
+  dependent-token grant, today; `authorization_code` and
+  `refresh_token` were on this list until slice B and login shim step 3
+  built them — is **our** gap and gets a loud 501 with a tracker link.  Answering `unsupported_grant_type` there
   would be Fauxbus slandering the real service to cover its own absence.
 - A grant **Globus does not offer** gets RFC 6749's
   `unsupported_grant_type`, which is what the real endpoint would say.
@@ -754,10 +774,13 @@ an unvetted URI is how an authorization server becomes an open
 redirector.  When the client asked for something malformed, it gets
 RFC 6749 §4.1.2.1's `error=` redirect with its own `state`.  And when it
 asked for something Globus does and Fauxbus has not built — `prompt=none`,
-offline access, PKCE `plain`, another `response_mode` — it gets the loud
-501, rendered, because an `error=` code would tell the client *it* was
-wrong.  The same three-way split the token endpoint makes for grant
-types, for the same reason.
+PKCE `plain`, another `response_mode` — it gets the loud 501, rendered,
+because an `error=` code would tell the client *it* was wrong.  The same
+three-way split the token endpoint makes for grant types, for the same
+reason.  Offline access was on that list until login shim step 3
+(v0.2.26): either spelling is now remembered on the parked request and
+the code, and `offline_access` comes out of the scope list before it is
+parsed, since it names no service.
 
 **The code** is one-use, bound to the client, the exact redirect URI,
 the scopes, the nonce, the PKCE challenge, and the identity, and every
@@ -770,7 +793,10 @@ always present, `resource_server` flipped to `auth.globus.org` with
 service's scope was named first, since `id_token` is only ever read from
 the top level — and the authorize request's `state` echoed in the body,
 as the SDK's default fixture shows.  A public (native-app) client's
-exchange was a 501 here; login shim step 2 built it (v0.2.25).
+exchange was a 501 here; login shim step 2 built it (v0.2.25).  A code
+issued with offline access puts a `refresh_token` beside every token in
+the document; login shim step 3 (v0.2.26) has the grant that redeems
+them.
 
 **Signing is RS512 in `signing.py`, stdlib only.**  The zero-dependency
 rule held: the switch from the probe's RS256 was one constant, the
@@ -1159,7 +1185,7 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
      those clients to `{auth}/v2/web/auth-code` to display the code;
      like authorize, that page is a browser surface the SDK cannot
      ground, so it is graded against what the SDK does with it.
-  3. **Refresh tokens.**  `access_type=offline` / `offline_access`
+  3. **Refresh tokens.**  *Done in v0.2.26.*  `access_type=offline` / `offline_access`
      yields a `refresh_token` on every token in the document (primary
      and `other_tokens`); `grant_type=refresh_token`; refresh tokens
      revocable; access-token expiry on the logical clock, so
@@ -1285,13 +1311,15 @@ and a divergence is a release-blocking bug in Fauxbus, not in the caller.
     all.
   - **Dependent scopes** (`scope[dependent]`) and the dependent-token
     grant.
-  - **`refresh_token`** as a grant, and refresh tokens in the response.
-    Requesting one is a loud 501 as of slice A.2, in **both** spellings:
-    the `offline_access` scope that a broker sends, and
-    `access_type=offline`, which is what globus-sdk actually sends
-    (`flow_managers/authorization_code.py`, 4.8.1).  Catching only the
-    first would have left the pinned SDK — the thing principle 1 calls
-    the contract — as the caller Fauxbus failed quietly.
+  - ~~**`refresh_token`** as a grant, and refresh tokens in the
+    response~~ — **built in login shim step 3** (v0.2.26), for a
+    person's login.  Requesting one was a loud 501 from slice A.2 on, in
+    **both** spellings: the `offline_access` scope that a broker sends,
+    and `access_type=offline`, which is what globus-sdk actually sends
+    (`flow_managers/authorization_code.py`, 4.8.1).  Under
+    `client_credentials` it still is, now on RFC 6749 §4.4.3's grounds:
+    there is no person to keep signed in, and the client can simply run
+    the grant again.
   - **Per-operation scope enforcement** — see Auth posture for why this
     one is a considered omission rather than a queue position.
 
@@ -1413,6 +1441,67 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.26** (2026-10-26) — **Login shim, step 3: refresh tokens.**
+  Ask for offline access either way — globus-sdk's
+  `access_type=offline`, a broker's `offline_access` scope — and every
+  token the code exchange returns carries a `refresh_token` beside it,
+  primary and `other_tokens` alike, one per resource server.
+  `grant_type=refresh_token` trades one back for a single fresh access
+  token, acting as the same person and timed from now on the logical
+  clock.  A native app refreshes by `client_id` alone.
+
+  **The proof the roadmap asked for**, in the conformance suite against
+  `--require-issued-tokens`: `NativeAppAuthClient` with a
+  `RefreshTokenAuthorizer`, and `UserApp` with
+  `request_refresh_tokens`, each ticked past expiry and carried through
+  without a second login.  One thing worth knowing before writing a
+  test like it: the SDK times expiry on its *own* wall clock
+  (`time.time() + expires_in`), so a `tick` is never noticed in
+  advance.  The app sends the expired token, gets a 401, and the SDK's
+  retry layer hands that to the authorizer, which refreshes and retries.
+  That is the path a real app takes when a token dies early, so it is
+  the better one to prove.
+
+  **Grounded from two directions.**  The entry shape is RECORDED from
+  the dependent-token fixture's `groups_with_refresh_token`:
+  `refresh_token` beside `access_token`, and *absent*, not null, when
+  none was asked for.  That a refresh response carries a refresh token
+  at all is pinned from the reader's side: `UserApp` saves every
+  refresh response through its token storage, which reads the field
+  with `.get` and overwrites what it held.  A mutant that left the field
+  off fails the UserApp test on its second refresh, with the SDK sending
+  `refresh_token=None`.
+
+  **Revocation:** revoking a refresh token takes every access token it
+  travelled with down too, including the login's first (RFC 7009 §2.1's
+  SHOULD); revoking an access token leaves its refresh token standing,
+  so a leaked access token does not cost a sign-in.  Refusals at the
+  refresh grant are all `invalid_grant`, the recorded 401, with a
+  description that says which: never issued, another client's, revoked.
+  Narrowing scopes on refresh, and introspecting a live refresh token,
+  are loud 501s.  `client_credentials` with offline access stays a 501.
+
+  **Shape changes in dumps:** a new `refresh_tokens` section; each
+  token gains `refresh_token` (null unless it has one); parked requests
+  and codes gain `offline`.  Seeds without them load as before.
+  `examples/seed.json` gains one line.  The seed door is stricter about
+  refresh tokens than about access tokens: the client must be
+  registered and the identity must be in the account, because using one
+  takes both.
+
+  **Found while writing the README for it: the README's own `curl`
+  lines were wrong, silently.**  `curl -d` labels every body a form, so
+  `curl -d '{"seconds": 60}' …/_fauxbus/tick` reached Fauxbus as a form
+  with one field named `{"seconds": 60}`, ticked the default one second,
+  and answered 200.  The control plane now refuses a form-labelled body
+  that is plainly JSON text, with a 400 naming curl and `--json`, and
+  the README uses `curl --json`.  The imitated surface is untouched.
+
+  302 tests, up from 279; 41 through the real globus-sdk, up from 39.
+
+  **PROVISIONAL inventory: 54 markers**, up five from 49, **one new
+  obligation** (recording list 26, refresh tokens past the happy path).
 
 - **Package release: fauxbus 0.4.0** (2026-10-14, tag `v0.4.0`) —
   **Transfer task monitoring reaches consumers**, with the login shim's
