@@ -64,6 +64,7 @@ from globus_sdk import (  # noqa: E402
     GroupsClient,
     GroupsManager,
     NativeAppAuthClient,
+    RefreshTokenAuthorizer,
     TransferAPIError,
     TransferClient,
     UserApp,
@@ -1001,3 +1002,111 @@ def test_the_sdks_user_app_runs_unmodified(pointed):
     issued = list(state["tokens"].values())
     assert {t["client_id"] for t in issued} == {NATIVE_CLIENT}
     assert len(state["authorization_codes"]) == 1
+
+
+# --------------------------------------- login shim step 3: refresh tokens
+#
+# The proof this step exists for: an app holding a refresh token outlives
+# its access token's expiry with no person present.  It runs against a
+# server with ``--require-issued-tokens``, the only posture where an
+# expired token is refused at all, and the clock is moved by ``tick``.
+#
+# Worth knowing before reading these: the SDK does *not* notice the
+# expiry itself.  It computes ``expires_at_seconds`` from its own wall
+# clock (``time.time() + expires_in``), and a logical tick does not move
+# that.  What it notices is the 401 — its retry layer hands that to the
+# authorizer's ``handle_missing_authorization``, which drops the token,
+# refreshes, and retries.  That is the same path a real app takes when a
+# token is revoked or expires early, which makes it the better one to
+# prove anyway.
+
+GROUPS_RS = "groups.api.globus.org"
+
+
+@pytest.fixture
+def strict_pointed(strict, monkeypatch):
+    """The strict server, seeded for logins, with the SDK aimed at it by environment."""
+    status, doc, _ = strict.post(
+        "/_fauxbus/seed",
+        oidc_seed(strict.base_url, oidc={"issuer": strict.base_url, "signed_token_clock": "wall"}),
+    )
+    assert status == 200, doc
+    for service in ("AUTH", "GROUPS", "TRANSFER"):
+        monkeypatch.setenv(f"GLOBUS_SDK_SERVICE_URL_{service}", strict.base_url + "/")
+    return strict
+
+
+def test_a_refresh_token_authorizer_outlives_its_access_token(strict_pointed):
+    """``NativeAppAuthClient`` with ``refresh_tokens=True``, then a tick past expiry.
+
+    The call after the tick is refused, the SDK refreshes, and the retry
+    succeeds as the same person — all inside one ``get_my_groups``.
+    """
+    fx = strict_pointed
+    app = NativeAppAuthClient(NATIVE_CLIENT)
+    app.oauth2_start_flow(GROUPS_SCOPE, refresh_tokens=True)
+    tokens = app.oauth2_exchange_code_for_tokens(browser_login(fx, app.oauth2_get_authorize_url()))
+    data = tokens.by_resource_server[GROUPS_RS]
+    assert data["refresh_token"]
+
+    refreshed = []
+    groups = GroupsClient(
+        authorizer=RefreshTokenAuthorizer(
+            data["refresh_token"],
+            app,
+            access_token=data["access_token"],
+            expires_at=data["expires_at_seconds"],
+            on_refresh=refreshed.append,
+        )
+    )
+    gid = groups.create_group({"name": "Before the tick", "description": ""})["id"]
+    assert refreshed == []
+
+    fx.post("/_fauxbus/tick", {"seconds": 172801})
+    assert gid in {g["id"] for g in groups.get_my_groups()}
+
+    (response,) = refreshed
+    assert response.by_resource_server[GROUPS_RS]["refresh_token"] == data["refresh_token"]
+    _, state, _ = fx.get("/_fauxbus/state")
+    minted = state["tokens"][response.by_resource_server[GROUPS_RS]["access_token"]]
+    assert (minted["grant_type"], minted["identity_id"]) == ("refresh_token", ALICE_GLOBUSID)
+
+
+def test_the_sdks_user_app_keeps_working_past_expiry(strict_pointed):
+    """``UserApp`` with ``request_refresh_tokens=True``: one login, then no person at all.
+
+    The app's own storage saves what each refresh returns.  If that
+    response lacked ``refresh_token``, storage would overwrite the saved
+    one with None — so the second tick below, which needs a second
+    refresh, is what proves the response carried it.
+    """
+    fx = strict_pointed
+    logins = []
+
+    class BrowserInTheTest(CommandLineLoginFlowManager):
+        def print_authorize_url(self, authorize_url: str) -> None:
+            self.authorize_url = authorize_url
+
+        def prompt_for_code(self) -> str:
+            logins.append(self.authorize_url)
+            return browser_login(fx, self.authorize_url)
+
+    app = UserApp(
+        "fauxbus-conformance",
+        client_id=NATIVE_CLIENT,
+        config=GlobusAppConfig(
+            token_storage="memory",
+            login_flow_manager=BrowserInTheTest,
+            request_refresh_tokens=True,
+        ),
+    )
+    groups = GroupsClient(app=app)
+    gid = groups.create_group({"name": "Long-running", "description": ""})["id"]
+    for _ in range(2):
+        fx.post("/_fauxbus/tick", {"seconds": 172801})
+        assert gid in {g["id"] for g in groups.get_my_groups()}
+
+    assert len(logins) == 1  # nobody signed in again
+    _, state, _ = fx.get("/_fauxbus/state")
+    grants = sorted(t["grant_type"] for t in state["tokens"].values())
+    assert grants.count("refresh_token") == 2

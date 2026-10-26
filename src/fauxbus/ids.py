@@ -79,6 +79,11 @@ def access_token(counter: int) -> str:
 CODE_PREFIX = "fauxbus-code-"
 SESSION_PREFIX = "fauxbus-session-"
 REQUEST_PREFIX = "fauxbus-request-"
+# Login shim step 3.  ``rt`` beside the access token's ``at``, so the two
+# kinds of token are told apart at a glance in a log — which matters,
+# because handing a refresh token to a resource server is a mistake a
+# reader should be able to spot without a lookup.
+REFRESH_TOKEN_PREFIX = "fauxbus-rt-"
 
 
 def minted_name(prefix: str, counter: int) -> str:

@@ -1,10 +1,12 @@
 """The imitated surface: Globus Auth v2, the OAuth2 token endpoint.
 
-``POST /v2/oauth2/token`` with two grants.  ``client_credentials`` (slice
-A) is the grant a service uses to act as *itself* rather than on behalf
-of a person; ``authorization_code`` (slice B) is where a browser login
-that started at ``/v2/oauth2/authorize`` (see ``oidc_api.py``) is
-redeemed for tokens acting as the person who signed in.  Both are built
+``POST /v2/oauth2/token`` with three grants.  ``client_credentials``
+(slice A) is the grant a service uses to act as *itself* rather than on
+behalf of a person; ``authorization_code`` (slice B) is where a browser
+login that started at ``/v2/oauth2/authorize`` (see ``oidc_api.py``) is
+redeemed for tokens acting as the person who signed in; and
+``refresh_token`` (login shim step 3) is how that login keeps going
+after its access tokens expire, with no browser in sight.  All are built
 resource-server-generic on purpose: nothing here knows or cares that
 Groups exists.  The requested scopes name the service, and the same
 endpoint that hands a WordPress provisioner a Groups token hands a
@@ -158,29 +160,37 @@ def _require_grant(form: dict[str, str]) -> str:
 
 
 def _refuse_refresh_requests(form: dict[str, str], scopes: list[str]) -> None:
-    """A request for a refresh token gets the 501, not a token without one.
+    """Client credentials plus offline access: still the 501, for a new reason.
 
     Exactly the same shape of gap as the ``openid`` check below, one
     field over.  Both scopes are promises about the *response document*:
     ``openid`` promises an ``id_token``, ``offline_access`` promises a
-    ``refresh_token``, and Fauxbus can honour neither yet.  Answering 200
-    without the field would move the failure into the consumer's own
-    ``response["refresh_token"]`` — a KeyError wearing a traceback that
-    points at the wrong repository.
+    ``refresh_token``.  Answering 200 without the field would move the
+    failure into the consumer's own ``response["refresh_token"]`` — a
+    KeyError wearing a traceback that points at the wrong repository.
+
+    Login shim step 3 built refresh tokens, and they are still refused
+    here, because this grant has no person in it.  RFC 6749 §4.4.3 says
+    a refresh token SHOULD NOT come back from client credentials: the
+    client can simply run the grant again, so a standing right to mint
+    tokens buys it nothing but a credential to leak.  Whether Globus
+    follows the SHOULD or answers some other way is unrecorded, and a
+    200 without the field is the one answer Fauxbus knows to be wrong.
 
     Both spellings are checked because both are in live use and they
     come from different callers.  A broker sends the scope; globus-sdk
-    sends ``access_type=offline``.  Honouring neither is fine — that is
-    a slice not built.  Catching only one would mean the SDK, the thing
-    principle 1 calls the contract, is the caller Fauxbus fails quietly.
+    sends ``access_type=offline``.  Catching only one would mean the
+    SDK, the thing principle 1 calls the contract, is the caller Fauxbus
+    fails quietly.
     """
     if REFRESH_SCOPE in scopes or form.get("access_type") == OFFLINE_ACCESS_TYPE:
         raise not_implemented(
-            f"this request asks for a refresh token — {REFRESH_SCOPE!r} in 'scope', or "
-            f"access_type={OFFLINE_ACCESS_TYPE!r} — and Fauxbus does not issue them yet, "
-            f"so it will not answer with a token document that quietly lacks the "
-            f"'refresh_token' field. Drop the request for offline access to get an access "
-            f"token today. Real client code needs to refresh?"
+            f"this client_credentials request asks for a refresh token — {REFRESH_SCOPE!r} "
+            f"in 'scope', or access_type={OFFLINE_ACCESS_TYPE!r}. Fauxbus issues refresh "
+            f"tokens only to a person's login (the authorization-code grant); RFC 6749 "
+            f"§4.4.3 says client credentials SHOULD NOT get one, and what Globus does here "
+            f"is unrecorded. A service can run this grant again instead of refreshing. "
+            f"Real client code asks for this?"
         )
 
 
@@ -188,18 +198,23 @@ def token(ctx: Ctx) -> tuple[int, Any]:
     form = _require_form(ctx)
     client = _authenticate_client(ctx, form)
     grant_type = _require_grant(form)
-    if client.public_client and grant_type != "authorization_code":
+    if client.public_client and grant_type == "client_credentials":
         # RFC 6749 §4.4: the client-credentials grant is for confidential
         # clients only, and the reason is in the name — a client with no
         # credential cannot be granted a token on the strength of it.  A
         # native app acts for a person, so its every token starts with a
-        # person signing in.
+        # person signing in — and may carry on by refresh, which a
+        # public client is allowed (RFC 6749 §6 asks for client
+        # authentication only from clients that have credentials).
         raise unauthorized_client(
             f"client {client.client_id!r} is a public (native app) client; it gets tokens "
-            f"by the authorization-code grant with PKCE, never by grant_type={grant_type!r}."
+            f"by the authorization-code grant with PKCE (then by refresh_token), never by "
+            f"grant_type={grant_type!r}."
         )
     if grant_type == "authorization_code":
         return _authorization_code(ctx, client, form)
+    if grant_type == "refresh_token":
+        return _refresh_token(ctx, client, form)
     return _client_credentials(ctx, client, form, grant_type)
 
 
@@ -315,10 +330,19 @@ def _authorization_code(ctx: Ctx, client: OAuthClient, form: dict[str, str]) -> 
             resource_server=resource_server,
             scopes=server_scopes,
             grant_type="authorization_code",
-            code=code,
+            login=code,
         )
         for resource_server, server_scopes in by_server.items()
     ]
+    if code.offline:
+        # Login shim step 3: one refresh token beside *every* token in the
+        # document, primary and other_tokens alike.  A refresh token is
+        # for one resource server, so a login that minted three access
+        # tokens has three things to refresh — and an app that keeps its
+        # Transfer token alive but not its Groups one has not got
+        # offline access, it has a third of it.
+        for token in issued:
+            ctx.world.issue_refresh_token(token)
     doc = ctx.world.token_response(issued[0], issued[1:])
     if "openid" in code.scopes:
         claims = ctx.world.id_token_claims(
@@ -334,6 +358,56 @@ def _authorization_code(ctx: Ctx, client: OAuthClient, form: dict[str, str]) -> 
         # the docstring — Fauxbus echoes in both.
         doc["state"] = code.state
     return 200, doc
+
+
+def _refresh_token(ctx: Ctx, client: OAuthClient, form: dict[str, str]) -> tuple[int, Any]:
+    """RFC 6749 §6: a refresh token in, one fresh access token out.
+
+    globus-sdk sends exactly ``grant_type`` and ``refresh_token``
+    (``AuthLoginClient.oauth2_refresh_token``, 4.8.1), from a confidential
+    client with its Basic header or a native app with ``client_id``
+    alone.  ``_authenticate_client`` has already told those apart; the
+    binding check below is what makes a refresh token useless in anyone
+    else's hands.
+
+    The response is the ordinary token document with one token in it,
+    ``other_tokens`` empty.  Not a style choice: ``RefreshTokenAuthorizer``
+    raises ``ValueError`` unless a refresh answers with exactly one
+    token, so this is pinned from the reader's side.  The refresh token
+    is in it too — see ``World.token_response`` on why, and on rotation.
+
+    Two things a refresh deliberately does *not* bring back:
+
+    - **No ``id_token``.**  An ID token says a person authenticated, and
+      nobody did — that is the point of refreshing.  Whether Globus
+      re-issues one for an ``openid`` refresh is unrecorded; the SDK's
+      storage reads it with ``.get`` and falls back to the identity it
+      already stored, so leaving it out breaks nothing that reads it.
+      PROVISIONAL.
+    - **No ``state``.**  ``state`` belongs to a browser round trip, and
+      there was none.
+
+    The new access token is timed from *now* on the logical clock, so a
+    test that ticks past expiry, watches a call fail, and lets the SDK
+    refresh gets a token that works — the whole proof this step exists
+    for.
+    """
+    value = form.get("refresh_token")
+    if not value:
+        raise invalid_request("'refresh_token' is required — the refresh token being redeemed.")
+    raw_scope = form.get("scope")
+    refresh = ctx.world.redeem_refresh_token(
+        client, value, None if raw_scope is None else split_scopes(raw_scope)
+    )
+    issued = ctx.world.issue_token(
+        client,
+        resource_server=refresh.resource_server,
+        scopes=refresh.scopes,
+        grant_type="refresh_token",
+        login=refresh,
+    )
+    issued.refresh_token = refresh.token
+    return 200, ctx.world.token_response(issued)
 
 
 def _require_token_field(form: dict[str, str]) -> str:

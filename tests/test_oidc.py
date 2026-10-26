@@ -348,8 +348,6 @@ def test_a_client_mistake_goes_back_to_the_client_with_its_state(oidc):
 def test_fauxbus_gaps_at_authorize_are_501s_not_oauth_errors(oidc):
     for extra in (
         {"prompt": "none"},
-        {"access_type": "offline"},
-        {"scope": "openid offline_access"},
         {"code_challenge": "x" * 43, "code_challenge_method": "plain"},
         {"code_challenge": "x" * 43},  # no method means plain (RFC 7636 §4.3)
     ):
@@ -1063,3 +1061,272 @@ def test_an_identity_belongs_to_one_account(fx):
     ]["identities"][ALICE_UNIVERSITY]
     status, doc, _ = fx.post("/_fauxbus/seed", seed)
     assert status == 422 and "one account" in doc["detail"]
+
+
+# ------------------------------------------ login shim step 3: refresh tokens
+#
+# Offline access, asked for either way — the SDK's ``access_type=offline``
+# or a broker's ``offline_access`` scope — puts a refresh token beside
+# every token the login yields.  The refresh grant trades one back for a
+# fresh access token as the same person, and revoking it takes its access
+# tokens down too.  The SDK drives the same thing, through a 401 and a
+# tick, in test_sdk_conformance.py.
+
+INTROSPECT = "/v2/oauth2/token/introspect"
+REVOKE = "/v2/oauth2/token/revoke"
+
+
+def offline_tokens(fx: Client, **authorize_kw: str) -> dict[str, Any]:
+    """A confidential client's login with offline access; returns the token document."""
+    kw = {"scope": f"openid {GROUPS_SCOPE}", "access_type": "offline", **authorize_kw}
+    code, _, _ = login(fx, **kw)
+    status, doc = exchange(fx, code)
+    assert status == 200, doc
+    return doc
+
+
+def refresh(
+    fx: Client, token: str, *, client: tuple[str, str] = (LOGIN_CLIENT, LOGIN_SECRET), **extra: str
+) -> tuple[int, Any]:
+    status, doc, _ = fx.form_post(
+        TOKEN, {"grant_type": "refresh_token", "refresh_token": token, **extra}, basic=client
+    )
+    return status, doc
+
+
+def introspect(fx: Client, token: str) -> dict[str, Any]:
+    status, doc, _ = fx.form_post(INTROSPECT, {"token": token}, basic=(CLIENT_ID, CLIENT_SECRET))
+    assert status == 200, doc
+    return doc
+
+
+def test_offline_access_puts_a_refresh_token_beside_every_token(oidc):
+    """Primary and other_tokens alike, each its own, each for one service.
+
+    RECORDED placement: ``refresh_token`` sits next to ``access_token`` in
+    the same object (the dependent-token fixture's
+    ``groups_with_refresh_token``).  One per entry, because each refreshes
+    exactly one resource server.
+    """
+    doc = offline_tokens(oidc)
+    (groups,) = doc["other_tokens"]
+    assert doc["resource_server"] == "auth.globus.org"
+    assert doc["refresh_token"] == "fauxbus-rt-0"
+    assert groups["refresh_token"] == "fauxbus-rt-1"
+    # The ID token is unchanged by asking for offline access.
+    assert "id_token" in doc
+
+
+def test_the_brokers_spelling_works_too_and_names_no_service(oidc):
+    """``offline_access`` in the scope: same refresh tokens, and gone from the scope strings.
+
+    It names no resource server, so it must not reach the scope parser
+    (which would 501 on it) or the issued tokens' ``scope``.
+    """
+    doc = offline_tokens(oidc, scope=f"openid offline_access {GROUPS_SCOPE}", access_type=None)
+    assert "refresh_token" in doc and "refresh_token" in doc["other_tokens"][0]
+    assert "offline_access" not in doc["scope"]
+    assert doc["other_tokens"][0]["scope"] == GROUPS_SCOPE
+
+
+def test_without_offline_access_the_key_is_absent_not_null(oidc):
+    """RECORDED: the plain dependent-token variant has no refresh_token key at all."""
+    code, _, _ = login(oidc, scope=f"openid {GROUPS_SCOPE}", access_type="online")
+    _, doc = exchange(oidc, code)
+    assert "refresh_token" not in doc
+    assert "refresh_token" not in doc["other_tokens"][0]
+
+
+def test_a_refresh_mints_one_new_token_as_the_same_person(oidc):
+    doc = offline_tokens(oidc)
+    groups = doc["other_tokens"][0]
+    oidc.post("/_fauxbus/tick", {"seconds": 1000})
+
+    status, fresh = refresh(oidc, groups["refresh_token"])
+    assert status == 200, fresh
+    # One token, pinned from the reader's side: RefreshTokenAuthorizer
+    # raises unless a refresh answers with exactly one.
+    assert fresh["other_tokens"] == []
+    assert fresh["resource_server"] == "groups.api.globus.org"
+    assert fresh["scope"] == GROUPS_SCOPE
+    assert fresh["access_token"] not in (doc["access_token"], groups["access_token"])
+    # Not rotated (PROVISIONAL): the same refresh token comes back.
+    assert fresh["refresh_token"] == groups["refresh_token"]
+    # Timed from now, not from the login.
+    assert fresh["expires_in"] == 172800
+    # Nobody authenticated, so nothing says they did.
+    assert "id_token" not in fresh and "state" not in fresh
+
+    who = introspect(oidc, fresh["access_token"])
+    assert who["active"] is True
+    assert who["sub"] == ALICE_GLOBUSID
+    assert who["client_id"] == LOGIN_CLIENT
+    _, state, _ = oidc.get("/_fauxbus/state")
+    assert state["tokens"][fresh["access_token"]]["grant_type"] == "refresh_token"
+
+
+def test_a_refresh_token_can_be_redeemed_again_and_again(oidc):
+    rt = offline_tokens(oidc)["refresh_token"]
+    first, second = refresh(oidc, rt)[1], refresh(oidc, rt)[1]
+    assert first["access_token"] != second["access_token"]
+    # The earlier refresh's token is still good: refreshing does not
+    # revoke what came before.
+    assert introspect(oidc, first["access_token"])["active"] is True
+
+
+def test_a_native_app_refreshes_with_its_client_id_alone(oidc):
+    """RFC 6749 §6 asks for client authentication only from clients that have some."""
+    callback = native_login(oidc, scope=GROUPS_SCOPE, access_type="offline")
+    _, doc = native_exchange(oidc, callback["code"])
+    status, fresh, _ = oidc.form_post(
+        TOKEN,
+        {"grant_type": "refresh_token", "refresh_token": doc["refresh_token"], "client_id": NATIVE_CLIENT},
+    )
+    assert status == 200, fresh
+    assert introspect(oidc, fresh["access_token"])["sub"] == ALICE_GLOBUSID
+
+
+def test_a_native_app_still_may_not_use_client_credentials(oidc):
+    status, doc, _ = oidc.form_post(
+        TOKEN, {"grant_type": "client_credentials", "client_id": NATIVE_CLIENT, "scope": GROUPS_SCOPE}
+    )
+    assert (status, doc["error"]) == (400, "unauthorized_client")
+
+
+def test_every_refusal_is_the_same_invalid_grant(oidc):
+    """Never issued, someone else's, revoked: one error code, three descriptions."""
+    rt = offline_tokens(oidc)["refresh_token"]
+
+    status, doc = refresh(oidc, "fauxbus-rt-99")
+    assert (status, doc["error"]) == (401, "invalid_grant")
+    assert "no such refresh token" in doc["error_description"]
+
+    status, doc = refresh(oidc, rt, client=(CAMPUS_CLIENT, CAMPUS_SECRET))
+    assert (status, doc["error"]) == (401, "invalid_grant")
+    assert "different client" in doc["error_description"]
+
+    oidc.form_post(REVOKE, {"token": rt}, basic=(LOGIN_CLIENT, LOGIN_SECRET))
+    status, doc = refresh(oidc, rt)
+    assert (status, doc["error"]) == (401, "invalid_grant")
+    assert "revoked" in doc["error_description"]
+
+    status, doc, _ = oidc.form_post(
+        TOKEN, {"grant_type": "refresh_token"}, basic=(LOGIN_CLIENT, LOGIN_SECRET)
+    )
+    assert (status, doc["error"]) == (400, "invalid_request")
+
+
+def test_revoking_a_refresh_token_takes_its_access_tokens_with_it(oidc):
+    """RFC 7009 §2.1's SHOULD — the login's own token and every refreshed one.
+
+    And only those: the Auth token from the same login has its own
+    refresh token, and stays live.
+    """
+    doc = offline_tokens(oidc)
+    groups = doc["other_tokens"][0]
+    _, fresh = refresh(oidc, groups["refresh_token"])
+
+    status, body, _ = oidc.form_post(
+        REVOKE, {"token": groups["refresh_token"]}, basic=(LOGIN_CLIENT, LOGIN_SECRET)
+    )
+    assert (status, body) == (200, {"active": False})
+    assert introspect(oidc, groups["access_token"])["active"] is False
+    assert introspect(oidc, fresh["access_token"])["active"] is False
+    assert introspect(oidc, doc["access_token"])["active"] is True
+
+
+def test_revoking_an_access_token_leaves_its_refresh_token_standing(oidc):
+    """The RFC's MAY, declined: a leaked access token should not cost a sign-in."""
+    groups = offline_tokens(oidc)["other_tokens"][0]
+    oidc.form_post(REVOKE, {"token": groups["access_token"]}, basic=(LOGIN_CLIENT, LOGIN_SECRET))
+    assert refresh(oidc, groups["refresh_token"])[0] == 200
+
+
+def test_a_stranger_cannot_revoke_someone_elses_refresh_token(oidc):
+    rt = offline_tokens(oidc)["refresh_token"]
+    oidc.form_post(REVOKE, {"token": rt}, basic=(CAMPUS_CLIENT, CAMPUS_SECRET))
+    assert refresh(oidc, rt)[0] == 200
+
+
+def test_the_same_scope_on_refresh_is_fine_and_a_narrower_one_is_a_501(oidc):
+    groups = offline_tokens(oidc)["other_tokens"][0]
+    assert refresh(oidc, groups["refresh_token"], scope=GROUPS_SCOPE)[0] == 200
+    status, doc = refresh(
+        oidc,
+        groups["refresh_token"],
+        scope="urn:globus:auth:scope:groups.api.globus.org:view_my_groups_and_memberships",
+    )
+    assert (status, doc["code"]) == (501, "NOT_IMPLEMENTED")
+
+
+def test_introspecting_a_live_refresh_token_is_a_loud_501(oidc):
+    """Not ``active: false`` — that would tell a resource server a live credential is dead."""
+    rt = offline_tokens(oidc)["refresh_token"]
+    status, doc, _ = oidc.form_post(INTROSPECT, {"token": rt}, basic=(CLIENT_ID, CLIENT_SECRET))
+    assert (status, doc["code"]) == (501, "NOT_IMPLEMENTED")
+
+
+def test_offline_logins_round_trip_through_the_state_document(oidc):
+    """Refresh tokens, the links to them, and an offline code in flight, all reseedable."""
+    offline_tokens(oidc)
+    login(oidc, scope=GROUPS_SCOPE, access_type="offline")  # a code, not yet redeemed
+    _, state, _ = oidc.get("/_fauxbus/state")
+    assert set(state["refresh_tokens"]) == {"fauxbus-rt-0", "fauxbus-rt-1"}
+    (code,) = [c for c in state["authorization_codes"].values() if not c["used"]]
+    assert code["offline"] is True
+
+    status, doc, _ = oidc.post("/_fauxbus/seed", state)
+    assert status == 200, doc
+    _, again, _ = oidc.get("/_fauxbus/state")
+    assert again == state
+    # And what was reloaded still works.
+    assert refresh(oidc, "fauxbus-rt-1")[0] == 200
+
+
+UNREGISTERED = "00000000-0000-4000-8000-00000000ffff"
+
+
+@pytest.mark.parametrize(
+    ("change", "complaint"),
+    [
+        pytest.param(
+            lambda s: s["refresh_tokens"].update({"fauxbus-rt-5": s["refresh_tokens"]["fauxbus-rt-0"]}),
+            "not minted yet",
+            id="name-the-mint-will-reach",
+        ),
+        pytest.param(
+            lambda s: s["refresh_tokens"]["fauxbus-rt-0"].update(client_id=UNREGISTERED),
+            "unregistered client",
+            id="client-nobody-registered",
+        ),
+        pytest.param(
+            lambda s: s["refresh_tokens"]["fauxbus-rt-0"].update(identity_id=BOB_GLOBUSID),
+            "is not in account",
+            id="identity-outside-the-account",
+        ),
+        pytest.param(
+            lambda s: next(iter(s["tokens"].values())).update(refresh_token="nope"),
+            "not in 'refresh_tokens'",
+            id="dangling-link-from-an-access-token",
+        ),
+        pytest.param(
+            lambda s: s["refresh_tokens"]["fauxbus-rt-0"].update(revoked="false"),
+            "true or false",
+            id="truthy-string-for-a-bool",
+        ),
+    ],
+)
+def test_the_seed_door_refuses_a_refresh_token_nobody_could_use(oidc, change, complaint):
+    offline_tokens(oidc)
+    _, state, _ = oidc.get("/_fauxbus/state")
+    change(state)
+    status, doc, _ = oidc.post("/_fauxbus/seed", state)
+    assert status == 422, doc
+    assert complaint in doc["detail"]
+
+
+def test_reset_forgets_every_refresh_token(oidc):
+    rt = offline_tokens(oidc)["refresh_token"]
+    oidc.post("/_fauxbus/reset")
+    oidc.post("/_fauxbus/seed", oidc_seed(oidc.base_url))
+    assert refresh(oidc, rt)[1]["error"] == "invalid_grant"

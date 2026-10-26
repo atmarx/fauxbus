@@ -51,6 +51,7 @@ from .errors import (
 )
 from .ids import (
     CODE_PREFIX,
+    REFRESH_TOKEN_PREFIX,
     REQUEST_PREFIX,
     SESSION_PREFIX,
     access_token,
@@ -115,6 +116,15 @@ def _require_int(value: Any, what: str) -> int:
         return int(value)
     except (TypeError, ValueError):
         raise validation_error(f"{what} is not an integer: {value!r}") from None
+
+
+def _require_bool(value: Any, what: str) -> bool:
+    # Strict, unlike the older ``bool(...)`` reads in this file: the
+    # string "false" is truthy, and a seed that says ``"offline": "false"``
+    # would otherwise hand out refresh tokens it asked not to.
+    if not isinstance(value, bool):
+        raise validation_error(f"{what} must be true or false, got {value!r}")
+    return value
 
 
 def _optional_str(value: Any, what: str) -> str | None:
@@ -238,7 +248,7 @@ GLOBUS_GRANT_TYPES = (
 
 # Which of those Fauxbus can actually perform today.  Everything else in
 # GLOBUS_GRANT_TYPES hits the 501 wall with a pointer to the tracker.
-IMPLEMENTED_GRANT_TYPES = ("client_credentials", "authorization_code")
+IMPLEMENTED_GRANT_TYPES = ("client_credentials", "authorization_code", "refresh_token")
 
 # How long an authorization code stays redeemable, on the *logical*
 # clock.  PROVISIONAL: the published reference gives no lifetime, and no
@@ -382,6 +392,13 @@ class AuthorizationRequest:
     state: str | None
     nonce: str | None
     code_challenge: str | None
+    # Whether the login asked for refresh tokens.  Kept apart from
+    # ``scopes`` because ``offline_access`` is not a scope that names a
+    # service (see auth.REFRESH_SCOPE), and globus-sdk's spelling,
+    # ``access_type=offline``, is not a scope at all.  Both spellings
+    # land here as one bool, so nothing downstream has to know there
+    # were two.
+    offline: bool = False
 
 
 @dataclass
@@ -409,6 +426,7 @@ class AuthorizationCode:
     issued_at: int
     expires_at: int
     used: bool = False
+    offline: bool = False  # carried over from the request; see AuthorizationRequest
 
 
 class RequiredIdpUnsatisfied(ApiError):
@@ -490,6 +508,49 @@ class IssuedToken:
     # because no person was there.
     account: str | None = None
     authenticated_at: int | None = None
+    # The refresh token this access token travels with: handed out beside
+    # it, or the one that minted it.  It is what lets revoking a refresh
+    # token take its access tokens down with it — see World.revoke.
+    refresh_token: str | None = None
+
+
+@dataclass
+class RefreshToken:
+    """A refresh token: a standing right to mint more access tokens for one login.
+
+    Login shim step 3.  The thing to see is what it is bound to, because
+    that is the whole security story of a refresh token and the fake has
+    to keep every binding the real one does:
+
+    - **the client** — RFC 6749 §6: only the client it was issued to may
+      redeem it.  A refresh token found in a log is useless to anyone
+      else's software.
+    - **the person** — ``account``, ``identity_id``, ``authenticated_at``,
+      copied from the login.  A refreshed token acts as the same identity
+      the original sign-in produced, and says the person last
+      authenticated *then*, not now: refreshing is not signing in again.
+    - **one resource server, and its scopes** — one refresh token per
+      token in the document, so refreshing yields exactly one access
+      token.  That is not a choice Fauxbus made: the SDK's
+      ``RefreshTokenAuthorizer`` raises unless a refresh answers with
+      exactly one token.
+
+    What it is *not* bound to is time.  Access tokens age on the logical
+    clock; a refresh token here lives until revoked.  Globus documents
+    refresh tokens as long-lived and has not been observed expiring one
+    on a schedule a test could hit, so modelling an expiry would be
+    inventing a failure the real service does not produce.
+    """
+
+    token: str
+    client_id: str
+    account: str
+    identity_id: str
+    authenticated_at: int
+    resource_server: str
+    scopes: list[str]
+    issued_at: int  # logical clock
+    revoked: bool = False
 
 
 # --------------------------------------------------------------- transfer
@@ -689,6 +750,7 @@ class World:
         self.preferences: dict[str, dict[str, Any]] = {}  # identity_id -> prefs doc
         self.clients: dict[str, OAuthClient] = {}  # client_id -> registration
         self.tokens: dict[str, IssuedToken] = {}  # access token -> what it authorizes
+        self.refresh_tokens: dict[str, RefreshToken] = {}  # refresh token -> its binding
         # Slice B.  The first two are configuration that lives in the
         # world rather than on the server, because the seed is
         # authoritative: a state dump must describe the world it came
@@ -891,7 +953,7 @@ class World:
         scopes: list[str],
         grant_type: str,
         expires_in: int = DEFAULT_EXPIRES_IN,
-        code: AuthorizationCode | None = None,
+        login: AuthorizationCode | RefreshToken | None = None,
     ) -> IssuedToken:
         """Mint one access token and remember what it authorizes.
 
@@ -910,17 +972,24 @@ class World:
         token acts as their *effective* identity — the client is only the
         requester.  That is the moment ``sub`` and ``client_id`` come
         apart in introspection, which slice A.2 predicted in a comment.
+
+        ``login`` is whatever carries the person: the code they just
+        signed in with, or — login shim step 3 — a refresh token that
+        remembers that sign-in.  Both hold the same three facts
+        (``account``, ``identity_id``, ``authenticated_at``), and a
+        refreshed token is minted from them exactly as the first one was,
+        which is how it comes to act as the same person.
         """
         counter = self.counters.get("access_token", 0)
         self.counters["access_token"] = counter + 1
-        if code is None:
+        if login is None:
             # A client IS its identity — see OAuthClient.
             identity_id, username = client.client_id, client.username
             account = authenticated_at = None
         else:
-            identity = self.accounts[code.account].identities[code.identity_id]
+            identity = self.accounts[login.account].identities[login.identity_id]
             identity_id, username = identity.id, identity.username
-            account, authenticated_at = code.account, code.authenticated_at
+            account, authenticated_at = login.account, login.authenticated_at
         issued = IssuedToken(
             token=access_token(counter),
             client_id=client.client_id,
@@ -936,6 +1005,84 @@ class World:
         )
         self.tokens[issued.token] = issued
         return issued
+
+    def issue_refresh_token(self, issued: IssuedToken) -> RefreshToken:
+        """Mint the refresh token that rides beside one access token.
+
+        One per access token, not one per login, because the token
+        document carries ``refresh_token`` on each entry — primary and
+        every one of ``other_tokens`` — and each entry is for a single
+        resource server.  RECORDED as an entry shape in the neighbouring
+        grant (``oauth2_get_dependent_tokens.py``'s
+        ``groups_with_refresh_token``, 4.8.1): ``refresh_token`` sits next
+        to ``access_token`` in the same object.
+
+        Only a token a person signed in for gets one; the caller
+        guarantees that, and this method trusts it.
+        """
+        assert issued.account is not None and issued.authenticated_at is not None
+        n = self.counters.get("refresh_token", 0)
+        self.counters["refresh_token"] = n + 1
+        refresh = RefreshToken(
+            token=minted_name(REFRESH_TOKEN_PREFIX, n),
+            client_id=issued.client_id,
+            account=issued.account,
+            identity_id=issued.identity_id,
+            authenticated_at=issued.authenticated_at,
+            resource_server=issued.resource_server,
+            scopes=list(issued.scopes),
+            issued_at=self.clock,
+        )
+        self.refresh_tokens[refresh.token] = refresh
+        issued.refresh_token = refresh.token
+        return refresh
+
+    def redeem_refresh_token(
+        self, client: OAuthClient, token: str, scopes: list[str] | None
+    ) -> RefreshToken:
+        """RFC 6749 §6: check a refresh token is this client's and still good.
+
+        Every no is ``invalid_grant``, the same error a bad code gets, for
+        the same reason: "never issued", "revoked", and "someone else's"
+        must look identical to a program that might be guessing.  The
+        ``error_description`` tells the human which one it was.
+
+        Unlike a code, a refresh token is *not* spent here.  It can be
+        redeemed again and again, and the same string comes back in the
+        response — see ``token_response`` on rotation.
+
+        ``scopes`` is the optional ``scope`` field.  RFC 6749 §6 lets a
+        client ask for a *narrower* set on refresh; nobody Fauxbus serves
+        sends one (globus-sdk's ``oauth2_refresh_token`` sends exactly
+        two fields), so asking for the same set is fine and asking for a
+        different one is a 501 rather than a guess at Globus's rules.
+        """
+        record = self.refresh_tokens.get(token)
+        if record is None:
+            raise invalid_grant(
+                "no such refresh token was issued here. Refresh tokens come from a login that "
+                "asked for offline access (access_type=offline, or the offline_access scope)."
+            )
+        if record.client_id != client.client_id:
+            raise invalid_grant("that refresh token was issued to a different client.")
+        if record.revoked:
+            raise invalid_grant(
+                "that refresh token was revoked through POST /v2/oauth2/token/revoke; the "
+                "person has to sign in again."
+            )
+        if record.account not in self.accounts or (
+            record.identity_id not in self.accounts[record.account].identities
+        ):
+            # Only reachable if a harness re-seeded the people out from
+            # under a refresh token; the seed door validates it otherwise.
+            raise invalid_grant("the account behind that refresh token no longer exists.")
+        if scopes is not None and sorted(scopes) != sorted(record.scopes):
+            raise not_implemented(
+                f"this refresh asks for scope {' '.join(scopes)!r}, and the refresh token was "
+                f"granted {' '.join(record.scopes)!r}. Narrowing scopes on refresh (RFC 6749 §6) "
+                f"is not built; send no 'scope', or the same set. Real client code narrows?"
+            )
+        return record
 
     def token_response(
         self, issued: IssuedToken, others: list[IssuedToken] | None = None
@@ -965,6 +1112,24 @@ class World:
         ``expires_in`` is computed against the current clock rather than
         stored, so a token fetched, then aged with ``/_fauxbus/tick``,
         then re-rendered still reports the truth.
+
+        ``refresh_token`` is on an entry only when that token has one,
+        and *absent* — not null — otherwise.  RECORDED, by comparing the
+        two variants of ``oauth2_get_dependent_tokens.py``: the plain one
+        has no such key.  The SDK reads it with ``.get`` either way.
+
+        On a refresh, the refresh token that comes back is the same
+        string that went in.  That it comes back at all is pinned from
+        the reader's side: ``UserApp`` stores every refresh response
+        through ``TokenStorage.store_token_response``, which overwrites
+        the stored ``refresh_token`` with the response's ``.get`` — so a
+        response without one would leave the app holding None, and its
+        next start would fail for want of a refresh token.  Whether
+        Globus hands back the *same* string or rotates to a new one is
+        PROVISIONAL.  Fauxbus does not rotate, because the two ways of
+        being wrong are not equal: a fake that rotates against a service
+        that does not would break consumers that work in production,
+        and that is the direction a fake must never err in.
         """
         return {
             **self._token_fields(issued),
@@ -972,14 +1137,17 @@ class World:
         }
 
     def _token_fields(self, issued: IssuedToken) -> dict[str, Any]:
-        """The five fields every token in a token document carries."""
-        return {
+        """The five fields every token in a token document carries, plus a refresh token if it has one."""
+        fields = {
             "access_token": issued.token,
             "scope": " ".join(issued.scopes),
             "expires_in": max(0, issued.expires_at - self.clock),
             "token_type": "Bearer",
             "resource_server": issued.resource_server,
         }
+        if issued.refresh_token is not None:
+            fields["refresh_token"] = issued.refresh_token
+        return fields
 
     def require_issued(self, token: str, resource_server: str | None) -> IssuedToken:
         """Issued-token mode: the three checks the permissive default cannot make.
@@ -1110,6 +1278,19 @@ class World:
         any resource server is an inference, not a recording.  It is on
         the list.
         """
+        live_refresh = self.refresh_tokens.get(token)
+        if live_refresh is not None and not live_refresh.revoked:
+            # RFC 7662 lets a server answer about refresh tokens too, and
+            # the SDK's docs say Globus does — but every recorded
+            # introspection document is about an access token, and a
+            # refresh token has no ``exp`` to report here.  Answering
+            # ``active: false`` would tell a resource server a live
+            # credential is dead.  PROVISIONAL gap, loud.
+            raise not_implemented(
+                "introspecting a refresh token is not built: the recorded introspection "
+                "document describes access tokens only, and Fauxbus will not guess the "
+                "refresh-token form. Real client code introspects refresh tokens?"
+            )
         issued = self.active_token(token)
         if issued is None:
             # RFC 7662 §2.2, and recorded besides — the SDK's *revoke*
@@ -1203,7 +1384,31 @@ class World:
         expired one does.  Revocation bites under
         ``--require-issued-tokens``, which is the mode where "issued
         here" is a question anyone is asking.
+
+        **A refresh token takes its access tokens with it.**  Login shim
+        step 3.  RFC 7009 §2.1 says a server that can revoke access
+        tokens SHOULD also revoke every access token from the same grant
+        when the refresh token goes, and Fauxbus can, so it does: every
+        access token that travelled with this refresh token, the first
+        one from the login included.  PROVISIONAL as Globus's behaviour.
+        The other direction is the RFC's MAY, and Fauxbus declines it —
+        revoking an access token leaves its refresh token standing,
+        which is what lets an app recover from a leaked access token
+        without making its user sign in again.
+
+        A refresh token stays refusable rather than vanishing, for the
+        same reason an access token's record stays: the next refresh
+        attempt gets "revoked", not "never issued", in its description.
         """
+        refresh = self.refresh_tokens.get(token)
+        if refresh is not None:
+            if refresh.client_id != client.client_id:
+                return
+            refresh.revoked = True
+            for issued in self.tokens.values():
+                if issued.refresh_token == token:
+                    issued.revoked = True
+            return
         issued = self.tokens.get(token)
         if issued is None or issued.client_id != client.client_id:
             return
@@ -1277,6 +1482,7 @@ class World:
         state: str | None,
         nonce: str | None,
         code_challenge: str | None,
+        offline: bool = False,
     ) -> AuthorizationRequest:
         n = self.counters.get("authorization_request", 0)
         self.counters["authorization_request"] = n + 1
@@ -1288,6 +1494,7 @@ class World:
             state=state,
             nonce=nonce,
             code_challenge=code_challenge,
+            offline=offline,
         )
         self.authorization_requests[request.id] = request
         return request
@@ -1365,6 +1572,7 @@ class World:
             authenticated_at=session.authenticated_at,
             issued_at=self.clock,
             expires_at=self.clock + CODE_LIFETIME,
+            offline=request.offline,
         )
         self.authorization_codes[code.code] = code
         del self.authorization_requests[request.id]
@@ -2956,8 +3164,25 @@ class World:
                     "revoked": t.revoked,
                     "account": t.account,
                     "authenticated_at": t.authenticated_at,
+                    "refresh_token": t.refresh_token,
                 }
                 for tok, t in sorted(self.tokens.items())
+            },
+            # Login shim step 3.  Seedable for the same reason access
+            # tokens are: a test of an app's refresh path should not have
+            # to drive a browser login first just to hold a refresh token.
+            "refresh_tokens": {
+                tok: {
+                    "client_id": r.client_id,
+                    "account": r.account,
+                    "identity_id": r.identity_id,
+                    "authenticated_at": r.authenticated_at,
+                    "resource_server": r.resource_server,
+                    "scopes": list(r.scopes),
+                    "issued_at": r.issued_at,
+                    "revoked": r.revoked,
+                }
+                for tok, r in sorted(self.refresh_tokens.items())
             },
             # Slice B.  Configuration first, then who exists, then the
             # login machinery in flight — all of it world state, all of
@@ -2992,6 +3217,7 @@ class World:
                     "state": r.state,
                     "nonce": r.nonce,
                     "code_challenge": r.code_challenge,
+                    "offline": r.offline,
                 }
                 for rid, r in sorted(self.authorization_requests.items())
             },
@@ -3009,6 +3235,7 @@ class World:
                     "issued_at": c.issued_at,
                     "expires_at": c.expires_at,
                     "used": c.used,
+                    "offline": c.offline,
                 }
                 for code, c in sorted(self.authorization_codes.items())
             },
@@ -3144,6 +3371,9 @@ class World:
                 redirect_uris=[_require_redirect_uri(u, client_id) for u in redirect_uris],
                 required_idp=required_idp,
             )
+        # Before access tokens, so an access token's ``refresh_token`` can
+        # be checked against something that already exists.
+        self._load_refresh_tokens(doc)
         # What the mint has not yet reached, the mint still owns.  Read
         # before the loop because the loop must not move it.
         mints_next = self.counters.get("access_token", 0)
@@ -3210,6 +3440,7 @@ class World:
                     if t.get("authenticated_at") is None
                     else _require_int(t["authenticated_at"], f"token {tok!r} authenticated_at")
                 ),
+                refresh_token=self._require_refresh_link(t.get("refresh_token"), str(tok)),
             )
         self._load_logins_in_flight(doc)
         # After pins and clients, because a task's default owner_string
@@ -3376,6 +3607,67 @@ class World:
                 f"counters.{counter} to {n + 1} or more."
             )
 
+    def _require_refresh_link(self, value: Any, tok: str) -> str | None:
+        # A dangling link would make revoking that refresh token miss
+        # this access token without a word — and a revocation that
+        # quietly leaves a credential live is the one kind of quiet a
+        # test about logout cannot afford.
+        if value is None:
+            return None
+        if str(value) not in self.refresh_tokens:
+            raise validation_error(
+                f"token {tok!r} names refresh_token {value!r}, which is not in 'refresh_tokens'."
+            )
+        return str(value)
+
+    def _load_refresh_tokens(self, doc: dict[str, Any]) -> None:
+        """Login shim step 3's seed section: standing rights to refresh.
+
+        Stricter than ``tokens`` about who they belong to, and on purpose.
+        A seeded access token may name a client nobody registered,
+        because using it takes no client at all.  Redeeming a refresh
+        token takes the client's own credentials, so one bound to an
+        unregistered client could never be used — and a seed that
+        contains an unusable credential is a typo, said here rather than
+        at the first refresh.  The same goes for the person: a refresh
+        token mints tokens *as someone*, and that someone must exist.
+        """
+        for tok, r in _require_mapping(doc.get("refresh_tokens"), "refresh_tokens").items():
+            tok = str(tok)
+            self._refuse_unminted("refresh_tokens", tok, REFRESH_TOKEN_PREFIX, "refresh_token")
+            r = _require_mapping(r, f"refresh_tokens[{tok!r}]")
+            for required in ("client_id", "account", "resource_server"):
+                if required not in r:
+                    raise validation_error(f"refresh token {tok!r} requires {required!r}")
+            client_id = _require_uuid(str(r["client_id"]), f"refresh token {tok!r} client_id")
+            if client_id not in self.clients:
+                raise validation_error(f"refresh token {tok!r} names unregistered client {client_id}")
+            account = self._require_account(r["account"], f"refresh token {tok!r}")
+            assert account is not None  # required above; _require_account passes None through
+            identity_id = _require_uuid(
+                str(r.get("identity_id") or account), f"refresh token {tok!r} identity_id"
+            )
+            if identity_id not in self.accounts[account].identities:
+                raise validation_error(
+                    f"refresh token {tok!r}: identity {identity_id} is not in account {account}"
+                )
+            scopes = r.get("scopes") or []
+            if not isinstance(scopes, list) or not all(isinstance(x, str) for x in scopes):
+                raise validation_error(f"refresh token {tok!r} 'scopes' must be a list of strings")
+            self.refresh_tokens[tok] = RefreshToken(
+                token=tok,
+                client_id=client_id,
+                account=account,
+                identity_id=identity_id,
+                authenticated_at=_require_int(
+                    r.get("authenticated_at", self.clock), f"refresh token {tok!r} authenticated_at"
+                ),
+                resource_server=str(r["resource_server"]),
+                scopes=list(scopes),
+                issued_at=_require_int(r.get("issued_at", self.clock), f"refresh token {tok!r} issued_at"),
+                revoked=_require_bool(r.get("revoked", False), f"refresh token {tok!r} revoked"),
+            )
+
     def _load_logins_in_flight(self, doc: dict[str, Any]) -> None:
         """Parked requests, issued codes, and sessions: a half-finished login.
 
@@ -3402,6 +3694,7 @@ class World:
                 "state": _optional_str(r.get("state"), f"{section} {name} state"),
                 "nonce": _optional_str(r.get("nonce"), f"{section} {name} nonce"),
                 "code_challenge": _optional_str(r.get("code_challenge"), f"{section} {name} code_challenge"),
+                "offline": _require_bool(r.get("offline", False), f"{section} {name} offline"),
             }
 
         for rid, r in _require_mapping(doc.get("authorization_requests"), "authorization_requests").items():
@@ -3460,6 +3753,10 @@ class World:
         # next issued token is `fauxbus-at-0` again, as determinism wants.
         self.clients = {}
         self.tokens = {}
+        # Refresh tokens most of all: one that outlived a reset would let
+        # the next test mint fresh, live access tokens for the last test's
+        # user, with no login anywhere in sight.
+        self.refresh_tokens = {}
         # And every login in flight with them: a code that survived a
         # reset could be redeemed by the next test, and a session that
         # survived would sign the next test's browser in as the last

@@ -212,8 +212,7 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
        back with ``error=`` and the client's ``state``, per §4.1.2.1 —
        the client's own callback is the place it handles these.
     3. **The client asked for something Globus does and Fauxbus has not
-       built** (refresh tokens, ``prompt`` values other than ``login``,
-       PKCE ``plain``).  A loud 501, rendered — not redirected, because
+       built** (``prompt`` values other than ``login``, PKCE ``plain``).  A loud 501, rendered — not redirected, because
        an OAuth ``error=`` code would tell the client *it* was wrong,
        and it was not.  Same three-way split as the token endpoint's
        grant types, for the same reason.
@@ -239,14 +238,18 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
             )
         )
 
+    # Offline access, two spellings, one bool (login shim step 3).  The
+    # broker's ``offline_access`` comes *out* of the scope list here,
+    # because it names no service and would otherwise reach
+    # scopes_by_resource_server as a scope nobody can mint a token for.
+    # So it is not in the issued tokens' ``scope`` strings either —
+    # PROVISIONAL: whether Globus echoes it there is unrecorded, and a
+    # scope string that named a non-service would be the odd one out.
+    requested = split_scopes(query.get("scope", ""))
+    scopes = [s for s in requested if s != REFRESH_SCOPE]
+    offline = REFRESH_SCOPE in requested or query.get("access_type") == OFFLINE_ACCESS_TYPE
+
     # --- kind 3: Fauxbus's gaps, said before anything is parked ---------
-    scopes = split_scopes(query.get("scope", ""))
-    if REFRESH_SCOPE in scopes or query.get("access_type") == OFFLINE_ACCESS_TYPE:
-        raise not_implemented(
-            f"this authorization request asks for offline access ({REFRESH_SCOPE!r} or "
-            f"access_type={OFFLINE_ACCESS_TYPE!r}), and Fauxbus does not issue refresh tokens "
-            f"yet. Real client code needs to refresh?"
-        )
     prompt = query.get("prompt")
     if prompt not in (None, "login"):
         # ``none`` matters most: it means "never show UI", and answering
@@ -309,6 +312,7 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
         state=state,
         nonce=query.get("nonce"),
         code_challenge=challenge,
+        offline=offline,
     )
     session = session_from(ctx)
     # DOCUMENTED: prompt=login means "the user will be redirected to log

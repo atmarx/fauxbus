@@ -255,14 +255,17 @@ def test_missing_scope_is_invalid_request(registered):
 def test_a_grant_globus_has_but_fauxbus_lacks_is_a_loud_501(registered):
     """Principle 2's sharpest edge, and the reason GLOBUS_GRANT_TYPES exists.
 
-    Globus supports refresh_token perfectly well; Fauxbus is the one that
-    has not built it. Answering ``unsupported_grant_type`` would be the
-    fake telling a lie about the real service on its own behalf. 501 with
-    a tracker link says whose gap it is.  (This test used
-    authorization_code until slice B built it.)
+    Globus supports the dependent-token grant perfectly well; Fauxbus is
+    the one that has not built it. Answering ``unsupported_grant_type``
+    would be the fake telling a lie about the real service on its own
+    behalf. 501 with a tracker link says whose gap it is.  (This test used
+    authorization_code until slice B built it, and refresh_token until
+    login shim step 3 did.)
     """
     status, doc, _ = registered.form_post(
-        TOKEN, {"grant_type": "refresh_token", "refresh_token": "x"}, basic=CREDS
+        TOKEN,
+        {"grant_type": "urn:globus:auth:grant_type:dependent_token", "token": "x"},
+        basic=CREDS,
     )
     assert status == 501
     assert doc["code"] == "NOT_IMPLEMENTED"
@@ -373,8 +376,9 @@ def test_openid_refuses_rather_than_omit_the_id_token(registered):
 def test_a_request_for_a_refresh_token_names_the_right_gap(registered):
     """The same lesson as ``openid``, one field over — and it used to lie.
 
-    ``offline_access`` asks for a ``refresh_token`` field. Fauxbus has no
-    refresh-token grant, so the honest answer is the 501.
+    ``offline_access`` asks for a ``refresh_token`` field, and under
+    client_credentials Fauxbus will not give one (RFC 6749 §4.4.3; see
+    ``_refuse_refresh_requests``), so the honest answer is the 501.
 
     What makes this a regression test and not just a feature test is what
     it used to do instead. ``offline_access`` was filed with the other
