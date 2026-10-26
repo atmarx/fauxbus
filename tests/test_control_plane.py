@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
 
 import pytest
 from conftest import BOB, PINS, files, make_task, transfer_seed
@@ -15,7 +17,7 @@ def test_index_names_itself(fx):
     assert status == 200
     assert doc["imitates"] == [
         "groups v2",
-        "auth v2 (client_credentials, authorization_code + OIDC)",
+        "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",
         "transfer v0.10 (endpoint_manager task monitoring)",
     ]
     assert doc["sdk_pin"] == "4.8.1"
@@ -176,6 +178,31 @@ def test_tick_advances_logical_clock_only(fx):
     fx.post("/_fauxbus/reset")
     _, state, _ = fx.get("/_fauxbus/state")
     assert state["clock"] == 0
+
+
+def test_curl_dash_d_json_is_refused_not_misread(fx):
+    """``curl -d '{"seconds": 60}'`` labels the JSON as a form.
+
+    It used to tick one second — the form's only field is named
+    ``{"seconds": 60}``, so ``seconds`` was missing and defaulted —
+    while the README showed exactly that command.  Now it is a 400 that
+    names curl and the fix, and the clock has not moved.
+    """
+    status, doc, _ = fx.form_post(
+        "/_fauxbus/tick", {}, content_type="application/x-www-form-urlencoded"
+    )
+    assert status == 200 and doc == {"clock": 1}  # an empty form is still a bare tick
+
+    req = urllib.request.Request(
+        fx.base_url + "/_fauxbus/tick", data=b'{"seconds": 60}', method="POST"
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with pytest.raises(urllib.error.HTTPError) as err:
+        urllib.request.urlopen(req, timeout=10)
+    assert err.value.code == 400
+    assert "curl" in json.loads(err.value.read())["detail"]
+    _, state, _ = fx.get("/_fauxbus/state")
+    assert state["clock"] == 1
 
 
 def test_seed_state_round_trip_is_byte_identical(fx):

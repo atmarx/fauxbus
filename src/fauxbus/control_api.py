@@ -25,7 +25,7 @@ def index(ctx: Ctx) -> tuple[int, Any]:
         "sdk_pin": SDK_PIN,
         "imitates": [
             "groups v2",
-            "auth v2 (client_credentials, authorization_code + OIDC)",
+            "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",
             "transfer v0.10 (endpoint_manager task monitoring)",
         ],
         "require_issued_tokens": ctx.server.require_issued_tokens,

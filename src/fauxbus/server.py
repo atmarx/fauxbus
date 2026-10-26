@@ -434,7 +434,7 @@ class FauxbusHandler(BaseHTTPRequestHandler):
         """
         self.close_connection = True
 
-    def _read_body(self) -> tuple[Any, str]:
+    def _read_body(self, *, control: bool = False) -> tuple[Any, str]:
         """Read the body and say, honestly, how it was encoded.
 
         Fauxbus spoke only JSON until the OAuth2 token endpoint arrived,
@@ -450,6 +450,18 @@ class FauxbusHandler(BaseHTTPRequestHandler):
         thrown away, because "you sent JSON to an endpoint that takes a
         form" is a specific mistake worth naming, and by the time a
         handler sees a dict there is no way left to tell.
+
+        The opposite mistake has a famous author: ``curl -d`` labels
+        *every* body as a form, so ``curl -d '{"seconds": 60}'`` reaches
+        here as a form whose one field is named ``{"seconds": 60}``.  On
+        the control plane that used to fail silently — ``tick`` read no
+        ``seconds`` and advanced the default one, while this file's own
+        README showed the command.  So for ``control`` paths, a form
+        body that is plainly JSON text is refused with the fix in the
+        message.  Plainly, because no real form field's name starts with
+        ``{``; the account picker's genuine browser form never trips it.
+        The imitated surface is left alone: what Globus answers that
+        mistake with is Globus's business, and not Fauxbus's to improve.
         """
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
@@ -461,6 +473,15 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                 decoded = raw.decode("utf-8")
             except UnicodeDecodeError:
                 raise ApiError(400, "BAD_REQUEST", "form body is not valid UTF-8") from None
+            if control and decoded.lstrip().startswith(("{", "[")):
+                raise ApiError(
+                    400,
+                    "BAD_REQUEST",
+                    "this body is JSON but its Content-Type says form "
+                    f"({FORM_CONTENT_TYPE}) — curl -d does that to every body. The control "
+                    "plane takes JSON: use curl --json, or add -H 'Content-Type: "
+                    "application/json'.",
+                )
             # keep_blank_values so ``scope=`` survives as an empty string
             # rather than vanishing: "you sent an empty scope" and "you
             # sent no scope" deserve different answers.  First value wins
@@ -508,7 +529,7 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                 # the line is now drawn by exclusion rather than by prefix.
                 if self._maybe_inject(method, path):
                     return
-            body, body_encoding = self._read_body()
+            body, body_encoding = self._read_body(control=path.startswith("/_fauxbus"))
             route, saw_path = self._find_route(method, path)
             if route is None:
                 if saw_path:
