@@ -51,6 +51,10 @@ So, until the first recording session is possible:
       to `--version`, the banner, and `GET /_fauxbus/`.  A checklist
       that names one of two sources of truth is a checklist that walks
       you confidently past the bug.
+- [ ] README's "`main` runs ahead of PyPI" line: drop it in the release
+      commit (PyPI renders the README, so a release that says it is
+      behind itself is wrong on its own page), and restore it in the
+      `.dev0` bump if anything unreleased lands after.
 - [ ] Confirm the artifact agrees before you tag: `python -m build`
       then check `dist/` is named for the version you meant.  (CI's
       tagged pipeline enforces this too, but after the tag exists.)

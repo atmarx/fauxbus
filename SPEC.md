@@ -59,9 +59,12 @@ client.
 1. **The SDK is the contract.**  Fauxbus imitates what the official
    `globus-sdk` actually sends and expects, pinned to a stated SDK version.
    Endpoint paths, payload shapes, and error documents are derived from the
-   SDK's own calls and from responses recorded against the real service —
-   never from guesswork.  If the SDK's method works against Fauxbus, that's
-   the definition of working.
+   SDK's own calls and from responses recorded against the real service.
+   Where no recording exists yet, the inference is marked `PROVISIONAL` in
+   code and listed as an obligation (see "Recorded, documented,
+   provisional") — a guess is allowed only if it is labelled as one.  If
+   the SDK's method works against Fauxbus, that's the definition of
+   working.
 2. **Only what's used.**  Endpoints are added because a real consumer needs
    them, not for coverage's sake.  An unimplemented endpoint returns a loud
    `501` with a "file an issue" pointer — never a silent wrong answer.  The
@@ -1143,6 +1146,14 @@ service and the fake ever answer differently, this suite is where it shows
 — it is the mechanism that keeps Fauxbus from becoming someone's fiction,
 and a divergence is a release-blocking bug in Fauxbus, not in the caller.
 
+**Where it stands: one leg of two.**  The Fauxbus leg runs on every CI
+push.  The real-service leg has never run, because it needs a
+sacrificial tenancy and none exists yet.  Until one does, each release
+ships its PROVISIONAL inventory in its notes instead (RELEASING.md §0),
+and the recording list under "Recorded, documented, provisional" is the
+work that leg would do.  This paragraph exists because the one above
+read, for months, as if both legs were running.
+
 ## Roadmap (after Groups earns its keep)
 
 - **Reordered 2026-10-14: Transfer task monitoring first.**  Andrew,
@@ -1441,6 +1452,20 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.27** (2026-10-29) — **Docs pass for public readers**, ahead of
+  pointing Globus at the repo.  Three claims said more than was true.
+  The conformance tether described its real-service leg as if it ran;
+  it never has, since there is no tenancy, and the section now says so.
+  Principle 1 and the README's "Fake, not mock" both said "never
+  guesswork," in a codebase with 54 `PROVISIONAL` markers; both now
+  say what the codebase actually does, which is to label every guess.
+  And the README described native apps and refresh tokens to readers
+  whose `pipx install` gets 0.4.0, which has neither; it now says
+  `main` is ahead and how to install it, and RELEASING gains the step
+  that drops that line at release.  The README's status paragraph, one
+  eighteen-line sentence, is now a list.  `examples/compose.yaml` no
+  longer suggests pointing at a published image that does not exist.
 
 - **v0.2.26** (2026-10-26) — **Login shim, step 3: refresh tokens.**
   Ask for offline access either way — globus-sdk's

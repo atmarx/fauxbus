@@ -32,24 +32,31 @@ a 429 on exactly the request where your retry logic needs exercise, an
 identity that is already in the group, a batch action that partially
 fails the way the real service partially fails.
 
-**Status: early but real.**  The complete `GroupsClient` surface of
-globus-sdk 4.8.1 is implemented — all fourteen methods, all eleven
-batch membership verbs — plus the OAuth2 **client-credentials grant** at
-`POST /v2/oauth2/token`, so a service can fetch a token as itself and
-then spend it, and the **introspection** and **revocation** endpoints
-that go with it, so the service on the receiving end can ask whether
-the token it was handed is real and the service that issued one can
-take it back — plus the **OIDC authorization-code flow**, so a real
-identity broker like Keycloak can sign a seeded person in through
-Fauxbus, linked identities and all — plus **Transfer task
-monitoring**, the `endpoint_manager_*` calls a service uses to watch
-other people's transfers into a collection.  The conformance suite
-drives all of it through the
-actual globus-sdk, unmodified, including the SDK's retry layer
-recovering through an injected 429.  Response shapes not yet backed by a
-recording are marked `PROVISIONAL` in code and tracked as conformance
-obligations.  Nothing is stable yet — see [SPEC.md](SPEC.md) for the
-full design.
+**Status: early but real.**  Imitated today, against globus-sdk 4.8.1:
+
+- **Groups** — the complete `GroupsClient` surface: all fourteen
+  methods, all eleven batch membership verbs.
+- **Auth, as a service** — the client-credentials grant, so a service
+  can fetch a token as itself and spend it, plus introspection and
+  revocation, so a resource server can ask whether a token is real and
+  an issuer can take one back.
+- **Auth, as a person** — the authorization-code flow with OIDC, so a
+  real broker like Keycloak can sign a seeded person in, linked
+  identities and all; native apps with PKCE and no secret, including
+  the SDK's `UserApp`; and refresh tokens, so an app can stay signed in
+  past expiry.
+- **Transfer task monitoring** — the `endpoint_manager_*` calls a
+  service uses to watch other people's transfers into a collection.
+
+The conformance suite drives all of it through the actual globus-sdk,
+unmodified, including the SDK's retry layer recovering through an
+injected 429.  Response shapes not yet backed by a recording are marked
+`PROVISIONAL` in code and tracked as conformance obligations — that
+list is in [SPEC.md](SPEC.md), along with the full design.  Nothing is
+stable yet.
+
+`main` runs ahead of PyPI: native apps and refresh tokens are here and
+land in the next release, 0.5.0.  [Changelog](SPEC.md#changelog).
 
 ## Fake, not mock
 
@@ -57,8 +64,10 @@ Your code doesn't know Fauxbus is there.  No monkeypatching, no fixture
 dicts shaped like your guess about what Globus returns.  The client
 library you ship is the client library you test against — Fauxbus
 imitates what `globus-sdk` actually sends and expects, pinned to a
-stated SDK version and derived from real recorded responses, never
-guesswork.
+stated SDK version.  Shapes come from the SDK's own recorded fixtures
+where they exist, from the published docs where they don't, and where
+neither reaches, the guess is labelled `PROVISIONAL` in the code rather
+than passed off as fact.
 
 If canned responses inside a Python unit test are all you need, use the
 SDK's own `globus_sdk.testing` — that's the in-process layer, and its
@@ -73,9 +82,11 @@ pipx install fauxbus
 fauxbus serve --port 9800
 ```
 
-Point your app at that port (next section) and run your existing test
-suite.  Groups and Auth's login and client-credentials flows are here;
-of `TransferClient`, only the task-monitoring calls exist so far.
+Released on [PyPI](https://pypi.org/project/fauxbus/); `pipx install
+git+https://github.com/atmarx/fauxbus` gets `main`.  Point your app at
+that port (next section) and run your existing test suite.  Groups and
+Auth's login and client-credentials flows are here; of
+`TransferClient`, only the task-monitoring calls exist so far.
 Anything else meets an honest `501` — see below.
 
 ## Point your app at Fauxbus
@@ -120,7 +131,8 @@ redirect instead of a terminal — the conformance suite's
 Then drive the person from the test.  Seed accounts and a login client
 (see "Brokered login" below).  `POST /_fauxbus/auth/session` signs a
 headless test in so the authorize page skips the account picker, or the
-test can walk the picker over plain HTTP, the way a browser would.  The person's Groups token acts as them, and changing
+test can walk the picker over plain HTTP, the way a browser would.
+The person's Groups token acts as them, and changing
 their group memberships changes what your app sees on its next check:
 the "let them in if they're in the group" test, with the test deciding
 the answer.

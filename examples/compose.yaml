@@ -8,7 +8,8 @@
 #   curl -s http://localhost:9800/_fauxbus/state | python -m json.tool
 #
 # In your own stack, copy the fauxbus service block and either build
-# from a checkout (as here) or point `image:` at a published one.
+# from a checkout (as here) or point `image:` at one you built and
+# pushed yourself — Fauxbus publishes no image of its own.
 
 services:
   fauxbus:
