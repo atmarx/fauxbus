@@ -844,6 +844,12 @@ price is that a Keycloak user who forgets the flag gets ID tokens from
 section leads with it, and `examples/seed.json` — the copyable pattern —
 sets `"wall"`.
 
+`fauxbus.testing.running_fauxbus` defaults to `"wall"` (since v0.2.28),
+and that is this rule being followed rather than broken: the harness is
+the one that decides, and it says so in its signature.  It exists to run
+a real SDK in the test's own process, and the SDK is an outside verifier
+of ID tokens.  `fauxbus serve` stays logical.
+
 ### Issuer versus reachability
 
 In a compose network the browser reaches Fauxbus as
@@ -1204,7 +1210,7 @@ read, for months, as if both legs were running.
      expiry.  There is no refresh fixture in 4.8.1: the shape is pinned
      from the reader's side (`refresh_token` via `.get`), and whether
      Globus rotates refresh tokens is PROVISIONAL.
-  4. **`fauxbus.testing`, an in-process harness.**  A context manager
+  4. **`fauxbus.testing`, an in-process harness.**  *Done in v0.2.28.*  A context manager
      (and a pytest fixture when pytest is present) that starts a server
      on a free port, seeds it, and gives a test `sign_in(account)`,
      `tick(seconds)`, `fail(...)`, `state()`.  These are thin wrappers
@@ -1452,6 +1458,44 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.28** (2026-10-30) — **Login shim, step 4: `fauxbus.testing`.**
+  `running_fauxbus(seed=...)` starts a server on a free port, seeds it
+  as canonical, points `GLOBUS_SDK_SERVICE_URL_*` at it, and restores
+  them on exit.  It yields a `Fauxbus`, which is an HTTP client and
+  nothing else: `login`, `login_flow_manager`, `sign_in`, `tick`, `fail`,
+  `clear_failures`, `state`, `seed`, `reset`, and `control` for the rest
+  of the surface.  With `pytest_plugins = ["fauxbus.testing"]` there are
+  `fauxbus` and `fauxbus_options` fixtures, and no `pytest11` entry
+  point, so nobody loads it without asking.  Stdlib only; globus-sdk is
+  imported inside `login_flow_manager` alone.
+
+  **The acceptance test now passes:** an unmodified `UserApp` signs in as
+  the account the test named, is ticked past expiry and refreshes with
+  no second login, and gets an injected 403 as its own `GroupsAPIError`.
+  No `base_url`, and no terminal.  **The milestone's other half is
+  unproved:** identities lookup and a second relying party (steps 5 and
+  6) are still to come.
+
+  **No backdoor, checked:** the roadmap's "never a backdoor into
+  `World`" is a test that reads the module's AST.  The one thing the
+  harness sets on the server directly is `default_issuer`, the field
+  `--issuer` fills, because the address does not exist until the socket
+  is bound.
+
+  **Three defaults, each chosen for the failure it prevents.**
+  `point_env=True`, because the alternative's failure is a test talking
+  to the real Globus.  `signed_token_clock="wall"`, because on the
+  logical clock the SDK's first `decode_id_token` raises "expired" (see
+  "Clocks").  `times=None` on `fail`, matching the route, because the SDK
+  retries a 429 or 5xx by itself, so a `times=1` default would hide the
+  failure from the app.
+
+  **Caught by a mutant:** the first proxy test passed with the fix
+  removed.  urllib reads proxy settings when an opener is built, the
+  harness builds its opener at import, and `monkeypatch` arrived too
+  late.  It runs in a fresh process now.  336 tests; `PROVISIONAL`
+  count unchanged, since the imitated surface did not move.
 
 - **v0.2.27** (2026-10-29) — **Docs pass for public readers**, ahead of
   pointing Globus at the repo.  Three claims said more than was true.

@@ -55,8 +55,8 @@ injected 429.  Response shapes not yet backed by a recording are marked
 list is in [SPEC.md](SPEC.md), along with the full design.  Nothing is
 stable yet.
 
-`main` runs ahead of PyPI: native apps and refresh tokens are here and
-land in the next release, 0.5.0.  [Changelog](SPEC.md#changelog).
+`main` runs ahead of PyPI: native apps, refresh tokens and the
+`fauxbus.testing` harness are here and land in the next release, 0.5.0.  [Changelog](SPEC.md#changelog).
 
 ## Fake, not mock
 
@@ -102,8 +102,8 @@ export GLOBUS_SDK_SERVICE_URL_TRANSFER=http://localhost:9800/
 ```
 
 All three are the bare root, Groups included: the SDK's own paths
-already start with `/v2/`.  In a pytest suite, `monkeypatch.setenv` does
-the same per test.  This covers `ConfidentialAppAuthClient` login flows,
+already start with `/v2/`.  In a Python test suite,
+[`fauxbus.testing`](#from-a-python-test) does this for you.  This covers `ConfidentialAppAuthClient` login flows,
 native apps (`NativeAppAuthClient`, and the SDK's `UserApp`), and the
 SDK's `ClientApp`, which fetches its own tokens; the conformance suite
 runs all of them this way.
@@ -123,10 +123,7 @@ code.  Fauxbus serves that page and allows it for every native client,
 matched against the issuer, so point `GLOBUS_SDK_SERVICE_URL_AUTH` at
 the same name you gave `--issuer`.  A test never needs the page: the
 code is already in the `Location` header of the redirect that leads to
-it.  For `UserApp`, subclass the SDK's `CommandLineLoginFlowManager`
-and override `print_authorize_url` and `prompt_for_code` to walk that
-redirect instead of a terminal — the conformance suite's
-`test_the_sdks_user_app_runs_unmodified` is a working copy.
+it.  `fauxbus.testing` walks that redirect for you, for `UserApp` too.
 
 Then drive the person from the test.  Seed accounts and a login client
 (see "Brokered login" below).  `POST /_fauxbus/auth/session` signs a
@@ -136,6 +133,68 @@ The person's Groups token acts as them, and changing
 their group memberships changes what your app sees on its next check:
 the "let them in if they're in the group" test, with the test deciding
 the answer.
+
+### From a Python test
+
+`fauxbus.testing` starts a server on a free port, seeds it, points the
+SDK at it, and puts it all back afterwards:
+
+```python
+from fauxbus.testing import running_fauxbus
+
+with running_fauxbus(seed="seed.json") as fb:
+    app = globus_sdk.NativeAppAuthClient(CLIENT_ID)
+    app.oauth2_start_flow("openid")
+    code = fb.login(app.oauth2_get_authorize_url(), ALICE).code
+    tokens = app.oauth2_exchange_code_for_tokens(code)
+```
+
+Your test then decides what happens next:
+
+| | |
+|---|---|
+| `fb.login(url, account)` | Be the browser: follow an authorize URL and pick an account.  Returns `.code`, `.state`, `.error` and the whole `.location`, for a web app's callback route. |
+| `fb.login_flow_manager(account)` | Hand this to `GlobusAppConfig(login_flow_manager=...)` and a `UserApp` logs in with nobody at the terminal. |
+| `fb.sign_in(account)` | The `Cookie` value that makes authorize skip the picker, for a real browser. |
+| `fb.tick(seconds)` | Move the logical clock. |
+| `fb.fail(path, status, times=...)` | Arm a failure.  The SDK retries a 429 or 5xx by itself, so `times=1` usually tests its retry and your app never sees the failure. |
+| `fb.clear_failures()`, `fb.reset()`, `fb.seed(doc)`, `fb.state()` | The rest of the everyday control plane. |
+| `fb.control(method, path, body)` | Any other `/_fauxbus/` route, such as creating a transfer task. |
+| `fb.env` | The environment that points a subprocess here. |
+
+A refusal raises `FauxbusError` at the call that caused it, with
+`.status` and `.body`.
+
+Three defaults are worth knowing:
+
+- **The environment is pointed for you.**  Forgetting to would send an
+  unmodified app to the real Globus, so this is on unless you pass
+  `point_env=False`.  It is process-wide, so tests running in parallel
+  threads want `point_env=False` and `fb.env`.
+- **ID tokens carry real time**, unlike `fauxbus serve`, because the SDK
+  checks them against the real clock when it decodes them.  Access
+  tokens and codes still expire by `tick`.  Pass
+  `signed_token_clock="logical"` to get byte-identical ID tokens.
+- **Any bearer token works**, as on any Fauxbus.  For a `tick` to kill a
+  token, pass `require_issued_tokens=True`.
+
+For pytest, add `pytest_plugins = ["fauxbus.testing"]` to your top-level
+`conftest.py`.  Each test that takes the `fauxbus` fixture gets a fresh
+server.  Override the `fauxbus_options` fixture to pass arguments:
+
+```python
+@pytest.fixture
+def fauxbus_options():
+    return {"seed": "seed.json", "require_issued_tokens": True}
+
+def test_login(fauxbus):
+    ...
+```
+
+These methods only make HTTP calls, so `Fauxbus("http://fauxbus:9800")`
+drives a server in a compose stack the same way.  The harness needs
+neither pytest nor globus-sdk, apart from `login_flow_manager`, which
+needs the SDK.
 
 ## Tokens
 
