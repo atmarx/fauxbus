@@ -73,6 +73,7 @@ from globus_sdk.login_flows import CommandLineLoginFlowManager  # noqa: E402
 
 from fauxbus import signing  # noqa: E402
 from fauxbus.ids import identity_id_for_token  # noqa: E402
+from fauxbus.testing import running_fauxbus  # noqa: E402
 
 # The stated SDK contract version, as one literal.  SPEC.md and README
 # both say Fauxbus imitates globus-sdk 4.8.1; pyproject pins it exactly.
@@ -1110,3 +1111,82 @@ def test_the_sdks_user_app_keeps_working_past_expiry(strict_pointed):
     _, state, _ = fx.get("/_fauxbus/state")
     grants = sorted(t["grant_type"] for t in state["tokens"].values())
     assert grants.count("refresh_token") == 2
+
+
+# ------------------------------------ login shim step 4: fauxbus.testing
+#
+# The milestone's acceptance test, written the way a consumer would write
+# it: the harness starts everything, nothing here has a base_url, and the
+# test decides who signs in, when tokens expire, and which call fails.
+
+
+def harness_seed() -> dict:
+    """The conftest world, minus its issuer: the harness supplies that."""
+    doc = oidc_seed("placeholder")
+    del doc["oidc"]
+    return doc
+
+
+def test_a_native_app_logs_in_through_the_harness_in_five_lines():
+    with running_fauxbus(seed=harness_seed()) as fb:
+        app = NativeAppAuthClient(NATIVE_CLIENT)
+        app.oauth2_start_flow("openid")
+        code = fb.login(app.oauth2_get_authorize_url(), ALICE_GLOBUSID).code
+        tokens = app.oauth2_exchange_code_for_tokens(code)
+        # decode_id_token verifies against real time, which is why the
+        # harness defaults its signed-token clock to the wall.
+        assert tokens.decode_id_token()["sub"] == ALICE_GLOBUSID
+
+
+def test_a_web_app_gets_its_own_state_back_through_the_harness():
+    with running_fauxbus(seed=harness_seed()) as fb:
+        app = ConfidentialAppAuthClient(LOGIN_CLIENT, LOGIN_SECRET)
+        app.oauth2_start_flow(LOGIN_REDIRECT, "openid", state="csrf-check")
+        login = fb.login(app.oauth2_get_authorize_url(), BOB_GLOBUSID)
+        assert login.state == "csrf-check"
+        tokens = app.oauth2_exchange_code_for_tokens(login.code)
+        assert tokens.decode_id_token()["sub"] == BOB_GLOBUSID
+
+
+def test_user_app_outlives_its_tokens_and_survives_a_failure_with_nobody_at_the_keyboard():
+    """The acceptance test: an unmodified ``UserApp``, the test driving all three levers."""
+    with running_fauxbus(seed=harness_seed(), require_issued_tokens=True) as fb:
+        app = UserApp(
+            "fauxbus-conformance",
+            client_id=NATIVE_CLIENT,
+            config=GlobusAppConfig(
+                token_storage="memory",
+                login_flow_manager=fb.login_flow_manager(ALICE_GLOBUSID),
+                request_refresh_tokens=True,
+            ),
+        )
+        groups = GroupsClient(app=app)
+        gid = groups.create_group({"name": "Long-running", "description": ""})["id"]
+
+        # Who signed in: the test said alice.
+        state = fb.state()
+        assert {t["identity_id"] for t in state["tokens"].values()} == {ALICE_GLOBUSID}
+
+        # When tokens expire: past this tick the app's token is dead, and
+        # it refreshes without another login.
+        fb.tick(172801)
+        assert gid in {g["id"] for g in groups.get_my_groups()}
+        state = fb.state()
+        assert len(state["authorization_codes"]) == 1
+        assert "refresh_token" in {t["grant_type"] for t in state["tokens"].values()}
+
+        # Which call fails: this one, as the app's own exception.
+        rule = fb.fail("/v2/groups/my_groups", 403, body={"code": "FORBIDDEN"})
+        with pytest.raises(GroupsAPIError) as caught:
+            groups.get_my_groups()
+        assert caught.value.http_status == 403
+        fb.clear_failures(rule)
+        assert gid in {g["id"] for g in groups.get_my_groups()}
+
+
+def test_the_harness_points_the_sdk_and_takes_it_back(monkeypatch):
+    """The other half of pointing: outside the block, the SDK is not aimed here."""
+    monkeypatch.delenv("GLOBUS_SDK_SERVICE_URL_GROUPS", raising=False)
+    with running_fauxbus() as fb:
+        assert GroupsClient().base_url == fb.url + "/"
+    assert "fauxbus" not in GroupsClient().base_url and "127.0.0.1" not in GroupsClient().base_url
