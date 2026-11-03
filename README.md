@@ -43,8 +43,9 @@ fails the way the real service partially fails.
 - **Auth, as a person** — the authorization-code flow with OIDC, so a
   real broker like Keycloak can sign a seeded person in, linked
   identities and all; native apps with PKCE and no secret, including
-  the SDK's `UserApp`; and refresh tokens, so an app can stay signed in
-  past expiry.
+  the SDK's `UserApp`; refresh tokens, so an app can stay signed in
+  past expiry; and identities lookup, so `IdentityMap` can turn a
+  username into a UUID and back.
 - **Transfer task monitoring** — the `endpoint_manager_*` calls a
   service uses to watch other people's transfers into a collection.
 
@@ -55,8 +56,9 @@ injected 429.  Response shapes not yet backed by a recording are marked
 list is in [SPEC.md](SPEC.md), along with the full design.  Nothing is
 stable yet.
 
-`main` runs ahead of PyPI: native apps, refresh tokens and the
-`fauxbus.testing` harness are here and land in the next release, 0.5.0.  [Changelog](SPEC.md#changelog).
+`main` runs ahead of PyPI: native apps, refresh tokens, identities
+lookup and the `fauxbus.testing` harness are here and land in the next
+release, 0.5.0.  [Changelog](SPEC.md#changelog).
 
 ## Fake, not mock
 
@@ -301,6 +303,23 @@ The fixture signing key is published in `src/fauxbus/signing.py` on
 purpose.  Anyone can forge a Fauxbus token, so nobody can be tempted to
 trust one.  Never configure it as a trusted issuer anywhere real —
 and Fauxbus refuses to run with an issuer under a Globus domain.
+
+## Looking people up
+
+`AuthClient.get_identities` and `IdentityMap` work against the people a
+seed describes under `accounts`, linked identities included: each comes
+back with its username, provider, name, email and organization, by UUID
+or by username.  An identity nobody seeded is simply absent, as it would
+be at Globus.
+
+The exception is an identity Fauxbus knows *of* but cannot describe: a
+registered client, a pinned token, or a group member seeded by bare
+UUID.  Globus would return a full record for each, and Fauxbus has no
+provider or name to give, so the lookup answers with a 501 rather than
+pretend they do not exist.  If your app shows names for group members,
+seed those members as accounts.  `provision=true` for an unknown
+username is a 501 too: Globus would create the identity, and Fauxbus
+does not.
 
 ## Watching transfers
 

@@ -337,6 +337,23 @@ not have asked before the code existed:
     err in — but an app that forgets to save a rotated token would pass
     here and fail there.
 
+27. **How the identities lookup behaves off the happy path.**  The
+    record is RECORDED (`get_identities.py`) and the SDK's own log line
+    says ids and usernames together are an error.  Four things are
+    inferred, under five markers.  That an identity nobody holds is **left out**
+    rather than refused, which is what `IdentityMap` is written for
+    (`World.lookup_identities`).  That the answer comes back **in the
+    order asked** (same place).  That usernames match **exactly**, with
+    no case folding (`World._account_identity_by_username`).  And the
+    **400** for both parameters, status and body (`errors.auth_bad_request`).
+    Two refusals are Fauxbus's own gaps, not guesses about Globus, and
+    say so as 501s: `provision=true` for a username nobody holds, and
+    any identity Fauxbus can name but not describe — a registered
+    client, a pinned token, a group member seeded by bare UUID.  The
+    client case is the one worth recording first: a service account in
+    a group is common, and the real record's `identity_provider` for a
+    client is unknown.
+
 And `identity_set`, already at the top of this list since v0.2.15, now
 has code to point at: its entry shape and its order are two
 `PROVISIONAL` markers in `world.identity_claims` and `Account.ordered`,
@@ -1218,7 +1235,7 @@ read, for months, as if both legs were running.
      principle 4 holds and the harness tests the same server everyone
      else runs.  Stdlib only.  This is what turns the pieces into
      something a test author uses in five lines.
-  5. **Identities lookup**: `GET /v2/api/identities` by ids and
+  5. **Identities lookup**: *Done in v0.2.29.*  `GET /v2/api/identities` by ids and
      usernames, from the recorded `get_identities` fixture.  For apps
      that show names or add group members by username.
   6. **A second relying party**: `examples/oauth2_proxy.py`, a generic
@@ -1458,6 +1475,37 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.29** (2026-11-03) — **Login shim, step 5: identities lookup.**
+  `GET /v2/api/identities` answers `AuthClient.get_identities` by ids or
+  by usernames, and so `IdentityMap`, the way most apps reach it.  It
+  authenticates like Groups: any bearer token by default, and under
+  `--require-issued-tokens` a live token minted for `auth.globus.org`
+  (`view_identities` is the scope a service asks for).  Its refusals use
+  Auth's recorded error document, so the SDK's `.code` reads them.
+
+  **Three answers, not two.**  An identity in a seeded account comes
+  back as the recorded record, `status: "used"`.  A string nobody holds
+  is left out.  The middle case is what made this step more than a
+  lookup table: Fauxbus can *name* some identities it cannot *describe*
+  — a registered client, a pinned token, a group member seeded by bare
+  UUID — and the real service would answer for all of them.  Leaving
+  them out would tell a test "no such identity", which is false, so
+  they are a 501 that says to seed an account (principle 2).  Same for
+  `provision=true` on an unknown username: Globus creates an identity
+  there, and Fauxbus does not.
+
+  **Found on the way, and fixed:** Groups never consulted the seeded
+  accounts.  Adding alice to a group by UUID filed her as
+  `<uuid>@fauxbus.example` when the seed called her
+  `alice@globusid.org`, and the new lookup would have named the same
+  person differently.  `World.username_for` now asks the accounts
+  first.  A test pins the two surfaces agreeing.
+
+  **The story, unmodified:** alice signs in, an `IdentityMap` turns
+  bob's username into his UUID, `GroupsManager.add_member` adds him,
+  and the member list renders by name through the same map.  360 tests
+  (24 new).  `PROVISIONAL` 54 → 59, all five in recording list 27.
 
 - **v0.2.28** (2026-10-30) — **Login shim, step 4: `fauxbus.testing`.**
   `running_fauxbus(seed=...)` starts a server on a free port, seeds it
