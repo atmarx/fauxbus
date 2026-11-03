@@ -36,6 +36,7 @@ from .auth import (
 from .errors import (
     ApiError,
     TransferError,
+    auth_bad_request,
     auth_forbidden,
     auth_unauthorized,
     endpoint_not_found,
@@ -333,9 +334,10 @@ class GlobusIdentity:
 
     Field names are RECORDED from the identity object in
     ``get_identities.py`` (``id``, ``username``, ``identity_provider``,
-    ``name``, ``email``, ``organization``).  ``status`` and
-    ``identity_type`` from the same fixture are left out until a surface
-    emits them.
+    ``name``, ``email``, ``organization``).  The fixture's ``status`` is
+    emitted by the identities lookup but not stored: every seeded
+    identity is ``"used"`` (see World.lookup_identities).
+    ``identity_type`` is left out until a consumer reads it.
 
     The UUID and the username are deliberately two fields.  SPEC's
     "identity churn" note: a rename changes the username and keeps the
@@ -811,6 +813,16 @@ class World:
         return derive_identity(token)
 
     def username_for(self, identity_id: str) -> str:
+        # A seeded account is the fullest record Fauxbus has of anyone,
+        # so it answers first.  It used to be skipped entirely: adding
+        # alice to a group by her UUID rendered her as
+        # "<uuid>@fauxbus.example" even though the seed named her
+        # alice@globusid.org — and the identities lookup (which reads
+        # accounts) would then have contradicted Groups about the same
+        # person.  Two surfaces of one fake must agree on a name.
+        identity = self.account_identity(identity_id)
+        if identity is not None:
+            return identity.username
         # Linear scan over pins, and that's fine: worlds are test-sized.
         # Clarity beats a reverse index we'd have to keep consistent.
         for pin in self.pinned_identities.values():
@@ -823,6 +835,145 @@ class World:
         if client is not None:
             return client.username
         return placeholder_username(identity_id)
+
+    # ------------------------------------------------- the identities lookup
+
+    def account_identity(self, identity_id: str) -> GlobusIdentity | None:
+        """The seeded identity with this UUID, from whichever account holds it."""
+        for account in self.accounts.values():
+            identity = account.identities.get(identity_id)
+            if identity is not None:
+                return identity
+        return None
+
+    def _account_identity_by_username(self, username: str) -> GlobusIdentity | None:
+        # PROVISIONAL: exact match.  Globus usernames look like lowercase
+        # email addresses, and the real service may well fold case — but
+        # nothing recorded says so, and folding is a rule Fauxbus would
+        # be inventing.  An exact match can only ever under-answer.
+        for account in self.accounts.values():
+            for identity in account.identities.values():
+                if identity.username == username:
+                    return identity
+        return None
+
+    def _named_without_a_record(
+        self, *, identity_id: str | None = None, username: str | None = None
+    ) -> str | None:
+        """What Fauxbus knows about an identity it cannot describe — or None.
+
+        The identities lookup has three possible answers for each thing
+        it is asked about, and this function is the middle one.  An
+        identity in a seeded account has a full record (provider, name,
+        email) and is answered.  A string Fauxbus has never heard of is
+        left out of the answer.  But some identities Fauxbus can *name*
+        without being able to *describe*: a registered client (a client
+        is an identity in Globus Auth), a token pinned to a UUID, a group
+        member seeded by bare UUID.  The real service would return a
+        full record for every one of those — they are real identities in
+        the world the test describes — and Fauxbus has no identity
+        provider, name or email to put in it.  Leaving them out would be
+        a silent wrong answer, so the caller turns this into a 501
+        (principle 2) that tells the test author what to seed instead.
+        """
+        for client in self.clients.values():
+            if client.client_id == identity_id or client.username == username:
+                return "a registered client"
+        for pin in self.pinned_identities.values():
+            if pin["identity_id"] == identity_id or pin["username"] == username:
+                return "a pinned token's identity"
+        for group in self.groups.values():
+            for m in group.memberships.values():
+                if m.identity_id == identity_id or m.username == username:
+                    return f"a member of group {group.id}"
+        return None
+
+    def lookup_identities(
+        self, *, ids: list[str] | None, usernames: list[str] | None, provision: bool
+    ) -> list[dict[str, Any]]:
+        """``GET /v2/api/identities`` — identity records by UUID or by username.
+
+        The record's fields are RECORDED (``get_identities.py`` in
+        globus-sdk 4.8.1).  ``status`` is ``"used"`` for every seeded
+        identity: an account in a seed is someone who signs in, and the
+        fixture's ``"unused"`` belongs to an identity provisioned by
+        username and never logged in — which Fauxbus does not create
+        (see ``provision`` below).  The fixture's ``identity_type``
+        appears on only one of its three records, so it is left out
+        until a consumer reads it.
+
+        The answer comes back in the order asked, each identity once.
+        PROVISIONAL: the fixtures never ask for more than two, so the
+        real service's order is unrecorded — but IdentityMap, the SDK's
+        main consumer of this call, files every record by both id and
+        username and never looks at the order.
+        """
+        # The SDK warns, in its own log line, that sending both is
+        # "Expecting an error" — DOCUMENTED that it fails, PROVISIONAL
+        # as to the status and body (see errors.auth_bad_request).
+        if ids is not None and usernames is not None:
+            raise auth_bad_request("Specify one of 'ids' or 'usernames', not both.")
+
+        found: list[GlobusIdentity] = []
+        if ids is not None:
+            for identity_id in ids:
+                identity = self.account_identity(identity_id)
+                if identity is None:
+                    self._refuse_unrecorded(identity_id=identity_id)
+                    # Not a UUID, or a UUID nobody seeded: left out.
+                    # PROVISIONAL, though it is what IdentityMap is
+                    # written to expect — its docstring's "no such
+                    # identity" example is a KeyError, which is what a
+                    # missing record turns into.
+                    continue
+                found.append(identity)
+        for username in usernames or []:
+            identity = self._account_identity_by_username(username)
+            if identity is None:
+                self._refuse_unrecorded(username=username)
+                if provision:
+                    # provision=true asks Globus to *create* an identity
+                    # for a username it has never seen, so a group can
+                    # invite someone before they first log in.  Fauxbus
+                    # does not build that yet; a made-up identity would
+                    # need a provider and a status it would have to guess.
+                    raise not_implemented(
+                        f"provision=true for {username!r}, a username no seeded account holds: "
+                        f"Fauxbus cannot create identities on lookup. Seed the account instead."
+                    )
+                continue
+            found.append(identity)
+
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for identity in found:
+            if identity.id in seen:
+                continue
+            seen.add(identity.id)
+            records.append(
+                {
+                    "id": identity.id,
+                    "username": identity.username,
+                    "identity_provider": identity.identity_provider,
+                    "name": identity.name,
+                    "email": identity.email,
+                    "organization": identity.organization,
+                    "status": "used",
+                }
+            )
+        return records
+
+    def _refuse_unrecorded(
+        self, *, identity_id: str | None = None, username: str | None = None
+    ) -> None:
+        what = self._named_without_a_record(identity_id=identity_id, username=username)
+        if what is not None:
+            asked = identity_id or username
+            raise not_implemented(
+                f"Identity lookup for {asked!r}: Fauxbus knows it as {what}, but holds no "
+                f"identity record for it (provider, name, email). Only identities seeded "
+                f"under 'accounts' are answerable here."
+            )
 
     # ------------------------------------------------------- oauth2 clients
 

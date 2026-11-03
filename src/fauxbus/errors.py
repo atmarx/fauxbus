@@ -179,9 +179,24 @@ class AuthServiceError(ApiError):
     the same failure renders the same bytes on every run.
     """
 
-    def __init__(self, status: int, code: str, detail: str, title: str) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        detail: str,
+        title: str,
+        *,
+        error: str = "unauthorized",
+        error_description: str = "Unauthorized",
+    ) -> None:
         super().__init__(status, code, detail)
         self.title = title
+        # The RFC 6749 pair rides beside the errors list.  Both recorded
+        # refusals (401 and 403) carry "unauthorized", so that stays the
+        # default; a status the fixtures never show has to say something
+        # else, or a 400 would claim to be an auth failure.
+        self.error = error
+        self.error_description = error_description
 
     def body(self) -> dict[str, Any]:
         return {
@@ -194,8 +209,8 @@ class AuthServiceError(ApiError):
                     "title": self.title,
                 }
             ],
-            "error_description": "Unauthorized",
-            "error": "unauthorized",
+            "error_description": self.error_description,
+            "error": self.error,
         }
 
 
@@ -211,6 +226,22 @@ def auth_unauthorized() -> AuthServiceError:
 
 def auth_forbidden() -> AuthServiceError:
     return AuthServiceError(403, "FORBIDDEN", "Call must be authenticated", "Unauthorized")
+
+
+def auth_bad_request(detail: str) -> AuthServiceError:
+    # PROVISIONAL, every field of it.  The Auth API's 400 is unrecorded;
+    # this is the recorded 401's document with the status words changed,
+    # which keeps the SDK's parsing path the same (``.code`` is read from
+    # the errors list) while saying "your request" rather than "your
+    # credentials".
+    return AuthServiceError(
+        400,
+        "BAD_REQUEST",
+        detail,
+        "Bad Request",
+        error="invalid_request",
+        error_description="Bad Request",
+    )
 
 
 class TransferError(ApiError):

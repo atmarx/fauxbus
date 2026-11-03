@@ -63,6 +63,7 @@ from globus_sdk import (  # noqa: E402
     GroupsAPIError,
     GroupsClient,
     GroupsManager,
+    IdentityMap,
     NativeAppAuthClient,
     RefreshTokenAuthorizer,
     TransferAPIError,
@@ -1190,3 +1191,80 @@ def test_the_harness_points_the_sdk_and_takes_it_back(monkeypatch):
     with running_fauxbus() as fb:
         assert GroupsClient().base_url == fb.url + "/"
     assert "fauxbus" not in GroupsClient().base_url and "127.0.0.1" not in GroupsClient().base_url
+
+
+# --------------------------------------- login shim step 5: identities lookup
+#
+# Two consumers of ``GET /v2/api/identities``, both unmodified: the plain
+# ``get_identities`` call, and ``IdentityMap``, which is how most apps
+# actually reach it — hand it a pile of ids and usernames, then index it
+# by either.  The story is the one SPEC names: an app that shows names,
+# and adds group members by username.
+
+
+def auth_as(tokens) -> AuthClient:
+    access = tokens.by_resource_server["auth.globus.org"]["access_token"]
+    return AuthClient(authorizer=AccessTokenAuthorizer(access))
+
+
+@pytest.fixture
+def signed_in(pointed):
+    """Alice, signed in to the login client with an Auth token and a Groups one."""
+    status, doc, _ = pointed.post("/_fauxbus/seed", oidc_seed(pointed.base_url))
+    assert status == 200, doc
+    return sign_in(pointed, ALICE_GLOBUSID, f"openid profile email {GROUPS_SCOPE}")
+
+
+def test_get_identities_answers_like_the_recorded_fixture(signed_in):
+    auth = auth_as(signed_in)
+    by_name = auth.get_identities(usernames=["bob@globusid.org", "nobody@example.org"])
+    (bob,) = by_name  # the response iterates its records, per the SDK docstring
+    assert bob["id"] == BOB_GLOBUSID
+    assert bob["status"] == "used"
+    by_id = auth.get_identities(ids=[BOB_GLOBUSID])
+    assert by_id.data == by_name.data
+
+
+def test_adding_a_member_by_username_shows_their_name(signed_in):
+    """The whole story, through four unmodified SDK objects.
+
+    Alice types a colleague's username; the app resolves it with an
+    IdentityMap, adds the identity to her group by UUID, and renders the
+    member list by name through the same map.  The last assertion is
+    the one the Groups fix exists for: the membership and the lookup
+    name bob the same way.
+    """
+    auth, groups = auth_as(signed_in), groups_as(signed_in)
+    names = IdentityMap(auth, ["bob@globusid.org"])
+    bob_id = names["bob@globusid.org"]["id"]
+
+    manager = GroupsManager(groups)
+    group = manager.create_group("Alice's lab", "")
+    manager.add_member(group["id"], bob_id)
+
+    members = groups.get_group(group["id"], include="memberships")["memberships"]
+    for m in members:
+        names.add(m["identity_id"])
+    shown = sorted(names[m["identity_id"]]["name"] for m in members)
+    assert shown == ["Alice Example", "Bob Example"]
+    assert {m["username"] for m in members} == {"alice@globusid.org", "bob@globusid.org"}
+
+
+def test_an_unknown_identity_is_a_keyerror_in_the_identity_map(signed_in):
+    """What IdentityMap's own docstring tells apps to expect for "no such identity"."""
+    names = IdentityMap(auth_as(signed_in), ["nobody@example.org"])
+    with pytest.raises(KeyError):
+        names["nobody@example.org"]
+    assert names.get("nobody@example.org") is None
+
+
+def test_lookup_refusals_parse_as_auth_errors(signed_in):
+    auth = auth_as(signed_in)
+    # The SDK logs "Expecting an error" when handed both; it gets one.
+    with pytest.raises(AuthAPIError) as exc:
+        auth.get_identities(ids=[BOB_GLOBUSID], usernames=["bob@globusid.org"])
+    assert (exc.value.http_status, exc.value.code) == (400, "BAD_REQUEST")
+    # A registered client is an identity Fauxbus can name but not describe.
+    with pytest.raises(AuthAPIError) as exc:
+        auth.get_identities(ids=[LOGIN_CLIENT])
+    assert exc.value.http_status == 501

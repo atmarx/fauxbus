@@ -260,9 +260,11 @@ def resource_server_for_scope(scope: str) -> str | None:
 def placeholder_username(identity_id: str) -> str:
     """Username for an identity we only know as a UUID (e.g. batch-added).
 
-    The real service resolves identities through Globus Auth; Fauxbus has
-    no identities lookup yet, so unknown UUIDs get a readable,
-    deterministic placeholder.
+    The real service resolves identities through Globus Auth.  Fauxbus
+    can only resolve the ones a seed describes in full (``accounts``),
+    so everyone else gets a readable, deterministic placeholder — and
+    the identities lookup answers a placeholder with a 501 rather than
+    pretend it knows who that is (World.lookup_identities).
     """
     return f"{identity_id}@fauxbus.example"
 

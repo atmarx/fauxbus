@@ -705,6 +705,7 @@ def make_server(
     from .auth_api import register as register_auth
     from .control_api import register as register_control
     from .groups_api import register as register_groups
+    from .identities_api import register as register_identities
     from .oidc_api import register as register_oidc
     from .transfer_api import register as register_transfer
 
@@ -722,6 +723,7 @@ def make_server(
     )
     register_auth(server)
     register_oidc(server)
+    register_identities(server)
     register_groups(server)
     register_transfer(server)
     register_control(server)
