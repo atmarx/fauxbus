@@ -1239,13 +1239,16 @@ read, for months, as if both legs were running.
   5. **Identities lookup**: *Done in v0.2.29.*  `GET /v2/api/identities` by ids and
      usernames, from the recorded `get_identities` fixture.  For apps
      that show names or add group members by username.
-  6. **A second relying party**: `examples/oauth2_proxy.py`, a generic
+  6. **Release 0.5.0.**  *Done 2026-11-07.*  (0.4.0 went out on
+     2026-10-14 carrying Transfer task monitoring and step 1, because
+     Root Cellar's dev stack needed the Transfer slice from PyPI.)
+  7. **A second relying party**: `examples/oauth2_proxy.py`, a generic
      OIDC client beside the Keycloak one, plus a headless `UserApp`
      example.  Proof that Fauxbus is a Globus login fake, not a
-     Keycloak special case.
-  7. **Release 0.5.0.**  (0.4.0 went out on 2026-10-14 carrying
-     Transfer task monitoring and step 1, because Root Cellar's dev
-     stack needed the Transfer slice from PyPI.)
+     Keycloak special case.  Moved after the release (Andrew,
+     2026-11-07): it is an example, not imitated surface, so no
+     consumer waits on it, and `fauxbus.testing`'s acceptance test
+     already drives a headless `UserApp`.
 
   Steps 2 and 3 come first among the real work because they are the
   first two refusals a real app hits: most Globus apps are native
@@ -1478,6 +1481,49 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **Package release: fauxbus 0.5.0** (2026-11-07, tag `v0.5.0`) —
+  **the Globus login shim reaches consumers.**  An unmodified
+  Globus-login app runs its whole login against Fauxbus with only
+  configuration changed, and the test drives every step.  A minor: new
+  imitated surface (native-app PKCE clients and `/v2/web/auth-code`,
+  the `refresh_token` grant, `GET /v2/api/identities`) and a new
+  importable module, `fauxbus.testing`.
+
+  What a consumer gets, in the order it landed: native apps and
+  `UserApp` sign in (v0.2.25); refresh tokens, either spelling of
+  offline access (v0.2.26); `fauxbus.testing`, the in-process harness
+  and pytest fixture (v0.2.28); identities lookup, so `IdentityMap`
+  works, and Groups names seeded accounts correctly (v0.2.29); session
+  requirements refused loudly (v0.2.30).
+
+  **Behaviours an 0.4.0 consumer could have relied on changed, on
+  purpose.**
+  - A confidential client that sends `client_id` without its secret
+    was a 501 and is now `invalid_client` (v0.2.25).
+  - A control-plane POST with a form body (`curl -d`) used to be read
+    as empty, so `tick` silently moved one second; it is now a 400
+    naming `--json` (v0.2.26).
+  - Adding a seeded account to a group by UUID used to file it as
+    `<uuid>@fauxbus.example`; it now carries the seed's username
+    (v0.2.29).
+  - `session_required_*` and `max_age` at authorize were ignored and
+    are now the 501 (v0.2.30).
+
+  **Before the tag:** the image scan went red on `main`
+  (pipeline #83).  Python 3.13.16 → 3.13.18 expired two
+  pinned acks, as designed, and Alpine's `sqlite-libs 3.53.4-r0`
+  arrived with ten new findings.  Each one was read and checked
+  against the built image (Fauxbus never loads SQLite, poplib, or an
+  untrusted hostname), then re-acked with its exact version.
+
+  **Re-pin handshake:** Root Cellar moves both pins to `0.5.0` in one
+  commit.  No seed change is needed.  Its own seat carries that.
+
+  **PROVISIONAL inventory: 59 markers**, up from 0.4.0's 45, on
+  recording lists 25–27.  The real-Globus leg of the conformance tether
+  is still unrun: no tenancy exists.  362 tests, 49 of them through the
+  real globus-sdk 4.8.1.
 
 - **v0.2.30** (2026-11-07) — **Session requirements refuse loudly.**
   Root Cellar asked for session step-up (a download needs a recent

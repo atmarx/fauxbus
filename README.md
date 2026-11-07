@@ -56,10 +56,6 @@ injected 429.  Response shapes not yet backed by a recording are marked
 list is in [SPEC.md](SPEC.md), along with the full design.  Nothing is
 stable yet.
 
-`main` runs ahead of PyPI: native apps, refresh tokens, identities
-lookup and the `fauxbus.testing` harness are here and land in the next
-release, 0.5.0.  [Changelog](SPEC.md#changelog).
-
 ## Fake, not mock
 
 Your code doesn't know Fauxbus is there.  No monkeypatching, no fixture
