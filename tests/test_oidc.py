@@ -304,6 +304,52 @@ def test_prompt_login_ignores_the_session(oidc):
     assert headers["Location"].startswith("/_fauxbus/auth/login?request=")
 
 
+def test_last_authentication_only_moves_on_a_real_sign_in(oidc):
+    """The claim a step-up check reads, pinned both ways.
+
+    Globus's ID token says when the person authenticated as
+    ``last_authentication`` (DOCUMENTED; it has no ``auth_time``).  A
+    silently reused session must keep the old instant, and only
+    ``prompt=login`` gives a new one — otherwise a relying party's
+    freshness check could not tell Globus's silent yes from a real
+    second sign-in, which is the bug Root Cellar saw on 2026-11-06.
+    """
+    code, _, cookie = login(oidc)
+    first = claims_of(exchange(oidc, code)[1]["id_token"])["last_authentication"]
+    oidc.post("/_fauxbus/tick", {"seconds": 3600})
+
+    _, headers, _ = oidc.browse(authorize_path(), cookie=cookie)
+    reused = query_of(headers["Location"])["code"]
+    assert claims_of(exchange(oidc, reused)[1]["id_token"])["last_authentication"] == first
+
+    fresh, _, _ = login(oidc, prompt="login")
+    assert claims_of(exchange(oidc, fresh)[1]["id_token"])["last_authentication"] == first + 3600
+
+
+def test_session_requirements_are_501s_until_built(oidc):
+    """A step-up parameter must never be accepted and then ignored.
+
+    Ignoring ``session_required_mfa`` would reuse the session and pass a
+    consumer's step-up test that proved nothing.  ``session_message``
+    only puts words on the page, so it is not on the list.
+    """
+    _, _, cookie = login(oidc)
+    for extra in (
+        {"session_required_mfa": "True"},
+        {"session_required_single_domain": "example.edu"},
+        {"session_required_identities": ALICE_UNIVERSITY},
+        {"session_required_policies": "c1d2e3f4-0000-4000-8000-000000000000"},
+        {"max_age": "0"},
+    ):
+        status, headers, body = oidc.browse(authorize_path(**extra), cookie=cookie)
+        assert status == 501, extra
+        assert "Location" not in headers
+        assert json.loads(body)["code"] == "NOT_IMPLEMENTED"
+
+    status, headers, _ = oidc.browse(authorize_path(session_message="sign in again"), cookie=cookie)
+    assert status == 302 and "?code=" in headers["Location"]
+
+
 def test_the_headless_session_route_signs_a_test_in_without_a_page(oidc):
     status, doc, headers = oidc.post("/_fauxbus/auth/session", {"account": ALICE_GLOBUSID})
     assert status == 200

@@ -58,6 +58,19 @@ USERINFO_PATH = "/v2/oauth2/userinfo"
 SESSION_COOKIE = "fauxbus_session"
 PICKER_PATH = "/_fauxbus/auth/login"
 
+# Authorize parameters that put a requirement on the session — the four
+# globus-sdk 4.8.1 puts on the URL (``oauth2_get_authorize_url``,
+# comma-joined lists, ``session_required_mfa=True``), plus OIDC's
+# ``max_age``, which a Keycloak broker forwards under ``passMaxAge``.
+# None is built yet; see the authorize handler for why each is a 501.
+SESSION_REQUIREMENTS = (
+    "session_required_identities",
+    "session_required_single_domain",
+    "session_required_policies",
+    "session_required_mfa",
+    "max_age",
+)
+
 
 def require_issuer(ctx: Ctx) -> str:
     """The configured issuer, or a loud refusal to guess one.
@@ -259,6 +272,23 @@ def authorize(ctx: Ctx) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
             f"prompt={prompt!r} is not built; Fauxbus handles prompt=login only. Real "
             f"client code sends this?"
         )
+    # Session requirements (2026-11-07, Root Cellar's step-up ask).  Each
+    # of these tells Globus "do not reuse the session as it stands" — the
+    # reference says the user is sent to log in, link an identity, or
+    # assert MFA first.  Accepting them and then reusing the session is
+    # the worst wrong answer a fake can give here: a consumer's step-up
+    # test goes green while proving nothing.  So until one is built, it
+    # is the loud 501.  ``session_message`` is display-only and passes.
+    # ``max_age`` is OIDC's freshness knob, which the Globus reference
+    # does not list (read 2026-11-07); whether Globus honours it is
+    # unrecorded, so it gets the same 501 rather than a guess either way.
+    for name in SESSION_REQUIREMENTS:
+        if query.get(name) not in (None, ""):
+            raise not_implemented(
+                f"{name} is not built; Fauxbus reuses or replaces a session only by "
+                f"prompt=login today, and silently ignoring {name} would pass a step-up "
+                f"test that proves nothing. Real client code sends this?"
+            )
     if query.get("response_mode") not in (None, "query"):
         raise not_implemented(
             f"response_mode={query['response_mode']!r} is not built; codes come back on the "

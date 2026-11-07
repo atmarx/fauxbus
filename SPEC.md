@@ -794,7 +794,8 @@ an unvetted URI is how an authorization server becomes an open
 redirector.  When the client asked for something malformed, it gets
 RFC 6749 §4.1.2.1's `error=` redirect with its own `state`.  And when it
 asked for something Globus does and Fauxbus has not built — `prompt=none`,
-PKCE `plain`, another `response_mode` — it gets the loud 501, rendered,
+PKCE `plain`, another `response_mode`, any `session_required_*`
+parameter or `max_age` (v0.2.30) — it gets the loud 501, rendered,
 because an `error=` code would tell the client *it* was wrong.  The same
 three-way split the token endpoint makes for grant types, for the same
 reason.  Offline access was on that list until login shim step 3
@@ -1250,7 +1251,9 @@ read, for months, as if both legs were running.
   first two refusals a real app hits: most Globus apps are native
   clients, and most ask for refresh tokens.  Deferred until a consumer
   asks: dependent tokens, `prompt=none` and session step-up, logout,
-  the consents API.  Transfer stayed held when this was written; the
+  the consents API.  (Root Cellar asked for step-up on 2026-11-07; the
+  research is answered on the board, and the build waits on which
+  parameters its broker will actually send.)  Transfer stayed held when this was written; the
   reorder above moved its first slice ahead.
 
 - **Transfer** — the big one: endpoints/collections, task submission, and a
@@ -1475,6 +1478,28 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **v0.2.30** (2026-11-07) — **Session requirements refuse loudly.**
+  Root Cellar asked for session step-up (a download needs a recent
+  sign-in), and reading the authorize handler for it turned up a
+  silent wrong answer: `session_required_identities`,
+  `session_required_single_domain`, `session_required_policies`,
+  `session_required_mfa` and `max_age` were all accepted and ignored,
+  so a browser with a session got a code straight back.  Against
+  Globus each of those sends the person to sign in, link an identity,
+  or assert MFA first (DOCUMENTED, the reference, read 2026-11-07;
+  `max_age` is not in it at all, so whether Globus honours it is
+  unrecorded).  A consumer's step-up test would have gone green while
+  proving nothing.  All five are now the authorize 501 until one is
+  built; `session_message` only puts words on the page and still
+  passes.  **Behaviour change:** a client that sent any of them and
+  relied on the quiet reuse now gets the 501.
+
+  Pinned at the same time, because a relying party's freshness check
+  reads it: `last_authentication` keeps the old instant when a session
+  is silently reused, and only a real sign-in (`prompt=login`, or a new
+  browser) moves it.  The Globus ID token has no `auth_time`, `acr` or
+  `amr` (DOCUMENTED); `last_authentication` is the claim to read.
 
 - **v0.2.29** (2026-11-03) — **Login shim, step 5: identities lookup.**
   `GET /v2/api/identities` answers `AuthClient.get_identities` by ids or
