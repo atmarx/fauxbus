@@ -48,15 +48,56 @@ ignore:
     package: { name: ssl_client, version: 1.37.0-r31 }
     reason: "2026-10-10 ash: wget's HTTPS helper, unreachable because Fauxbus never invokes wget. No Alpine fix yet."
 
-  # --- CPython: fixed only on the 3.15 pre-release line ----------------
-  # Grype reports both as "fixed", but the fixes landed in 3.15 alphas
-  # and RCs and no 3.13 release carries them, so a rebuild cannot clear
-  # them.  Neither module is imported anywhere in src/.  When the base
-  # tag moves past 3.13.16 these stop matching, and the new version gets
-  # checked for a backport.
+  # --- CPython: fixes only on unreleased lines ------------------------
+  # Grype reports these as "fixed", but the fixes landed in 3.15/3.16
+  # pre-releases and no 3.13 release carries them, so a rebuild cannot
+  # clear them.  Re-acked 2026-11-07 when the base moved 3.13.16 ->
+  # 3.13.18 and the old pins expired as designed.  CVE-2026-12345
+  # (tempfile) no longer matches on 3.13.18, so its ack is gone.
   - vulnerability: CVE-2025-15367
-    package: { name: python, version: 3.13.16 }
-    reason: "2026-10-10 ash: poplib command injection. Fauxbus never imports poplib. Fixed only in 3.15.0a6."
-  - vulnerability: CVE-2026-12345
-    package: { name: python, version: 3.13.16 }
-    reason: "2026-10-10 ash: tempfile.TemporaryDirectory cleanup race. Fauxbus never imports tempfile. Fixed only in 3.15.0rc3."
+    package: { name: python, version: 3.13.18 }
+    reason: "2026-11-07 ash: poplib command injection. Fauxbus never imports poplib (checked in the image: not in sys.modules after importing every fauxbus module). Fixed only in 3.15.0a6."
+  - vulnerability: CVE-2026-116566
+    package: { name: python, version: 3.13.18 }
+    reason: "2026-11-07 ash: getaddrinfo accepts NUL bytes in host/port. Fauxbus only resolves its own bind address and the test author's own base_url; no untrusted party supplies a hostname. Fixed only in 3.16.0."
+
+  # --- SQLite: Alpine 3.53.4-r0, no Alpine fix yet ---------------------
+  # sqlite-libs is in the image only because the python base installs
+  # it for the stdlib sqlite3 module (`apk info -r` names only
+  # .python-rundeps).  Fauxbus keeps state in memory and never imports
+  # sqlite3: checked 2026-11-07 inside the built image, importing every
+  # fauxbus module leaves sqlite3, _sqlite3 and dbm.sqlite3 out of
+  # sys.modules, and there is no sqlite3 CLI for the .recover bug to
+  # reach.  Every one of these needs an attacker-supplied database or
+  # SQL, and Fauxbus opens neither.  Alpine's 3.54 build will change the
+  # version and expire all nine at once.
+  - vulnerability: CVE-2026-119586
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: sqlite3 CLI .recover command injection; no CLI in the image. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119379
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: session-extension changeset overflow. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119374
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: FTS5 secure-delete overflow. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119373
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: FTS5 prefix-merge overflow. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119378
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: R-Tree use-after-free. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119375
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: WAL page-cache disclosure. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119371
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: CTE depth stack exhaustion. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119376
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: COLLATE depth stack exhaustion. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119591
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: count-of-view stack exhaustion. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
+  - vulnerability: CVE-2026-119372
+    package: { name: sqlite-libs, version: 3.53.4-r0 }
+    reason: "2026-11-07 ash: FTS3 snippet use-after-free. Fauxbus never loads SQLite (sqlite3 absent from sys.modules in the image). No Alpine fix yet."
