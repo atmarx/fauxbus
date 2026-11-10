@@ -48,6 +48,12 @@ fails the way the real service partially fails.
   username into a UUID and back.
 - **Transfer task monitoring** — the `endpoint_manager_*` calls a
   service uses to watch other people's transfers into a collection.
+- **Guest collections and permissions** (0.6.0, unreleased) — a GCS
+  Manager per seeded endpoint, enough of `GCSClient` to make a guest
+  collection on a mapped one, and Transfer's ACL calls to rule a group
+  onto it.  A control-plane route then lets a test try a person's
+  transfer and watch the permission decide, against the same Groups
+  world the Groups API changes.
 
 The conformance suite drives all of it through the actual globus-sdk,
 unmodified, including the SDK's retry layer recovering through an
@@ -84,7 +90,8 @@ Released on [PyPI](https://pypi.org/project/fauxbus/); `pipx install
 git+https://github.com/atmarx/fauxbus` gets `main`.  Point your app at
 that port (next section) and run your existing test suite.  Groups and
 Auth's login and client-credentials flows are here; of
-`TransferClient`, only the task-monitoring calls exist so far.
+`TransferClient`, only the task-monitoring and permission calls exist
+so far, and of `GCSClient` only guest collections and user credentials.
 Anything else meets an honest `501` — see below.
 
 ## Point your app at Fauxbus
@@ -360,6 +367,50 @@ finish in 1970.  A poller that asks for "completed in the last ten
 minutes" by its own wall clock will find nothing.  Seed `"clock"` to the
 second your test starts (the example seed uses `1767225600`), and tick
 it forward rather than letting it fall behind.
+
+## Guest collections and who may use them
+
+A service that makes one guest collection per workspace on a mapped
+collection, and lets a Globus group in by permission, can be tested end
+to end.  Seed the endpoint, the gateway that maps the service's own
+client, and the mapped collection:
+
+```json
+"gcs_endpoints": {"<endpoint id>": {"display_name": "DTN", "storage_gateways": {
+  "<gateway id>": {"display_name": "POSIX", "identity_mappings": {"<client id>": "svc"}}}}},
+"mapped_collections": {"<mapped id>": {"endpoint_id": "<endpoint id>",
+  "storage_gateway_id": "<gateway id>", "display_name": "Upload",
+  "subscription_id": "<id>", "roles": {"<client id>": "activity_monitor"}}}
+```
+
+Each endpoint's GCS Manager answers at `/gcs/<endpoint id>/api/`.
+`GCSClient`'s constructor turns any address that is not `https://` into
+one that is, so build it and then set its `base_url`:
+
+```python
+gcs = globus_sdk.GCSClient("unused.invalid", authorizer=authorizer)
+gcs.base_url = "http://localhost:9800/gcs/<endpoint id>/api/"
+```
+
+`get_collection`, `get_user_credential_list`, `create_user_credential`,
+`get_collection_list` (`mapped_collection_id`, `filter=guest_collections`),
+`create_collection`, `update_collection` and `delete_collection` work
+from there, and `TransferClient`'s `endpoint_acl_list`,
+`add_endpoint_acl_rule` and `delete_endpoint_acl_rule` manage the
+permissions.  Then try a person's transfer:
+
+```sh
+curl localhost:9800/_fauxbus/transfer/submit --json '{
+  "owner_id": "<identity id>", "source_endpoint_id": "<laptop, anything>",
+  "destination_endpoint_id": "<guest id>",
+  "files": [{"source_path": "/home/a/x.dat", "destination_path": "/run1/x.dat", "size": 1}]}'
+```
+
+Into a guest needs `rw` there, out of one needs `r`, counted through the
+person's groups and their parent groups.  Allowed, a SUCCEEDED task
+appears in the task-monitoring calls, under the mapped collection's id
+as well as the guest's.  Refused, there is no task, and a 403
+`PermissionDenied` says which path and which permission.
 
 ## In a compose stack
 

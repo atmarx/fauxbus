@@ -18,7 +18,8 @@ def test_index_names_itself(fx):
     assert doc["imitates"] == [
         "groups v2",
         "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",
-        "transfer v0.10 (endpoint_manager task monitoring)",
+        "transfer v0.10 (endpoint_manager task monitoring, guest-collection permissions)",
+        "gcs manager api (guest collections, user credentials) at /gcs/<endpoint id>/api/",
     ]
     assert doc["sdk_pin"] == "4.8.1"
     # A harness needs to know which auth posture it is talking to before

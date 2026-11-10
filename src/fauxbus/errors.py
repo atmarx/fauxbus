@@ -11,8 +11,9 @@ dialect — RFC 6749 §5.2's ``{"error": ..., "error_description": ...}``
 carries it, and its docstring is the argument for why the two shapes
 have to coexist rather than one being normalized into the other.
 Globus Auth's own resources (userinfo) speak a third, ``AuthServiceError``,
-and the Transfer API a fourth, ``TransferError``.  Each one is recorded
-in the SDK's fixtures; none of them is Fauxbus's invention.
+the Transfer API a fourth, ``TransferError``, and a GCS Manager a fifth,
+``GCSError``.  Each one is recorded in the SDK's fixtures; none of them
+is Fauxbus's invention.
 """
 
 from __future__ import annotations
@@ -280,20 +281,32 @@ class TransferError(ApiError):
 
     def body(self) -> dict[str, Any]:
         resource = self.resource or ""
-        digest = hashlib.sha256(f"{self.code}:{resource}".encode()).digest()
-        # Base62 over the digest, nine characters, the recorded length.
-        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        n = int.from_bytes(digest, "big")
-        request_id = ""
-        for _ in range(9):
-            n, r = divmod(n, 62)
-            request_id += alphabet[r]
         return {
             "code": self.code,
             "message": self.detail,
-            "request_id": request_id,
+            "request_id": transfer_request_id(self.code, resource),
             "resource": resource,
         }
+
+
+def transfer_request_id(code: str, resource: str) -> str:
+    """Nine characters that look like a Transfer ``request_id`` and never vary.
+
+    Shared by the error document above and, since the guest-collection
+    slice, by Transfer's *success* documents for permissions, which
+    carry a ``request_id`` too (DOCUMENTED, docs.globus.org/api/
+    transfer/permissions).  Base62 over a hash of the code and the
+    resource path, nine characters, the recorded length — the same
+    answer on the same path every run (principle 3).
+    """
+    digest = hashlib.sha256(f"{code}:{resource}".encode()).digest()
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    n = int.from_bytes(digest, "big")
+    request_id = ""
+    for _ in range(9):
+        n, r = divmod(n, 62)
+        request_id += alphabet[r]
+    return request_id
 
 
 # The four codes the task-monitoring slice can answer with.  The *codes*
@@ -319,3 +332,71 @@ def endpoint_not_found(endpoint_id: str) -> TransferError:
 
 def transfer_bad_request(message: str) -> TransferError:
     return TransferError(400, "BadRequest", message)
+
+
+# The permissions slice's codes.  DOCUMENTED, codes and statuses both
+# (docs.globus.org/api/transfer/permissions, read 2026-11-09):
+# AccessRuleNotFound 404, NotSupported 409 for a collection that is not
+# a guest collection, InvalidPath 400, LimitExceeded 409, Exists 409.
+# The messages are Fauxbus's own sentences.
+
+
+def access_rule_not_found(rule_id: str) -> TransferError:
+    return TransferError(404, "AccessRuleNotFound", f"Access rule {rule_id} not found")
+
+
+def transfer_conflict(code: str, message: str) -> TransferError:
+    return TransferError(409, code, message)
+
+
+def invalid_path(message: str) -> TransferError:
+    return TransferError(400, "InvalidPath", message)
+
+
+class GCSError(ApiError):
+    """The GCS Manager API's error document — a fifth dialect, recorded.
+
+    A GCS Manager answers everything, errors included, inside its
+    ``result`` envelope.  ``globus_sdk/testing/data/globus_connect_server/
+    get_collection_list.py`` (4.8.1) records the 403::
+
+        {"code": "permission_denied", "http_response_code": 403,
+         "DATA_TYPE": "result#1.0.0", "detail": null,
+         "message": "Could not list collections. Insufficient permissions",
+         "data": [], "has_next_page": false, "marker": ""}
+
+    ``code`` is snake_case, unlike Transfer's CamelCase and Fauxbus's own
+    SHOUTING_SNAKE; ``message`` carries the sentence and ``detail`` is
+    null, and ``GCSAPIError`` reads them into ``.code``/``.message``.
+    ``permission_denied`` is the one code the SDK records.  Every other
+    code Fauxbus answers here (``not_found``, ``bad_request``) is
+    PROVISIONAL — the snake_case of the HTTP reason, the most a fake can
+    infer from one example.
+    """
+
+    def body(self) -> dict[str, Any]:
+        return {
+            "DATA_TYPE": "result#1.0.0",
+            "code": self.code,
+            "http_response_code": self.status,
+            "detail": None,
+            "message": self.detail,
+            "data": [],
+            "has_next_page": False,
+            "marker": "",
+        }
+
+
+def gcs_permission_denied(message: str) -> GCSError:
+    return GCSError(403, "permission_denied", message)
+
+
+def gcs_not_found(message: str) -> GCSError:
+    # PROVISIONAL code.
+    return GCSError(404, "not_found", message)
+
+
+def gcs_bad_request(message: str) -> GCSError:
+    # PROVISIONAL code and status: the GCS reference does not say what an
+    # invalid collection or credential document answers.
+    return GCSError(400, "bad_request", message)

@@ -1,8 +1,9 @@
 """The HTTP server: routing, auth, failure injection, and the 501 wall.
 
-Stdlib only.  The imitated surface lives under /v2/ (Groups, Auth) and
-/v0.10/ (Transfer) and requires a bearer token; the control plane lives
-under /_fauxbus/ and never does.
+Stdlib only.  The imitated surface lives under /v2/ (Groups, Auth),
+/v0.10/ (Transfer) and /gcs/<endpoint id>/api/ (each seeded endpoint's
+GCS Manager) and requires a bearer token; the control plane lives under
+/_fauxbus/ and never does.
 Anything unrouted gets a loud 501 pointing at the issue tracker — never
 a silent wrong answer.
 """
@@ -118,6 +119,14 @@ def html_page(status: int, title: str, body: str, note: str = FAKE_NOTE) -> tupl
 
 Handler = Callable[[Ctx], tuple[int, Any] | tuple[int, Any, dict[str, str]]]
 
+# A route's resource server is usually one fixed name, but not always.  A
+# GCS Manager's resource server is its *endpoint's* id (globus-sdk 4.8.1:
+# ``GCSClient.resource_server`` is ``endpoint_client_id``), and Fauxbus
+# serves every seeded endpoint's manager from one socket, so the name
+# lives in the path.  Such a route passes a function from the path match
+# to the resource server instead of a string.
+ResourceServer = str | Callable[[re.Match[str]], str] | None
+
 
 @dataclass
 class Route:
@@ -130,7 +139,8 @@ class Route:
     # --require-issued-tokens, where it is what lets Fauxbus reject a
     # Transfer token presented to Groups.  None means "no resource server
     # owns this path" — the control plane, and the token endpoint itself.
-    resource_server: str | None = None
+    # A function reads it out of the path (see ResourceServer).
+    resource_server: ResourceServer = None
 
 
 @dataclass
@@ -262,7 +272,7 @@ class FauxbusServer(ThreadingHTTPServer):
         handler: Handler,
         *,
         auth: bool,
-        resource_server: str | None = None,
+        resource_server: ResourceServer = None,
     ) -> None:
         # Patterns are anchored ^...$ so "/v2/groups" can never match
         # "/v2/groups/anything" by prefix.  First registered match wins
@@ -542,9 +552,9 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                     f"needs it? File an issue: {ISSUES_URL}",
                 )
             with self.server.lock:
-                identity = self._authenticate(route) if route.requires_auth else None
                 match = route.pattern.match(path)
                 assert match is not None
+                identity = self._authenticate(route, match) if route.requires_auth else None
                 result = route.handler(
                     Ctx(
                         self.server.world,
@@ -654,7 +664,7 @@ class FauxbusHandler(BaseHTTPRequestHandler):
             # cannot identify is not one we can call local.
             return False
 
-    def _authenticate(self, route: Route) -> Identity:
+    def _authenticate(self, route: Route, match: re.Match[str]) -> Identity:
         """Turn a bearer token into a caller, or refuse.
 
         The strict check runs *before* identity resolution and only under
@@ -669,7 +679,10 @@ class FauxbusHandler(BaseHTTPRequestHandler):
                 raise unauthorized()
             token = ANONYMOUS_TOKEN
         if self.server.require_issued_tokens:
-            self.server.world.require_issued(token, route.resource_server)
+            resource_server = route.resource_server
+            if callable(resource_server):
+                resource_server = resource_server(match)
+            self.server.world.require_issued(token, resource_server)
         return self.server.world.identity_for_token(token)
 
     # ----------------------------------------------------------- verb hooks
@@ -685,6 +698,11 @@ class FauxbusHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         self._dispatch("DELETE")
+
+    def do_PATCH(self) -> None:
+        # The GCS Manager API updates with PATCH (``GCSClient.update_collection``,
+        # 4.8.1), the first verb of its kind anywhere in the imitated surface.
+        self._dispatch("PATCH")
 
 
 def make_server(
@@ -704,6 +722,7 @@ def make_server(
     from .account_picker import register as register_picker
     from .auth_api import register as register_auth
     from .control_api import register as register_control
+    from .gcs_api import register as register_gcs
     from .groups_api import register as register_groups
     from .identities_api import register as register_identities
     from .oidc_api import register as register_oidc
@@ -726,6 +745,7 @@ def make_server(
     register_identities(server)
     register_groups(server)
     register_transfer(server)
+    register_gcs(server)
     register_control(server)
     register_picker(server)
     return server
@@ -748,6 +768,7 @@ def boot_line(server: FauxbusServer) -> str:
     return (
         f"fauxbus {__version__} listening on http://{host}:{port} — "
         f"imitating: groups v2, auth v2 client_credentials + authorization_code, "
-        f"transfer v0.10 endpoint_manager task monitoring "
+        f"transfer v0.10 endpoint_manager task monitoring + guest-collection permissions, "
+        f"GCS Manager guest collections at /gcs/<endpoint id>/api/ "
         f"(globus-sdk {SDK_PIN} surface){strict}; {oidc}; control plane at /_fauxbus/"
     )

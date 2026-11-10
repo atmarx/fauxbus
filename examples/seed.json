@@ -65,6 +65,7 @@
   "counters": {
     "group": 1
   },
+  "gcs_endpoints": {},
   "groups": {
     "47c2164b-c572-51b0-9246-1a8211fb9e80": {
       "description": "Runs when everything else is down.",
@@ -105,6 +106,7 @@
       "subscription_info": null
     }
   },
+  "guest_collections": {},
   "identities": {
     "t-alice": {
       "identity_id": "00000000-0000-4000-8000-00000000000a",
@@ -123,6 +125,7 @@
       "name": "Globus ID"
     }
   },
+  "mapped_collections": {},
   "oidc": {
     "issuer": "http://localhost:9800",
     "signed_token_clock": "wall"
@@ -166,5 +169,6 @@
       "status": "SUCCEEDED"
     }
   },
+  "user_credentials": {},
   "version": 0
 }

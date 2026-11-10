@@ -1,7 +1,9 @@
 """The in-memory world: groups, memberships, policies, preferences,
 the OAuth2 client registry and the tokens it has issued, and — since the
 Transfer task-monitoring slice — collections, their role grants, and
-transfer tasks.
+transfer tasks.  Since 0.6.0: GCS endpoints, their storage gateways,
+mapped and guest collections, user credentials, and the permissions
+(ACL rules) on guest collections.
 
 Truth grades (see SPEC.md "Recorded, documented, provisional"):
 - Document shapes for groups, my_groups entries, policies, and DELETE
@@ -36,18 +38,25 @@ from .auth import (
 from .errors import (
     ApiError,
     TransferError,
+    access_rule_not_found,
     auth_bad_request,
     auth_forbidden,
     auth_unauthorized,
     endpoint_not_found,
+    gcs_bad_request,
+    gcs_not_found,
+    gcs_permission_denied,
     group_not_found,
     invalid_client,
     invalid_grant,
+    invalid_path,
     invalid_request,
     not_implemented,
     task_not_found,
     transfer_bad_request,
+    transfer_conflict,
     transfer_permission_denied,
+    transfer_request_id,
     validation_error,
 )
 from .ids import (
@@ -57,6 +66,7 @@ from .ids import (
     SESSION_PREFIX,
     access_token,
     access_token_number,
+    derived_id,
     minted_name,
     minted_number,
     sequential_id,
@@ -696,6 +706,169 @@ class TransferTask:
     destination_base_path: str | None = None
 
 
+# ------------------------------------------------- guest collections (0.6.0)
+#
+# A GCS endpoint hosts storage gateways; a mapped collection sits on one
+# gateway and is used directly only by identities the gateway maps to a
+# local account; a guest collection sits inside a mapped collection, is
+# owned by one such identity (through a user credential), and grants
+# everyone else access by *permissions*, Transfer's ACL rules.  Same
+# bright line as the task slice: bookkeeping only.  No path is opened,
+# and a collection's "storage" is a string.
+
+# The roles a mapped or guest collection may grant.  DOCUMENTED
+# (docs.globus.org/api/transfer/roles): access_manager is the one that
+# manages permissions on a guest collection, which is why a guest-capable
+# collection takes it and a plain task-monitoring collection still does
+# not.  ``restricted_administrator`` is not modelled; nobody asked.
+GCS_ROLES = ("administrator", "access_manager", "activity_manager", "activity_monitor")
+
+# DOCUMENTED (docs.globus.org/api/transfer/permissions, read 2026-11-09):
+# creating a permission takes access_manager or administrator, and so do
+# listing and deleting (restricted_administrator also may, unmodelled).
+# The same two roles carry an implicit rw permission on "/" — the
+# role-derived rules in an access list.
+ACL_MANAGER_ROLES = ("administrator", "access_manager")
+
+# RECORDED (globus_sdk/testing/data/globus_connect_server/
+# get_gcs_info.py and create_user_credential.py, 4.8.1): the POSIX
+# connector's id.  The only connector Fauxbus models.
+POSIX_CONNECTOR_ID = "145812c8-decc-41f1-83cf-bb2a85a2a70b"
+
+# DOCUMENTED: "each guest collection can have at most 1000 permissions."
+# Whether role-derived rules count toward it is not said; Fauxbus counts
+# explicit rules only.  PROVISIONAL.
+ACCESS_RULE_LIMIT = 1000
+
+# DOCUMENTED: a permission's path is at most 2000 characters encoded.
+ACCESS_PATH_MAX = 2000
+
+# PROVISIONAL: the GCS Manager's default page size is unpublished; the
+# number only decides how many pages a list spans.
+GCS_PAGE_SIZE = 100
+
+# What a GCS Manager's result envelope says on success.  RECORDED
+# (get_collection_list.py, create_user_credential.py): DATA_TYPE
+# ``result#1.0.0``, ``code`` "success", ``detail`` "success" (or
+# "created"), ``http_response_code`` equal to the status, ``data`` a list.
+GCS_RESULT = "result#1.0.0"
+
+
+@dataclass
+class StorageGateway:
+    """A storage gateway, as far as identity mapping needs one.
+
+    ``identity_mappings`` is the gateway's whole policy, flattened: the
+    identities it maps, each to the local username it maps to.  The real
+    service evaluates mapping expressions and allowed domains; a fake
+    can only say who is in, and a table says that without inventing an
+    expression language.
+    """
+
+    id: str
+    endpoint_id: str
+    display_name: str
+    connector_id: str = POSIX_CONNECTOR_ID
+    identity_mappings: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class GCSEndpoint:
+    """One GCS endpoint, which is to say one GCS Manager and its gateways.
+
+    Its id is also the resource server of the tokens its manager takes,
+    and the first segment of its scopes (``urn:globus:auth:scope:<id>:
+    manage_collections``).  globus-sdk says the manager's *client* id is
+    the canonical one and "will be equal to the endpoint_id in most
+    cases"; Fauxbus models the most-cases world, where they are one id.
+    """
+
+    id: str
+    display_name: str
+    storage_gateways: dict[str, StorageGateway] = field(default_factory=dict)
+
+
+@dataclass
+class UserCredential:
+    """A user credential: one identity's local account on one gateway."""
+
+    id: str
+    storage_gateway_id: str
+    identity_id: str
+    username: str
+    connector_id: str = POSIX_CONNECTOR_ID
+    display_name: str | None = None
+
+
+@dataclass
+class MappedCollection:
+    """A mapped collection: a storage gateway's root, opened to mapped identities.
+
+    ``roles`` holds one role per identity, like a plain ``Collection``.
+    Globus lets a principal hold several; every consumer so far needs
+    one, and a role here reaches every guest collection hosted on this
+    one (DOCUMENTED, advanced_collection_management: a role on a mapped
+    collection "gives the corresponding role on all guest collections on
+    that mapped collection").  The subscription works the same way.
+    """
+
+    id: str
+    endpoint_id: str
+    storage_gateway_id: str
+    display_name: str
+    identity_id: str | None = None
+    allow_guest_collections: bool = True
+    public: bool = True
+    subscription_id: str | None = None
+    roles: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class AccessRule:
+    """One permission on a guest collection: who, where, and r or rw.
+
+    ``create_time`` is world-clock seconds.  ``notify_email`` and
+    ``notify_message`` are accepted at creation and not kept, as the
+    reference says ("this will not be persisted as part of the
+    permission"), so they are not here either.
+    """
+
+    id: str
+    principal_type: str
+    principal: str
+    path: str
+    permissions: str
+    create_time: int
+
+
+@dataclass
+class GuestCollection:
+    """A guest collection: a path inside a mapped collection, shared by permissions.
+
+    ``collection_base_path`` is stored as the creator gave it.  The
+    reference resolves it against the mapped collection's ``root_path``;
+    Fauxbus models no root path, so the base path *is* the host path a
+    task document reports.
+    """
+
+    id: str
+    mapped_collection_id: str
+    display_name: str
+    identity_id: str
+    collection_base_path: str
+    user_credential_id: str | None = None
+    public: bool = True
+    roles: dict[str, str] = field(default_factory=dict)
+    permissions: dict[str, AccessRule] = field(default_factory=dict)
+
+
+def _refuse_unknown_keys(doc: dict[str, Any], known: frozenset[str] | set[str], what: str) -> None:
+    """A seed record's typo is refused by name, the way an unknown section is."""
+    unknown = sorted(set(doc) - set(known))
+    if unknown:
+        raise validation_error(f"{what} has unknown fields {unknown}; known: {sorted(known)}")
+
+
 def _iso(seconds: int) -> str:
     """World-clock seconds as the recorded wire format: ``2024-02-06T06:59:02+00:00``."""
     return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
@@ -776,6 +949,17 @@ class World:
         # along by control-plane call or by tick.
         self.collections: dict[str, Collection] = {}
         self.transfer_tasks: dict[str, TransferTask] = {}
+        # Guest collections (0.6.0).  Endpoints and their gateways arrive
+        # only by seed; mapped collections too, since creating one is an
+        # endpoint administrator's act no consumer performs.  Guest
+        # collections, user credentials and permissions arrive by seed or
+        # through the imitated GCS Manager and Transfer surfaces.  Every
+        # collection id is unique across ``collections``,
+        # ``mapped_collections`` and ``guest_collections``.
+        self.gcs_endpoints: dict[str, GCSEndpoint] = {}
+        self.mapped_collections: dict[str, MappedCollection] = {}
+        self.guest_collections: dict[str, GuestCollection] = {}
+        self.user_credentials: dict[str, UserCredential] = {}
 
     # ------------------------------------------------------------------ ids
 
@@ -1082,10 +1266,9 @@ class World:
         by_server: dict[str, list[str]] = {}
         for scope in scopes:
             if "[" in scope or "]" in scope:
-                raise not_implemented(
-                    f"Fauxbus does not implement dependent scopes, and {scope!r} declares "
-                    f"one. Real client code needs them?"
-                )
+                resource_server = self._gcs_dependent_scope(scope)
+                by_server.setdefault(resource_server, []).append(scope)
+                continue
             resource_server = resource_server_for_scope(scope)
             if resource_server is None:
                 raise not_implemented(
@@ -1095,6 +1278,42 @@ class World:
                 )
             by_server.setdefault(resource_server, []).append(scope)
         return by_server
+
+    def _gcs_dependent_scope(self, scope: str) -> str:
+        """The one dependent scope Fauxbus mints for: a GCS endpoint's, with its data_access.
+
+        A service creating guest collections on a mapped collection that
+        requires ``data_access`` asks for ``urn:globus:auth:scope:
+        <endpoint>:manage_collections[https://auth.globus.org/scopes/
+        <mapped>/data_access]`` — the endpoint scope with the collection's
+        consent hung underneath it.  The token belongs to the outer
+        scope's resource server, the endpoint, so that is where Fauxbus
+        files it, carrying the whole string in ``scope``.
+
+        What it does *not* do is model the dependency.  No dependent
+        token is ever minted for the inner scope (that grant is still the
+        501 it was), and no GCS route asks whether ``data_access`` was
+        consented.  So it is narrowed on purpose to endpoints this world
+        has seeded: anywhere else, a dependent scope is the loud 501 it
+        always was, rather than a token whose meaning nobody has decided.
+        PROVISIONAL — whether the real service mints this token for a
+        client_credentials request without a prior consent is
+        unrecorded.
+        """
+        outer, bracket, inner = scope.partition("[")
+        resource_server = resource_server_for_scope(outer)
+        if (
+            bracket
+            and inner.endswith("]")
+            and "[" not in inner
+            and resource_server in self.gcs_endpoints
+        ):
+            return resource_server
+        raise not_implemented(
+            f"Fauxbus does not implement dependent scopes, and {scope!r} declares "
+            f"one. (The one it does mint is a seeded GCS endpoint's scope with a "
+            f"single dependency.) Real client code needs them?"
+        )
 
     def issue_token(
         self,
@@ -2466,6 +2685,117 @@ class World:
         elapsed = max(0, self.clock - task.active_since)
         return task.files_done + (n - task.files_done) * elapsed // (task.due_at - task.active_since)
 
+    # A collection, since 0.6.0, is one of three kinds, kept in three
+    # dicts: a plain one the task slice knows by name and roles alone, a
+    # mapped one, and a guest one hosted on a mapped one.  These helpers
+    # are the only places that know there are three.
+
+    def _collection_known(self, cid: str) -> bool:
+        return cid in self.collections or cid in self.mapped_collections or cid in self.guest_collections
+
+    def _display_name(self, cid: str) -> str | None:
+        found = (
+            self.collections.get(cid)
+            or self.mapped_collections.get(cid)
+            or self.guest_collections.get(cid)
+        )
+        return found.display_name if found is not None else None
+
+    def _host_of(self, cid: str) -> MappedCollection | None:
+        """The mapped collection hosting guest ``cid``, or None for any other id."""
+        guest = self.guest_collections.get(cid)
+        return None if guest is None else self.mapped_collections.get(guest.mapped_collection_id)
+
+    def _effective_roles(self, identity_id: str, cid: str) -> set[str]:
+        """Every role ``identity_id`` holds on ``cid``, inherited ones included.
+
+        DOCUMENTED (advanced_collection_management): a role on a mapped
+        collection "gives the corresponding role on all guest collections
+        on that mapped collection."  So a guest's roles are its own plus
+        its host's.  Role principals are identities only (see
+        MONITOR_ROLES); a role granted to a group is not modelled.
+        """
+        holders: list[Collection | MappedCollection | GuestCollection] = []
+        if cid in self.collections:
+            holders.append(self.collections[cid])
+        elif cid in self.mapped_collections:
+            holders.append(self.mapped_collections[cid])
+        elif cid in self.guest_collections:
+            holders.append(self.guest_collections[cid])
+            host = self._host_of(cid)
+            if host is not None:
+                holders.append(host)
+        return {h.roles[identity_id] for h in holders if identity_id in h.roles}
+
+    def _subscription_of(self, cid: str) -> str | None:
+        """A collection's subscription; a guest collection's is its host's.
+
+        PROVISIONAL that a guest inherits rather than carrying its own:
+        Globus subscribes an endpoint, and every collection on it is
+        managed by that subscription, but no source spells out the guest
+        case for the activity roles.
+        """
+        if cid in self.collections:
+            return self.collections[cid].subscription_id
+        if cid in self.mapped_collections:
+            return self.mapped_collections[cid].subscription_id
+        host = self._host_of(cid)
+        return None if host is None else host.subscription_id
+
+    def _names_side(self, side_cid: str, wanted: str) -> bool:
+        """Whether one side of a task is ``wanted``, or a guest collection hosted on it."""
+        if side_cid == wanted:
+            return True
+        host = self._host_of(side_cid)
+        return host is not None and host.id == wanted
+
+    def _host_fields(self, side: str, cid: str, caller: Identity) -> dict[str, Any]:
+        """A task side's ``*_host_*`` and ``*_mapped_*`` fields, as ``caller`` may see them.
+
+        DOCUMENTED (advanced_collection_management, read 2026-11-09), for
+        a side that is a guest collection: the host endpoint and mapped
+        collection fields name the mapped collection hosting it, and are
+        shown when that mapped collection is public or the caller holds
+        administrator or activity_monitor on it; ``*_host_path`` — where
+        on the mapped collection the guest lives — only to an
+        administrator of the guest itself or an activity_monitor of the
+        mapped collection.  Null for any side that is not a guest.
+
+        PROVISIONAL, two readings: that activity_manager and
+        administrator count as "activity_monitor" here (each can do
+        everything a monitor can), and that the host path is the guest's
+        ``collection_base_path`` as given, since Fauxbus models no mapped
+        ``root_path`` to resolve it against.  The legacy
+        ``*_host_endpoint`` string is ``name#id`` like its neighbours.
+        """
+        fields: dict[str, Any] = {
+            f"{side}_host_endpoint": None,
+            f"{side}_host_endpoint_display_name": None,
+            f"{side}_host_endpoint_id": None,
+            f"{side}_host_path": None,
+            f"{side}_mapped_collection_display_name": None,
+            f"{side}_mapped_collection_id": None,
+        }
+        host = self._host_of(cid)
+        if host is None:
+            return fields
+        on_host = self._effective_roles(caller.identity_id, host.id)
+        if host.public or on_host & set(MONITOR_ROLES):
+            fields.update(
+                {
+                    f"{side}_host_endpoint": f"{host.display_name}#{host.id}",
+                    f"{side}_host_endpoint_display_name": host.display_name,
+                    f"{side}_host_endpoint_id": host.id,
+                    f"{side}_mapped_collection_display_name": host.display_name,
+                    f"{side}_mapped_collection_id": host.id,
+                }
+            )
+        if on_host & set(MONITOR_ROLES) or "administrator" in self._effective_roles(
+            caller.identity_id, cid
+        ):
+            fields[f"{side}_host_path"] = self.guest_collections[cid].collection_base_path
+        return fields
+
     def _monitor_refusal(self, caller: Identity, collection_id: str) -> str | None:
         """Why ``caller`` may not watch tasks on a collection, or None if they may.
 
@@ -2475,16 +2805,16 @@ class World:
         it is the failure a consumer meets in production when a DTN's
         subscription lapses, with every grant still visibly in place.
         """
-        collection = self.collections.get(collection_id)
-        if collection is None:
+        if not self._collection_known(collection_id):
             return f"collection {collection_id} is not one Fauxbus has been told about"
-        role = collection.roles.get(caller.identity_id)
-        if role not in MONITOR_ROLES:
+        held = self._effective_roles(caller.identity_id, collection_id)
+        role = next((r for r in reversed(MONITOR_ROLES) if r in held), None)
+        if role is None:
             return (
                 f"identity {caller.identity_id} holds no activity_monitor, activity_manager or "
                 f"administrator role on collection {collection_id}"
             )
-        if collection.subscription_id is None:
+        if self._subscription_of(collection_id) is None:
             # DOCUMENTED for the two activity roles ("if the endpoint or
             # collection is unsubscribed, activity manager and monitor
             # roles become inactive").  PROVISIONAL that administrator
@@ -2536,7 +2866,7 @@ class World:
                 f"identity {caller.identity_id} has no activity_monitor role (or a stronger "
                 f"one) on a subscribed collection this task touched"
             )
-        return self.task_doc(task)
+        return self.task_doc(task, caller)
 
     def endpoint_manager_task_list(self, caller: Identity, query: dict[str, str]) -> dict[str, Any]:
         """``GET /v0.10/endpoint_manager/task_list``: filter, order, page.
@@ -2599,16 +2929,25 @@ class World:
                 # PROVISIONAL, the twin of the task-id case: a malformed
                 # collection id is a collection nobody has, so 404.
                 raise endpoint_not_found(endpoint) from None
-            if endpoint not in self.collections:
+            if not self._collection_known(endpoint):
                 raise endpoint_not_found(endpoint)
             refusal = self._monitor_refusal(caller, endpoint)
             if refusal is not None:
                 raise transfer_permission_denied(refusal)
+            # DOCUMENTED: filter_endpoint matches a task whose "source or
+            # destination host endpoint or collection" it names, so a
+            # mapped collection's id finds the tasks into and out of every
+            # guest collection it hosts.  PROVISIONAL: that
+            # filter_endpoint_use narrows the guest-on-host case to the
+            # side the guest was on, the same as it narrows a direct
+            # match.  The reference says only that the use filter limits
+            # results to tasks where the collection "was used in the
+            # specified capacity."
             tasks = [
                 t
                 for t in self.transfer_tasks.values()
-                if (use != "destination" and t.source_endpoint_id == endpoint)
-                or (use != "source" and t.destination_endpoint_id == endpoint)
+                if (use != "destination" and self._names_side(t.source_endpoint_id, endpoint))
+                or (use != "source" and self._names_side(t.destination_endpoint_id, endpoint))
             ]
         else:
             tasks = [t for t in self.transfer_tasks.values() if self._task_visible(caller, t)]
@@ -2627,7 +2966,7 @@ class World:
         # The SDK's LastKeyPaginator reads has_next_page with a bare
         # index, so it is present on every page, never omitted.
         return {
-            "DATA": [self.task_doc(t) for t in page],
+            "DATA": [self.task_doc(t, caller) for t in page],
             "DATA_TYPE": "task_list",
             "has_next_page": len(ordered) > limit,
             "last_key": self._encode_last_key(page[-1]) if page else None,
@@ -2810,7 +3149,7 @@ class World:
             ],
         }
 
-    def task_doc(self, task: TransferTask) -> dict[str, Any]:
+    def task_doc(self, task: TransferTask, caller: Identity) -> dict[str, Any]:
         """The task document, key for key as the recorded fixture has it.
 
         RECORDED key set: every key in
@@ -2829,9 +3168,13 @@ class World:
         for three files count directories Fauxbus does not have),
         ``is_ok``, ``nice_status``, ``effective_bytes_per_second``,
         ``username``, the legacy ``name#id`` endpoint strings, and every
-        ``*_local_user``/``*_host_*``/``*_mapped_*`` field, which are
-        null or the fixture's resting value because Fauxbus models no
-        hosts, mappings or local accounts.
+        ``*_local_user`` field, which are null or the fixture's resting
+        value because Fauxbus models no local accounts.
+
+        The ``*_host_*`` and ``*_mapped_*`` fields are modelled since
+        0.6.0, for a side that is a guest collection (see ``_host_fields``)
+        and null for any other side, as the reference says.  They depend
+        on who is asking, which is why this takes the caller.
         """
         n = len(task.files)
         done = self.files_done_now(task)
@@ -2841,13 +3184,16 @@ class World:
         elapsed = max(0, end - task.request_time)
 
         def endpoint(cid: str) -> tuple[str, str | None]:
-            collection = self.collections.get(cid)
-            name = collection.display_name if collection is not None else None
+            name = self._display_name(cid)
             return f"{name or cid}#{cid}", name
 
         source, source_name = endpoint(task.source_endpoint_id)
         destination, destination_name = endpoint(task.destination_endpoint_id)
-        return {
+        hosts = {
+            **self._host_fields("source", task.source_endpoint_id, caller),
+            **self._host_fields("destination", task.destination_endpoint_id, caller),
+        }
+        return hosts | {
             "DATA_TYPE": "task",
             "bytes_checksummed": 0,
             "bytes_transferred": transferred,
@@ -2864,14 +3210,8 @@ class World:
             "destination_endpoint": destination,
             "destination_endpoint_display_name": destination_name,
             "destination_endpoint_id": task.destination_endpoint_id,
-            "destination_host_endpoint": None,
-            "destination_host_endpoint_display_name": None,
-            "destination_host_endpoint_id": None,
-            "destination_host_path": None,
             "destination_local_user": None,
             "destination_local_user_status": None,
-            "destination_mapped_collection_display_name": None,
-            "destination_mapped_collection_id": None,
             "directories": 0,
             "effective_bytes_per_second": round(transferred / elapsed) if elapsed else 0,
             "encrypt_data": False,
@@ -2900,14 +3240,8 @@ class World:
             "source_endpoint": source,
             "source_endpoint_display_name": source_name,
             "source_endpoint_id": task.source_endpoint_id,
-            "source_host_endpoint": None,
-            "source_host_endpoint_display_name": None,
-            "source_host_endpoint_id": None,
-            "source_host_path": None,
             "source_local_user": None,
             "source_local_user_status": None,
-            "source_mapped_collection_display_name": None,
-            "source_mapped_collection_id": None,
             "status": task.status,
             "subtasks_canceled": 0,
             "subtasks_expired": 0,
@@ -3264,9 +3598,1038 @@ class World:
                 subscription_id=subscription,
                 roles=roles,
             )
+        self._load_guest_world(doc)
         for tid, t in _require_mapping(doc.get("transfer_tasks"), "transfer_tasks").items():
             tid = _require_uuid(str(tid), "transfer task id")
             self.transfer_tasks[tid] = self._task_from_doc(tid, t)
+
+    def _gcs_roles(self, value: Any, what: str) -> dict[str, str]:
+        roles: dict[str, str] = {}
+        for iid, role in _require_mapping(value, f"{what} roles").items():
+            iid = _require_uuid(str(iid), f"{what} role principal")
+            if role not in GCS_ROLES:
+                raise validation_error(f"{what}: role {role!r} is not one of {GCS_ROLES}")
+            roles[iid] = role
+        return roles
+
+    def _load_guest_world(self, doc: dict[str, Any]) -> None:
+        """The seed's guest-collection sections, in dependency order.
+
+        Endpoints (with their gateways), then mapped collections, then
+        user credentials, then guest collections with their permissions —
+        each one checked against what came before it, and every record's
+        unknown field refused by name, so a typo is a 422 here rather
+        than a permission that quietly grants nothing three tests later.
+        Two things are deliberately *not* checked: a permission's
+        principal (Globus accepts a group id it cannot resolve, and so
+        does Fauxbus), and a guest's ``user_credential_id``, which may be
+        null — a harness planting a guest to watch a consumer revoke its
+        permission should not have to invent the owner's local account.
+        """
+        for eid, e in _require_mapping(doc.get("gcs_endpoints"), "gcs_endpoints").items():
+            eid = _require_uuid(str(eid), "gcs endpoint id")
+            what = f"gcs endpoint {eid}"
+            e = _require_mapping(e, what)
+            _refuse_unknown_keys(e, {"display_name", "storage_gateways"}, what)
+            endpoint = GCSEndpoint(id=eid, display_name=str(e.get("display_name") or eid))
+            for gid, g in _require_mapping(e.get("storage_gateways"), f"{what} storage_gateways").items():
+                gid = _require_uuid(str(gid), "storage gateway id")
+                gwhat = f"storage gateway {gid}"
+                if self._gateway(gid) is not None:
+                    raise validation_error(f"{gwhat} appears on two endpoints")
+                g = _require_mapping(g, gwhat)
+                _refuse_unknown_keys(g, {"display_name", "connector_id", "identity_mappings"}, gwhat)
+                mappings: dict[str, str] = {}
+                for iid, username in _require_mapping(
+                    g.get("identity_mappings"), f"{gwhat} identity_mappings"
+                ).items():
+                    iid = _require_uuid(str(iid), f"{gwhat} mapped identity")
+                    if not isinstance(username, str) or not username:
+                        raise validation_error(f"{gwhat} maps {iid} to no local username")
+                    mappings[iid] = username
+                endpoint.storage_gateways[gid] = StorageGateway(
+                    id=gid,
+                    endpoint_id=eid,
+                    display_name=str(g.get("display_name") or gid),
+                    connector_id=_require_uuid(
+                        str(g.get("connector_id") or POSIX_CONNECTOR_ID), f"{gwhat} connector_id"
+                    ),
+                    identity_mappings=mappings,
+                )
+            self.gcs_endpoints[eid] = endpoint
+
+        mapped_keys = {
+            "endpoint_id", "storage_gateway_id", "display_name", "identity_id",
+            "allow_guest_collections", "public", "subscription_id", "roles",
+        }
+        for cid, m in _require_mapping(doc.get("mapped_collections"), "mapped_collections").items():
+            cid = _require_uuid(str(cid), "mapped collection id")
+            what = f"mapped collection {cid}"
+            if self._collection_known(cid):
+                raise validation_error(f"{what} reuses a collection id already in this seed")
+            m = _require_mapping(m, what)
+            _refuse_unknown_keys(m, mapped_keys, what)
+            eid = _require_uuid(str(m.get("endpoint_id")), f"{what} endpoint_id")
+            if eid not in self.gcs_endpoints:
+                raise validation_error(f"{what} names endpoint {eid}, which is not in gcs_endpoints")
+            gid = _require_uuid(str(m.get("storage_gateway_id")), f"{what} storage_gateway_id")
+            if gid not in self.gcs_endpoints[eid].storage_gateways:
+                raise validation_error(f"{what} names storage gateway {gid}, not one of endpoint {eid}'s")
+            owner = m.get("identity_id")
+            subscription = m.get("subscription_id")
+            self.mapped_collections[cid] = MappedCollection(
+                id=cid,
+                endpoint_id=eid,
+                storage_gateway_id=gid,
+                display_name=str(m.get("display_name") or cid),
+                identity_id=None if owner is None else _require_uuid(str(owner), f"{what} identity_id"),
+                allow_guest_collections=_require_bool(
+                    m.get("allow_guest_collections", True), f"{what} allow_guest_collections"
+                ),
+                public=_require_bool(m.get("public", True), f"{what} public"),
+                subscription_id=None
+                if subscription is None
+                else _require_uuid(str(subscription), f"{what} subscription_id"),
+                roles=self._gcs_roles(m.get("roles"), what),
+            )
+
+        cred_keys = {"storage_gateway_id", "identity_id", "username", "connector_id", "display_name"}
+        for cred_id, c in _require_mapping(doc.get("user_credentials"), "user_credentials").items():
+            cred_id = _require_uuid(str(cred_id), "user credential id")
+            what = f"user credential {cred_id}"
+            c = _require_mapping(c, what)
+            _refuse_unknown_keys(c, cred_keys, what)
+            gateway = self._gateway(_require_uuid(str(c.get("storage_gateway_id")), f"{what} storage_gateway_id"))
+            if gateway is None:
+                raise validation_error(f"{what} names a storage gateway no endpoint has")
+            if not isinstance(c.get("username"), str) or not c["username"]:
+                raise validation_error(f"{what} requires a username")
+            self.user_credentials[cred_id] = UserCredential(
+                id=cred_id,
+                storage_gateway_id=gateway.id,
+                identity_id=_require_uuid(str(c.get("identity_id")), f"{what} identity_id"),
+                username=c["username"],
+                connector_id=_require_uuid(
+                    str(c.get("connector_id") or gateway.connector_id), f"{what} connector_id"
+                ),
+                display_name=_optional_str(c.get("display_name"), f"{what} display_name"),
+            )
+
+        guest_keys = {
+            "mapped_collection_id", "display_name", "identity_id", "collection_base_path",
+            "user_credential_id", "public", "roles", "permissions",
+        }
+        rule_keys = {"principal_type", "principal", "path", "permissions", "create_time"}
+        for cid, g in _require_mapping(doc.get("guest_collections"), "guest_collections").items():
+            cid = _require_uuid(str(cid), "guest collection id")
+            what = f"guest collection {cid}"
+            if self._collection_known(cid):
+                raise validation_error(f"{what} reuses a collection id already in this seed")
+            g = _require_mapping(g, what)
+            _refuse_unknown_keys(g, guest_keys, what)
+            mid = _require_uuid(str(g.get("mapped_collection_id")), f"{what} mapped_collection_id")
+            if mid not in self.mapped_collections:
+                raise validation_error(f"{what} is hosted on {mid}, which is not in mapped_collections")
+            base_path = g.get("collection_base_path")
+            if not isinstance(base_path, str) or not base_path:
+                raise validation_error(f"{what} requires a collection_base_path")
+            cred = g.get("user_credential_id")
+            if cred is not None:
+                cred = _require_uuid(str(cred), f"{what} user_credential_id")
+                if cred not in self.user_credentials:
+                    raise validation_error(f"{what} names user credential {cred}, which is not seeded")
+            guest = GuestCollection(
+                id=cid,
+                mapped_collection_id=mid,
+                display_name=str(g.get("display_name") or cid),
+                identity_id=_require_uuid(str(g.get("identity_id")), f"{what} identity_id"),
+                collection_base_path=base_path,
+                user_credential_id=cred,
+                public=_require_bool(g.get("public", True), f"{what} public"),
+                roles=self._gcs_roles(g.get("roles"), what),
+            )
+            seen: set[tuple[str, str, str]] = set()
+            for rid, r in _require_mapping(g.get("permissions"), f"{what} permissions").items():
+                rid = _require_uuid(str(rid), f"{what} permission id")
+                rwhat = f"{what} permission {rid}"
+                if any(rid in other.permissions for other in self.guest_collections.values()):
+                    raise validation_error(f"{rwhat} reuses a permission id")
+                r = _require_mapping(r, rwhat)
+                _refuse_unknown_keys(r, rule_keys, rwhat)
+                if r.get("principal_type") not in ("identity", "group"):
+                    raise validation_error(f"{rwhat} principal_type must be identity or group")
+                path = r.get("path")
+                if not isinstance(path, str) or not path.startswith("/") or not path.endswith("/"):
+                    raise validation_error(f"{rwhat} path must begin and end with '/'")
+                if r.get("permissions") not in ("r", "rw"):
+                    raise validation_error(f"{rwhat} permissions must be 'r' or 'rw'")
+                rule = AccessRule(
+                    id=rid,
+                    principal_type=r["principal_type"],
+                    principal=_require_uuid(str(r.get("principal")), f"{rwhat} principal"),
+                    path=path,
+                    permissions=r["permissions"],
+                    create_time=_require_int(r.get("create_time", self.clock), f"{rwhat} create_time"),
+                )
+                key = (rule.principal_type, rule.principal, rule.path)
+                if key in seen:
+                    raise validation_error(f"{rwhat} duplicates another permission's principal and path")
+                seen.add(key)
+                guest.permissions[rid] = rule
+            if len(guest.permissions) > ACCESS_RULE_LIMIT:
+                raise validation_error(f"{what} has more than {ACCESS_RULE_LIMIT} permissions")
+            self.guest_collections[cid] = guest
+
+    # ------------------------------------------------- GCS Manager (0.6.0)
+    #
+    # One fake GCS Manager per seeded endpoint, reached at
+    # ``/gcs/<endpoint id>/api/``.  The surface is what a service minting
+    # one guest collection per workspace calls, and no more: look up the
+    # mapped collection, find or make its own user credential, list the
+    # guest collections already there, create, rename, delete.
+
+    def _gcs_endpoint(self, endpoint_id: str) -> GCSEndpoint:
+        """The endpoint a GCS path names, or Fauxbus's own 404.
+
+        Fauxbus's dialect, not GCS's: against the real service an unknown
+        endpoint is a DNS name that does not resolve, so there is no
+        Globus answer to imitate.  The fake says what is missing instead.
+        """
+        endpoint = self.gcs_endpoints.get(endpoint_id)
+        if endpoint is None:
+            raise ApiError(
+                404,
+                "NOT_FOUND",
+                f"Fauxbus has no GCS endpoint {endpoint_id}. Seed it under 'gcs_endpoints' "
+                f"and address its manager as /gcs/<endpoint id>/api/.",
+            )
+        return endpoint
+
+    def _gateway(self, gateway_id: str) -> StorageGateway | None:
+        for endpoint in self.gcs_endpoints.values():
+            if gateway_id in endpoint.storage_gateways:
+                return endpoint.storage_gateways[gateway_id]
+        return None
+
+    def _endpoint_of(self, cid: str) -> str | None:
+        if cid in self.mapped_collections:
+            return self.mapped_collections[cid].endpoint_id
+        host = self._host_of(cid)
+        return None if host is None else host.endpoint_id
+
+    def _gcs_collection(self, endpoint_id: str, cid: str) -> MappedCollection | GuestCollection:
+        """A mapped or guest collection *on this endpoint*, or GCS's 404.
+
+        A collection on another endpoint is not found here: each manager
+        knows its own collections and nobody else's.
+        """
+        self._gcs_endpoint(endpoint_id)
+        found = self.mapped_collections.get(cid) or self.guest_collections.get(cid)
+        if found is None or self._endpoint_of(cid) != endpoint_id:
+            raise gcs_not_found(f"Collection {cid} not found on endpoint {endpoint_id}")
+        return found
+
+    def _gcs_may_see(self, caller: Identity, c: MappedCollection | GuestCollection) -> bool:
+        # PROVISIONAL: a public collection is visible to any caller; a
+        # private one to its owner and anyone holding a role on it.  The
+        # reference marks some fields private and does not spell out the
+        # collection-level rule.
+        return (
+            c.public
+            or c.identity_id == caller.identity_id
+            or bool(self._effective_roles(caller.identity_id, c.id))
+        )
+
+    def gcs_collection_doc(self, c: MappedCollection | GuestCollection) -> dict[str, Any]:
+        """A collection document, version ``collection#1.0.0``.
+
+        RECORDED key set for a mapped collection (get_collection_list.py):
+        ``DATA_TYPE``, ``public``, ``id``, ``display_name``,
+        ``identity_id``, ``collection_type``, ``storage_gateway_id``,
+        ``require_high_assurance``, ``high_assurance``,
+        ``authentication_assurance_timeout``,
+        ``authentication_timeout_mins``.  Added, DOCUMENTED (the GCS
+        Collections reference): ``allow_guest_collections`` (always false
+        on a guest), and on a guest ``mapped_collection_id``,
+        ``user_credential_id`` and ``collection_base_path``.  PROVISIONAL
+        values: the two timeouts are null and both high-assurance flags
+        false, because Fauxbus models no high assurance.
+        """
+        doc: dict[str, Any] = {
+            "DATA_TYPE": "collection#1.0.0",
+            "id": c.id,
+            "display_name": c.display_name,
+            "identity_id": c.identity_id,
+            "public": c.public,
+            "require_high_assurance": False,
+            "high_assurance": False,
+            "authentication_assurance_timeout": None,
+            "authentication_timeout_mins": None,
+        }
+        if isinstance(c, MappedCollection):
+            doc.update(
+                collection_type="mapped",
+                storage_gateway_id=c.storage_gateway_id,
+                allow_guest_collections=c.allow_guest_collections,
+            )
+        else:
+            host = self.mapped_collections.get(c.mapped_collection_id)
+            doc.update(
+                collection_type="guest",
+                storage_gateway_id=host.storage_gateway_id if host is not None else None,
+                allow_guest_collections=False,
+                mapped_collection_id=c.mapped_collection_id,
+                user_credential_id=c.user_credential_id,
+                collection_base_path=c.collection_base_path,
+            )
+        return doc
+
+    @staticmethod
+    def gcs_result(
+        docs: list[dict[str, Any]], status: int = 200, **extra: Any
+    ) -> dict[str, Any]:
+        """The GCS Manager's result envelope around ``docs``.  RECORDED shape."""
+        return {
+            "DATA_TYPE": GCS_RESULT,
+            "code": "success",
+            "detail": "created" if status == 201 else "success",
+            "http_response_code": status,
+            "data": docs,
+            **extra,
+        }
+
+    @staticmethod
+    def _gcs_page(
+        items: list[tuple[str, dict[str, Any]]], query: dict[str, str]
+    ) -> dict[str, Any]:
+        """One marker page of ``(id, doc)`` pairs, in id order.
+
+        ``has_next_page`` and ``marker`` are DOCUMENTED envelope fields
+        and the SDK's MarkerPaginator reads exactly those two.
+        PROVISIONAL: the marker is the last id on the page (keyset paging,
+        so a collection made between two pages shifts nothing), a last
+        page carries ``""`` (the recorded 403 does), and ``page_size``
+        takes any positive integer.
+        """
+        raw = query.get("page_size")
+        try:
+            size = GCS_PAGE_SIZE if raw is None else int(raw)
+        except ValueError:
+            raise gcs_bad_request(f"page_size {raw!r} is not an integer") from None
+        if size < 1:
+            raise gcs_bad_request("page_size must be at least 1")
+        ordered = sorted(items, key=lambda pair: pair[0])
+        after = query.get("marker")
+        if after:
+            ordered = [pair for pair in ordered if pair[0] > after]
+        page = ordered[:size]
+        more = len(ordered) > size
+        return World.gcs_result(
+            [doc for _, doc in page],
+            has_next_page=more,
+            marker=page[-1][0] if more else "",
+        )
+
+    def gcs_get_collection(self, caller: Identity, endpoint_id: str, cid: str) -> dict[str, Any]:
+        c = self._gcs_collection(endpoint_id, cid)
+        if not self._gcs_may_see(caller, c):
+            raise gcs_permission_denied(f"Could not get collection {cid}. Insufficient permissions")
+        return self.gcs_result([self.gcs_collection_doc(c)])
+
+    GCS_LIST_PARAMS = frozenset({"mapped_collection_id", "filter", "page_size", "marker"})
+    GCS_TYPE_FILTERS = {"mapped_collections": "mapped", "guest_collections": "guest"}
+
+    def gcs_list_collections(
+        self, caller: Identity, endpoint_id: str, query: dict[str, str]
+    ) -> dict[str, Any]:
+        """``GET /collections``: what this endpoint holds that the caller may see.
+
+        ``filter`` takes ``mapped_collections`` and ``guest_collections``;
+        given both, a collection of either type passes (PROVISIONAL: the
+        reference says "any combination" without saying whether types
+        combine as and or or).  The reference's other filters
+        (``managed_by_me``, ``created_by_me``, the date comparisons) and
+        parameters (``include``, ``storage_gateway_id``) are a loud 501,
+        for the reason task_list's are: a filter ignored hands back what
+        the caller asked to leave out.
+        """
+        endpoint = self._gcs_endpoint(endpoint_id)
+        unknown = sorted(set(query) - self.GCS_LIST_PARAMS)
+        if unknown:
+            raise not_implemented(
+                f"Fauxbus does not implement GET /collections' {', '.join(unknown)}. "
+                f"Real client code sends it?"
+            )
+        filters = [f for f in query.get("filter", "").split(",") if f]
+        unbuilt = sorted(set(filters) - set(self.GCS_TYPE_FILTERS))
+        if unbuilt:
+            raise not_implemented(
+                f"Fauxbus does not implement the collection filter {', '.join(unbuilt)}, and "
+                f"will not ignore it. Real client code sends it?"
+            )
+        types = {self.GCS_TYPE_FILTERS[f] for f in filters} or {"mapped", "guest"}
+        candidates: list[MappedCollection | GuestCollection] = [
+            *(m for m in self.mapped_collections.values() if m.endpoint_id == endpoint.id),
+            *(g for g in self.guest_collections.values() if self._endpoint_of(g.id) == endpoint.id),
+        ]
+        mapped_id = query.get("mapped_collection_id")
+        if mapped_id is not None:
+            # DOCUMENTED: limits results to guest collections created
+            # from that mapped collection.
+            candidates = [
+                c
+                for c in candidates
+                if isinstance(c, GuestCollection) and c.mapped_collection_id == mapped_id
+            ]
+        chosen = [
+            (c.id, self.gcs_collection_doc(c))
+            for c in candidates
+            if ("mapped" if isinstance(c, MappedCollection) else "guest") in types
+            and self._gcs_may_see(caller, c)
+        ]
+        return self._gcs_page(chosen, query)
+
+    GUEST_CREATE_FIELDS = frozenset(
+        {
+            "DATA_TYPE",
+            "collection_type",
+            "display_name",
+            "identity_id",
+            "mapped_collection_id",
+            "user_credential_id",
+            "collection_base_path",
+            "storage_gateway_id",
+            "public",
+        }
+    )
+
+    def _gcs_unmodelled(self, body: dict[str, Any], known: frozenset[str], what: str) -> None:
+        unknown = sorted(set(body) - known)
+        if unknown:
+            raise not_implemented(
+                f"Fauxbus does not model the {what} field(s) {', '.join(unknown)}, and will "
+                f"not accept a value it would silently drop. Real client code sends it?"
+            )
+
+    def gcs_create_collection(
+        self, caller: Identity, endpoint_id: str, body: Any
+    ) -> GuestCollection:
+        """``POST /collections`` for a guest collection.
+
+        DOCUMENTED (the SDK's ``create_collection`` docstring and the GCS
+        reference): "in order to create a guest collection, the caller
+        must have an identity that matches the Storage Gateway policies",
+        the creator gets ``collection:administrator``, and the user
+        credential "must be owned by the collection's identity_id."  Also
+        DOCUMENTED: a mapped collection with ``allow_guest_collections``
+        off hosts no guest collections.  The status and code of each
+        refusal are PROVISIONAL (see errors.GCSError); so is refusing an
+        ``identity_id`` other than the caller's own, the conservative
+        reading of "identity that matches".  Creating a *mapped*
+        collection is an endpoint administrator's act no consumer
+        performs, and a 501.
+        """
+        endpoint = self._gcs_endpoint(endpoint_id)
+        if not isinstance(body, dict):
+            raise gcs_bad_request("collection document required")
+        kind = body.get("collection_type")
+        if kind == "mapped":
+            raise not_implemented("Fauxbus does not implement creating a mapped collection.")
+        if kind != "guest":
+            raise gcs_bad_request("collection_type must be 'guest'")
+        data_type = body.get("DATA_TYPE")
+        if data_type is not None and not str(data_type).startswith("collection#"):
+            raise gcs_bad_request(f"DATA_TYPE {data_type!r} is not a collection document")
+        self._gcs_unmodelled(body, self.GUEST_CREATE_FIELDS, "collection")
+
+        mapped_id = body.get("mapped_collection_id")
+        mapped = self.mapped_collections.get(str(mapped_id))
+        if mapped is None or mapped.endpoint_id != endpoint.id:
+            raise gcs_not_found(f"Mapped collection {mapped_id} not found on endpoint {endpoint.id}")
+        if not mapped.allow_guest_collections:
+            raise gcs_permission_denied(
+                f"Mapped collection {mapped.id} does not allow guest collections "
+                f"(allow_guest_collections is false)"
+            )
+        gateway = self._gateway(mapped.storage_gateway_id)
+        if gateway is None or caller.identity_id not in gateway.identity_mappings:
+            raise gcs_permission_denied(
+                f"Identity {caller.identity_id} is not mapped by storage gateway "
+                f"{mapped.storage_gateway_id}, so it may not create a guest collection on "
+                f"mapped collection {mapped.id}"
+            )
+        owner = str(body.get("identity_id") or caller.identity_id)
+        if owner != caller.identity_id:
+            raise gcs_permission_denied(
+                f"Identity {caller.identity_id} may not create a guest collection owned by {owner}"
+            )
+        gateway_id = body.get("storage_gateway_id")
+        if gateway_id is not None and gateway_id != mapped.storage_gateway_id:
+            raise gcs_bad_request(
+                f"storage_gateway_id {gateway_id} is not mapped collection {mapped.id}'s "
+                f"gateway ({mapped.storage_gateway_id})"
+            )
+        credential = self.user_credentials.get(str(body.get("user_credential_id")))
+        if (
+            credential is None
+            or credential.storage_gateway_id != mapped.storage_gateway_id
+            or credential.identity_id != owner
+        ):
+            raise gcs_bad_request(
+                f"user_credential_id {body.get('user_credential_id')!r} must name a credential "
+                f"on gateway {mapped.storage_gateway_id} owned by {owner}"
+            )
+        base_path = body.get("collection_base_path")
+        if not isinstance(base_path, str) or not base_path:
+            raise gcs_bad_request("collection_base_path is required")
+        display_name = body.get("display_name")
+        if not isinstance(display_name, str) or not display_name:
+            raise gcs_bad_request("display_name is required")
+        public = body.get("public", True)
+        if not isinstance(public, bool):
+            raise gcs_bad_request("public must be true or false")
+
+        guest = GuestCollection(
+            id=self._fresh_collection_id("guest_collection"),
+            mapped_collection_id=mapped.id,
+            display_name=display_name,
+            identity_id=owner,
+            collection_base_path=base_path,
+            user_credential_id=credential.id,
+            public=public,
+            roles={owner: "administrator"},
+        )
+        self.guest_collections[guest.id] = guest
+        return guest
+
+    def _fresh_collection_id(self, kind: str) -> str:
+        # Same skip-past-the-seed rule as transfer task ids: a hand-written
+        # seed may already hold the id the counter is about to produce.
+        while True:
+            cid = self.next_id(kind)
+            if not self._collection_known(cid):
+                return cid
+
+    def _gcs_guest_admin(self, caller: Identity, endpoint_id: str, cid: str) -> GuestCollection:
+        c = self._gcs_collection(endpoint_id, cid)
+        if isinstance(c, MappedCollection):
+            raise not_implemented("Fauxbus does not implement changing or deleting a mapped collection.")
+        if "administrator" not in self._effective_roles(caller.identity_id, c.id):
+            raise gcs_permission_denied(
+                f"Identity {caller.identity_id} holds no administrator role on collection {cid}"
+            )
+        return c
+
+    # DOCUMENTED (GCS Collections reference): collection_base_path,
+    # mapped_collection_id and storage_gateway_id "may not be changed"
+    # once the collection exists.  Sending one unchanged is accepted
+    # (PROVISIONAL); a different value is refused.
+    GUEST_IMMUTABLE_FIELDS = ("collection_base_path", "mapped_collection_id", "storage_gateway_id")
+    GUEST_UPDATE_FIELDS = frozenset({"DATA_TYPE", "collection_type", "display_name", *GUEST_IMMUTABLE_FIELDS})
+
+    def gcs_update_collection(
+        self, caller: Identity, endpoint_id: str, cid: str, body: Any
+    ) -> GuestCollection:
+        """``PATCH /collections/{id}``: rename a guest collection, and nothing else.
+
+        The one change a consumer makes is ``display_name``.  The three
+        immutable fields are refused when they differ; every other field
+        is a 501 until someone needs it changed.
+        """
+        guest = self._gcs_guest_admin(caller, endpoint_id, cid)
+        if not isinstance(body, dict):
+            raise gcs_bad_request("collection document required")
+        if body.get("collection_type") not in (None, "guest"):
+            raise gcs_bad_request("collection_type of a guest collection is 'guest'")
+        self._gcs_unmodelled(body, self.GUEST_UPDATE_FIELDS, "updatable collection")
+        current = self.gcs_collection_doc(guest)
+        for key in self.GUEST_IMMUTABLE_FIELDS:
+            if key in body and body[key] != current[key]:
+                raise gcs_bad_request(
+                    f"{key} may not be changed once the collection is created "
+                    f"(it is {current[key]!r})"
+                )
+        if "display_name" in body:
+            name = body["display_name"]
+            if not isinstance(name, str) or not name:
+                raise gcs_bad_request("display_name must be a non-empty string")
+            guest.display_name = name
+        return guest
+
+    def gcs_delete_collection(self, caller: Identity, endpoint_id: str, cid: str) -> None:
+        """``DELETE /collections/{id}``: the guest collection and its permissions go.
+
+        Tasks that touched it keep its id, as Globus's history does; they
+        simply lose the host fields a live guest would lend them.
+        """
+        guest = self._gcs_guest_admin(caller, endpoint_id, cid)
+        del self.guest_collections[guest.id]
+
+    USER_CREDENTIAL_FIELDS = frozenset(
+        {"DATA_TYPE", "identity_id", "connector_id", "username", "display_name", "storage_gateway_id"}
+    )
+
+    def gcs_user_credential_doc(self, cred: UserCredential) -> dict[str, Any]:
+        """RECORDED key set (create_user_credential.py), POSIX policies and all."""
+        return {
+            "DATA_TYPE": "user_credential#1.0.0",
+            "connector_id": cred.connector_id,
+            "display_name": cred.display_name,
+            "id": cred.id,
+            "identity_id": cred.identity_id,
+            "invalid": False,
+            "policies": {"DATA_TYPE": "posix_user_credential_policies#1.0.0"},
+            "provisioned": False,
+            "storage_gateway_id": cred.storage_gateway_id,
+            "username": cred.username,
+        }
+
+    def gcs_list_user_credentials(
+        self, caller: Identity, endpoint_id: str, query: dict[str, str]
+    ) -> dict[str, Any]:
+        """``GET /user_credentials``: the caller's own, optionally on one gateway.
+
+        PROVISIONAL that the list is the caller's credentials only.  The
+        reference lists "user credentials", and a credential is one
+        identity's key to a local account, which nobody else should be
+        shown.
+        """
+        endpoint = self._gcs_endpoint(endpoint_id)
+        unknown = sorted(set(query) - {"storage_gateway", "page_size", "marker"})
+        if unknown:
+            raise not_implemented(
+                f"Fauxbus does not implement GET /user_credentials' {', '.join(unknown)}. "
+                f"Real client code sends it?"
+            )
+        gateway = query.get("storage_gateway")
+        chosen = [
+            (c.id, self.gcs_user_credential_doc(c))
+            for c in self.user_credentials.values()
+            if c.identity_id == caller.identity_id
+            and c.storage_gateway_id in endpoint.storage_gateways
+            and (gateway is None or c.storage_gateway_id == gateway)
+        ]
+        return self._gcs_page(chosen, query)
+
+    def gcs_create_user_credential(
+        self, caller: Identity, endpoint_id: str, body: Any
+    ) -> UserCredential:
+        """``POST /user_credentials``: a mapped identity claims its local account.
+
+        Authorized by the gateway's identity mapping, not by any role:
+        the gateway either maps this identity or it does not.
+        PROVISIONAL: that the credential must be for the caller's own
+        identity, that ``username`` must be the one the gateway maps it
+        to (it defaults to that), and that ``connector_id`` must be the
+        gateway's.  Each refusal errs toward the real service allowing
+        more, the direction SPEC asks a fake to err in.
+        """
+        endpoint = self._gcs_endpoint(endpoint_id)
+        if not isinstance(body, dict):
+            raise gcs_bad_request("user credential document required")
+        data_type = body.get("DATA_TYPE")
+        if data_type is not None and not str(data_type).startswith("user_credential#"):
+            raise gcs_bad_request(f"DATA_TYPE {data_type!r} is not a user credential document")
+        self._gcs_unmodelled(body, self.USER_CREDENTIAL_FIELDS, "user credential")
+        gateway_id = str(body.get("storage_gateway_id"))
+        gateway = endpoint.storage_gateways.get(gateway_id)
+        if gateway is None:
+            raise gcs_not_found(f"Storage gateway {gateway_id} not found on endpoint {endpoint.id}")
+        identity_id = str(body.get("identity_id") or caller.identity_id)
+        if identity_id != caller.identity_id:
+            raise gcs_permission_denied(
+                f"Identity {caller.identity_id} may not create a credential for {identity_id}"
+            )
+        mapped_to = gateway.identity_mappings.get(identity_id)
+        if mapped_to is None:
+            raise gcs_permission_denied(
+                f"Identity {identity_id} is not mapped by storage gateway {gateway.id}"
+            )
+        username = body.get("username", mapped_to)
+        if username != mapped_to:
+            raise gcs_bad_request(
+                f"Storage gateway {gateway.id} maps identity {identity_id} to {mapped_to!r}, "
+                f"not {username!r}"
+            )
+        connector = body.get("connector_id", gateway.connector_id)
+        if connector != gateway.connector_id:
+            raise gcs_bad_request(
+                f"connector_id {connector} is not storage gateway {gateway.id}'s connector"
+            )
+        display_name = _optional_str(body.get("display_name"), "display_name")
+        while True:
+            cred_id = self.next_id("user_credential")
+            if cred_id not in self.user_credentials:
+                break
+        cred = UserCredential(
+            id=cred_id,
+            storage_gateway_id=gateway.id,
+            identity_id=identity_id,
+            username=mapped_to,
+            connector_id=gateway.connector_id,
+            display_name=display_name,
+        )
+        self.user_credentials[cred.id] = cred
+        return cred
+
+    # ------------------------------------- Transfer permissions (0.6.0)
+    #
+    # A guest collection's ACL rules, through Transfer's
+    # ``/endpoint/<id>/access*`` resources.  DOCUMENTED throughout, from
+    # docs.globus.org/api/transfer/permissions (read 2026-11-09); the SDK
+    # records no fixture for any of it.
+
+    ACCESS_CREATE_FIELDS = frozenset(
+        {"DATA_TYPE", "principal_type", "principal", "path", "permissions", "notify_email", "notify_message"}
+    )
+
+    def _acl_guest(self, caller: Identity, cid: str) -> GuestCollection:
+        """The guest collection a permissions call names, if the caller manages it."""
+        try:
+            cid = str(UUID(cid))
+        except (ValueError, AttributeError, TypeError):
+            raise endpoint_not_found(cid) from None
+        guest = self.guest_collections.get(cid)
+        if guest is None:
+            if self._collection_known(cid):
+                # DOCUMENTED: NotSupported (409) — "the collection is not
+                # a guest collection."
+                raise transfer_conflict(
+                    "NotSupported", f"Collection {cid} is not a guest collection, so it has no permissions"
+                )
+            raise endpoint_not_found(cid)
+        if not self._effective_roles(caller.identity_id, guest.id) & set(ACL_MANAGER_ROLES):
+            raise transfer_permission_denied(
+                f"identity {caller.identity_id} holds no access_manager or administrator role "
+                f"on collection {guest.id}"
+            )
+        return guest
+
+    def _role_rules(self, guest: GuestCollection) -> list[dict[str, Any]]:
+        """The implicit permissions an access list shows for role holders.
+
+        DOCUMENTED: an identity holding administrator or access_manager
+        has rw on "/" with a null ``id`` and ``create_time``, and its
+        ``role_id`` and ``role_type`` set; it "can not be fetched,
+        updated or deleted" through the permission resources.  One per
+        role grant, the guest's own and its host's, since either one is
+        an effective role there.  The ``role_id`` is derived from the
+        grant (ids.derived_id), because Fauxbus stores a grant as a fact
+        rather than a record with an id.
+        """
+        grants: list[tuple[str, str, str]] = []
+        host = self.mapped_collections.get(guest.mapped_collection_id)
+        for holder in (guest, host):
+            if holder is None:
+                continue
+            for identity_id, role in holder.roles.items():
+                if role in ACL_MANAGER_ROLES:
+                    grants.append((identity_id, role, derived_id("role", holder.id, identity_id, role)))
+        return [
+            {
+                "DATA_TYPE": "access",
+                "create_time": None,
+                "expiration_date": None,
+                "id": None,
+                "path": "/",
+                "permissions": "rw",
+                "principal": identity_id,
+                "principal_type": "identity",
+                "role_id": role_id,
+                "role_type": role,
+            }
+            for identity_id, role, role_id in sorted(grants)
+        ]
+
+    @staticmethod
+    def access_rule_doc(rule: AccessRule) -> dict[str, Any]:
+        """DOCUMENTED key set: the reference's access_list example, entry for entry."""
+        return {
+            "DATA_TYPE": "access",
+            "create_time": _iso(rule.create_time),
+            "expiration_date": None,
+            "id": rule.id,
+            "path": rule.path,
+            "permissions": rule.permissions,
+            "principal": rule.principal,
+            "principal_type": rule.principal_type,
+            "role_id": None,
+            "role_type": None,
+        }
+
+    @staticmethod
+    def _rule_order(rule: AccessRule) -> tuple[int, str]:
+        # PROVISIONAL order: oldest first, id breaking ties (common on a
+        # logical clock).  Nothing documents the real order.
+        return (rule.create_time, rule.id)
+
+    def endpoint_acl_list(self, caller: Identity, cid: str) -> dict[str, Any]:
+        """``GET /endpoint/<id>/access_list``.  DOCUMENTED envelope: DATA, DATA_TYPE, endpoint.
+
+        Role-derived rules first, then the explicit ones (PROVISIONAL
+        order).  No paging, which the reference does not describe either;
+        a collection holds at most 1000 rules.
+        """
+        guest = self._acl_guest(caller, cid)
+        explicit = sorted(guest.permissions.values(), key=self._rule_order)
+        return {
+            "DATA_TYPE": "access_list",
+            "endpoint": guest.id,
+            "DATA": self._role_rules(guest) + [self.access_rule_doc(r) for r in explicit],
+        }
+
+    def add_access_rule(self, caller: Identity, cid: str, body: Any) -> dict[str, Any]:
+        """``POST /endpoint/<id>/access``: one new permission, or the reason why not.
+
+        DOCUMENTED rules, applied in this order (the order itself is
+        PROVISIONAL): only access_manager or administrator may create
+        (restricted_administrator may list and delete, but not create);
+        ``path`` begins and ends with ``/``, has no ``/../`` or ``/./``,
+        and is at most 2000 characters, else InvalidPath; the same
+        ``(principal_type, principal, path)`` twice is Exists; the
+        1001st rule is LimitExceeded.  The principal is **not** looked
+        up: a group id that names no group is accepted, as Globus accepts
+        it — the permission simply grants nobody anything until the group
+        exists.  Its UUID *form* is checked, the reference saying
+        identities and groups are named by UUID.
+
+        PROVISIONAL: the BadRequest status for a malformed principal,
+        permissions value or unknown field.  ``all_authenticated_users``
+        and ``anonymous`` principals are real and unbuilt, so a 501.
+        ``expiration_date`` (high-assurance collections only) is a 501.
+        """
+        guest = self._acl_guest(caller, cid)
+        if not isinstance(body, dict):
+            raise transfer_bad_request("an access document is required")
+        if "expiration_date" in body:
+            raise not_implemented(
+                "Fauxbus does not implement permission expiration_date (high-assurance "
+                "collections only)."
+            )
+        unknown = sorted(set(body) - self.ACCESS_CREATE_FIELDS)
+        if unknown:
+            raise transfer_bad_request(f"unknown access document fields: {', '.join(unknown)}")
+        if body.get("DATA_TYPE", "access") != "access":
+            raise transfer_bad_request("DATA_TYPE must be 'access'")
+        principal_type = body.get("principal_type")
+        if principal_type in ("all_authenticated_users", "anonymous"):
+            raise not_implemented(
+                f"Fauxbus does not implement {principal_type} permissions. Real client code "
+                f"needs them?"
+            )
+        if principal_type not in ("identity", "group"):
+            raise transfer_bad_request(
+                "principal_type must be one of identity, group, all_authenticated_users, anonymous"
+            )
+        try:
+            principal = str(UUID(str(body.get("principal"))))
+        except ValueError:
+            raise transfer_bad_request(
+                f"principal {body.get('principal')!r} is not a {principal_type} id"
+            ) from None
+        path = body.get("path")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or not path.endswith("/")
+            or "/../" in path
+            or "/./" in path
+            or len(path) > ACCESS_PATH_MAX
+        ):
+            raise invalid_path(
+                f"path {path!r} must begin and end with '/', contain no '/../' or '/./', and "
+                f"be at most {ACCESS_PATH_MAX} characters"
+            )
+        permissions = body.get("permissions")
+        if permissions not in ("r", "rw"):
+            raise transfer_bad_request("permissions must be 'r' or 'rw'")
+        for rule in guest.permissions.values():
+            if (rule.principal_type, rule.principal, rule.path) == (principal_type, principal, path):
+                raise transfer_conflict(
+                    "Exists",
+                    f"A permission for {principal_type} {principal} on {path} already exists "
+                    f"({rule.id})",
+                )
+        if len(guest.permissions) >= ACCESS_RULE_LIMIT:
+            raise transfer_conflict(
+                "LimitExceeded",
+                f"Collection {guest.id} already has the maximum of {ACCESS_RULE_LIMIT} permissions",
+            )
+        while True:
+            rule_id = self.next_id("access_rule")
+            if not any(rule_id in g.permissions for g in self.guest_collections.values()):
+                break
+        guest.permissions[rule_id] = AccessRule(
+            id=rule_id,
+            principal_type=principal_type,
+            principal=principal,
+            path=path,
+            permissions=permissions,
+            create_time=self.clock,
+        )
+        resource = f"/endpoint/{guest.id}/access"
+        # DOCUMENTED: access_create_result, answered with a 201.
+        return {
+            "DATA_TYPE": "access_create_result",
+            "access_id": rule_id,
+            "code": "Created",
+            "message": "Access rule created successfully.",
+            "request_id": transfer_request_id("Created", resource),
+            "resource": resource,
+        }
+
+    def delete_access_rule(self, caller: Identity, cid: str, rule_id: str) -> dict[str, Any]:
+        """``DELETE /endpoint/<id>/access/<rule id>``.
+
+        A role-derived rule has no id to name, so it cannot be deleted
+        here; asked for by its ``role_id`` it is AccessRuleNotFound like
+        any id that is not a permission (DOCUMENTED: implicit
+        permissions cannot be deleted through this resource).
+        """
+        guest = self._acl_guest(caller, cid)
+        if rule_id not in guest.permissions:
+            raise access_rule_not_found(rule_id)
+        del guest.permissions[rule_id]
+        resource = f"/endpoint/{guest.id}/access/{rule_id}"
+        return {
+            "DATA_TYPE": "result",
+            "code": "Deleted",
+            "message": f"Access rule '{rule_id}' deleted successfully",
+            "request_id": transfer_request_id("Deleted", resource),
+            "resource": resource,
+        }
+
+    # ------------------------------------------- the permission is the gate
+
+    def group_closure(self, identity_id: str) -> set[str]:
+        """Every group an identity counts as a member of, for a permission check.
+
+        Its active memberships, plus every ancestor of those groups:
+        Globus counts a subgroup's members as members of the parent, so a
+        permission naming the parent reaches them.  PROVISIONAL — the
+        consumer reports the rule (its chain is readers ⊃ writers ⊃
+        managers, by subgroup) and Fauxbus has no recording of it.  The
+        Groups API's own answers (``my_groups``, role checks) do not use
+        this; a subgroup member is not shown as a member of the parent
+        there.  The calling identity alone, not its linked identities —
+        SPEC's recording item 24, the conservative reading.
+        """
+        found: set[str] = set()
+        frontier = [g.id for g in self.groups.values() if g.active_role(identity_id) is not None]
+        while frontier:
+            gid = frontier.pop()
+            if gid in found:
+                continue
+            found.add(gid)
+            group = self.groups.get(gid)
+            if group is not None and group.parent_id is not None:
+                frontier.append(group.parent_id)
+        return found
+
+    def guest_permission(self, identity_id: str, guest: GuestCollection, path: str) -> str | None:
+        """The strongest permission ``identity_id`` holds at ``path`` on ``guest``: "rw", "r", or None.
+
+        A rule covers a path at or beneath its own (the rule's path ends
+        in ``/``).  Explicit rules for the identity or any group in its
+        closure count, and so do the role-derived ones.
+        """
+        groups = self.group_closure(identity_id)
+        best: str | None = None
+        rules = [
+            (r.principal_type, r.principal, r.path, r.permissions)
+            for r in guest.permissions.values()
+        ] + [
+            (r["principal_type"], r["principal"], r["path"], r["permissions"])
+            for r in self._role_rules(guest)
+        ]
+        for principal_type, principal, rule_path, permissions in rules:
+            applies = (principal_type == "identity" and principal == identity_id) or (
+                principal_type == "group" and principal in groups
+            )
+            if applies and (path == rule_path.rstrip("/") or path.startswith(rule_path)):
+                if permissions == "rw":
+                    return "rw"
+                best = "r"
+        return best
+
+    def _data_access_refusal(
+        self, identity_id: str, cid: str, paths: list[str], write: bool
+    ) -> str | None:
+        """Why ``identity_id`` may not read (or write) ``paths`` on ``cid``, or None.
+
+        A guest collection asks its permissions; a mapped collection asks
+        its gateway's identity mapping; any other collection is not
+        modelled as storage and asks nothing, which is how a researcher's
+        own laptop works as a source.
+        """
+        need = "write" if write else "read"
+        if cid in self.guest_collections:
+            guest = self.guest_collections[cid]
+            host = self.mapped_collections.get(guest.mapped_collection_id)
+            if host is not None and not host.allow_guest_collections:
+                # DOCUMENTED: setting allow_guest_collections false "makes
+                # its guest collections inaccessible."
+                return (
+                    f"guest collection {cid} is inaccessible: its mapped collection "
+                    f"{host.id} has allow_guest_collections off"
+                )
+            for path in paths:
+                held = self.guest_permission(identity_id, guest, path)
+                if held == "rw" or (held == "r" and not write):
+                    continue
+                return (
+                    f"identity {identity_id} may not {need} {path} on guest collection {cid}: "
+                    f"no permission there grants {'rw' if write else 'r'} to it or to a group "
+                    f"it belongs to"
+                    + (f" (it holds {held})" if held else "")
+                )
+            return None
+        if cid in self.mapped_collections:
+            gateway = self._gateway(self.mapped_collections[cid].storage_gateway_id)
+            if gateway is None or identity_id not in gateway.identity_mappings:
+                return (
+                    f"identity {identity_id} may not {need} on mapped collection {cid}: its "
+                    f"storage gateway does not map that identity"
+                )
+        return None
+
+    def submit_transfer_as(self, doc: Any) -> TransferTask:
+        """A person's transfer, let through or refused by the collections' permissions.
+
+        The task-creating route of the control plane, with Globus's
+        access check in front of it.  ``owner_id`` is the person.  Moving
+        files *into* a guest collection needs ``rw`` there and moving them
+        *out* needs ``r``, resolved against the person's transitive group
+        membership as of now.  Allowed, the task is created exactly as
+        ``/_fauxbus/transfer/tasks`` would create it, except that it
+        defaults to SUCCEEDED.  Refused, nothing is created.
+
+        PROVISIONAL, and worth reading before leaning on it: the refusal
+        is Transfer's PermissionDenied (403) at submission.  The real
+        service may instead accept the submission and let the task fail
+        or stall on permission-denied faults; what Fauxbus promises is
+        the decision, not where Globus reports it.
+        """
+        doc = dict(_require_mapping(doc, "transfer document"))
+        owner = _require_uuid(str(doc.get("owner_id")), "owner_id")
+        raw_files = doc.get("files") or []
+        if not isinstance(raw_files, list) or not all(
+            isinstance(f, dict)
+            and isinstance(f.get("source_path"), str)
+            and isinstance(f.get("destination_path"), str)
+            for f in raw_files
+        ):
+            raise validation_error("'files' must be a list of {source_path, destination_path, size}")
+        for key, side, write in (
+            ("source_endpoint_id", "source_path", False),
+            ("destination_endpoint_id", "destination_path", True),
+        ):
+            cid = _require_uuid(str(doc.get(key)), key)
+            refusal = self._data_access_refusal(owner, cid, [f[side] for f in raw_files], write)
+            if refusal is not None:
+                raise transfer_permission_denied(refusal)
+        doc.setdefault("status", "SUCCEEDED")
+        return self.create_transfer_task(doc)
 
     # ----------------------------------------------------------- seed/state
 
@@ -3408,6 +4771,68 @@ class World:
             },
             "transfer_tasks": {
                 tid: self.task_record(t) for tid, t in sorted(self.transfer_tasks.items())
+            },
+            # Guest collections (0.6.0): endpoints with their gateways,
+            # mapped collections, credentials, and guest collections with
+            # their permissions inside them.
+            "gcs_endpoints": {
+                eid: {
+                    "display_name": e.display_name,
+                    "storage_gateways": {
+                        gid: {
+                            "display_name": g.display_name,
+                            "connector_id": g.connector_id,
+                            "identity_mappings": dict(sorted(g.identity_mappings.items())),
+                        }
+                        for gid, g in sorted(e.storage_gateways.items())
+                    },
+                }
+                for eid, e in sorted(self.gcs_endpoints.items())
+            },
+            "mapped_collections": {
+                cid: {
+                    "endpoint_id": m.endpoint_id,
+                    "storage_gateway_id": m.storage_gateway_id,
+                    "display_name": m.display_name,
+                    "identity_id": m.identity_id,
+                    "allow_guest_collections": m.allow_guest_collections,
+                    "public": m.public,
+                    "subscription_id": m.subscription_id,
+                    "roles": dict(sorted(m.roles.items())),
+                }
+                for cid, m in sorted(self.mapped_collections.items())
+            },
+            "user_credentials": {
+                cred_id: {
+                    "storage_gateway_id": c.storage_gateway_id,
+                    "identity_id": c.identity_id,
+                    "username": c.username,
+                    "connector_id": c.connector_id,
+                    "display_name": c.display_name,
+                }
+                for cred_id, c in sorted(self.user_credentials.items())
+            },
+            "guest_collections": {
+                cid: {
+                    "mapped_collection_id": g.mapped_collection_id,
+                    "display_name": g.display_name,
+                    "identity_id": g.identity_id,
+                    "collection_base_path": g.collection_base_path,
+                    "user_credential_id": g.user_credential_id,
+                    "public": g.public,
+                    "roles": dict(sorted(g.roles.items())),
+                    "permissions": {
+                        rid: {
+                            "principal_type": r.principal_type,
+                            "principal": r.principal,
+                            "path": r.path,
+                            "permissions": r.permissions,
+                            "create_time": r.create_time,
+                        }
+                        for rid, r in sorted(g.permissions.items())
+                    },
+                }
+                for cid, g in sorted(self.guest_collections.items())
             },
             "groups": {
                 gid: {
@@ -3924,3 +5349,10 @@ class World:
         # right to see.
         self.collections = {}
         self.transfer_tasks = {}
+        # And the guest-collection world with them, for the same reason:
+        # a permission that outlived a reset would let the next test's
+        # person through a door it never opened.
+        self.gcs_endpoints = {}
+        self.mapped_collections = {}
+        self.guest_collections = {}
+        self.user_credentials = {}

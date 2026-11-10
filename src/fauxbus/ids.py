@@ -46,6 +46,20 @@ def identity_id_for_token(token: str) -> str:
     return str(uuid.uuid5(FAUXBUS_NS, f"identity:{token}"))
 
 
+def derived_id(kind: str, *parts: str) -> str:
+    """An id that is a pure function of what it names, with no counter at all.
+
+    ``sequential_id`` numbers things in the order they were made, which
+    is right for anything a harness or a call creates.  Some ids belong
+    to a *relationship* instead: a GCS role grant is identity X holding
+    role R on collection C, and the world stores it as exactly that
+    triple, with nowhere to keep a number.  Hashing the triple gives it
+    an id that is the same on every run and after every reload, without
+    a counter that a dump would have to carry.
+    """
+    return str(uuid.uuid5(FAUXBUS_NS, ":".join((kind, *parts))))
+
+
 ACCESS_TOKEN_PREFIX = "fauxbus-at-"
 
 

@@ -182,6 +182,9 @@ class Client:
     def delete(self, path: str, **kw: Any) -> tuple[int, Any, dict[str, str]]:
         return self.request("DELETE", path, **kw)
 
+    def patch(self, path: str, body: Any = None, **kw: Any) -> tuple[int, Any, dict[str, str]]:
+        return self.request("PATCH", path, body, **kw)
+
     def form_post(
         self,
         path: str,
@@ -394,5 +397,146 @@ def make_task(fx: Client, **fields: Any) -> dict[str, Any]:
 def transfer(fx: Client) -> Client:
     """A world seeded with the landing collection and its watchers."""
     status, doc, _ = fx.post("/_fauxbus/seed", transfer_seed())
+    assert status == 200, doc
+    return fx
+
+
+# --- Guest collections and permissions (0.6.0) -----------------------------
+#
+# The consumer's shape: one GCS endpoint, one POSIX gateway that maps
+# only the platform's own client, and two mapped collections on it — an
+# upload one (writers get rw on each workspace's guest) and a read one
+# (readers get r).  Groups nest readers ⊃ writers ⊃ managers by subgroup,
+# and the platform client administers all three.  alice writes, bob only
+# reads, dave manages (a member of the innermost subgroup), and carol is
+# nobody's.
+DAVE = "00000000-0000-4000-8000-00000000000d"
+ENDPOINT = "00000000-0000-4000-8000-00000000e0d0"
+GATEWAY = "00000000-0000-4000-8000-000000006a7e"
+UPLOAD = "00000000-0000-4000-8000-00000000a9a1"
+READ = "00000000-0000-4000-8000-00000000a9a2"
+CLOSED = "00000000-0000-4000-8000-00000000a9a3"
+READERS = "00000000-0000-4000-8000-0000000004ea"
+WRITERS = "00000000-0000-4000-8000-0000000004e1"
+MANAGERS = "00000000-0000-4000-8000-0000000004a6"
+POSIX = "145812c8-decc-41f1-83cf-bb2a85a2a70b"
+GCS_SCOPE = f"urn:globus:auth:scope:{ENDPOINT}:manage_collections"
+# The consumer's actual scope: the endpoint's, with the upload
+# collection's data_access consent hung underneath it.
+GCS_DEPENDENT_SCOPE = f"{GCS_SCOPE}[https://auth.globus.org/scopes/{UPLOAD}/data_access]"
+PLATFORM_TOKEN = "t-platform"
+
+
+def guest_seed(**extra: Any) -> dict[str, Any]:
+    """A world with the endpoint, both mapped collections, and the group chain.
+
+    CLOSED is a third mapped collection with allow_guest_collections off.
+    """
+    member = {"role": "member", "status": "active"}
+    admin = {"role": "admin", "status": "active"}
+
+    def mapped(name: str, **more: Any) -> dict[str, Any]:
+        return {
+            "endpoint_id": ENDPOINT,
+            "storage_gateway_id": GATEWAY,
+            "display_name": name,
+            "subscription_id": SUBSCRIPTION,
+            "roles": {CLIENT_ID: "activity_monitor"},
+            **more,
+        }
+
+    doc: dict[str, Any] = {
+        "identities": {
+            **PINS,
+            "t-dave": {"identity_id": DAVE, "username": "dave@example.org"},
+            PLATFORM_TOKEN: {
+                "identity_id": CLIENT_ID,
+                "username": f"{CLIENT_ID}@clients.auth.globus.org",
+            },
+        },
+        "clients": CLIENTS,
+        "gcs_endpoints": {
+            ENDPOINT: {
+                "display_name": "Example DTN",
+                "storage_gateways": {
+                    GATEWAY: {"display_name": "POSIX", "identity_mappings": {CLIENT_ID: "rcsvc"}}
+                },
+            }
+        },
+        "mapped_collections": {
+            UPLOAD: mapped("Upload"),
+            READ: mapped("Read"),
+            CLOSED: mapped("Closed", allow_guest_collections=False),
+        },
+        "groups": {
+            READERS: {"name": "readers", "memberships": {CLIENT_ID: admin, BOB: member}},
+            WRITERS: {"name": "writers", "parent_id": READERS,
+                      "memberships": {CLIENT_ID: admin, ALICE: member}},
+            MANAGERS: {"name": "managers", "parent_id": WRITERS,
+                       "memberships": {CLIENT_ID: admin, DAVE: member}},
+        },
+    }
+    doc.update(extra)
+    return doc
+
+
+def gcs(endpoint: str = ENDPOINT) -> str:
+    """Where Fauxbus serves an endpoint's GCS Manager."""
+    return f"/gcs/{endpoint}/api"
+
+
+def make_guest(
+    fx: Client, mapped: str, base_path: str, *, token: str = PLATFORM_TOKEN,
+    group: str | None = None, permissions: str = "rw",
+) -> str:
+    """The consumer's call sequence over HTTP: credential, guest, one group permission."""
+    status, creds, _ = fx.get(f"{gcs()}/user_credentials?storage_gateway={GATEWAY}", token=token)
+    assert status == 200, creds
+    if creds["data"]:
+        cred_id = creds["data"][0]["id"]
+    else:
+        status, made, _ = fx.post(
+            f"{gcs()}/user_credentials",
+            {"DATA_TYPE": "user_credential#1.0.0", "identity_id": CLIENT_ID,
+             "connector_id": POSIX, "username": "rcsvc", "storage_gateway_id": GATEWAY},
+            token=token,
+        )
+        assert status == 201, made
+        cred_id = made["data"][0]["id"]
+    status, made, _ = fx.post(
+        f"{gcs()}/collections",
+        {"DATA_TYPE": "collection#1.0.0", "collection_type": "guest",
+         "display_name": f"ws {base_path}", "identity_id": CLIENT_ID,
+         "mapped_collection_id": mapped, "user_credential_id": cred_id,
+         "collection_base_path": base_path, "storage_gateway_id": GATEWAY},
+        token=token,
+    )
+    assert status == 201, made
+    guest = made["data"][0]["id"]
+    if group is not None:
+        status, rule, _ = fx.post(
+            f"/v0.10/endpoint/{guest}/access",
+            {"DATA_TYPE": "access", "principal_type": "group", "principal": group,
+             "path": "/", "permissions": permissions},
+            token=token,
+        )
+        assert status == 201, rule
+    return guest
+
+
+def attempt(fx: Client, who: str, source: str, destination: str,
+            paths: tuple[str, str] = ("/in/a.dat", "/a.dat")) -> tuple[int, Any]:
+    """A person's transfer through the permission gate; (status, body)."""
+    status, body, _ = fx.post(
+        "/_fauxbus/transfer/submit",
+        {"owner_id": who, "source_endpoint_id": source, "destination_endpoint_id": destination,
+         "files": [{"source_path": paths[0], "destination_path": paths[1], "size": 7}]},
+    )
+    return status, body
+
+
+@pytest.fixture
+def guests(fx: Client) -> Client:
+    status, doc, _ = fx.post("/_fauxbus/seed", guest_seed())
     assert status == 200, doc
     return fx

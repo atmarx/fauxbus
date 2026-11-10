@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import SDK_PIN, __version__
-from .errors import ApiError
+from .errors import ApiError, TransferError
 from .server import Ctx, FauxbusServer
 
 
@@ -26,7 +26,8 @@ def index(ctx: Ctx) -> tuple[int, Any]:
         "imitates": [
             "groups v2",
             "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",
-            "transfer v0.10 (endpoint_manager task monitoring)",
+            "transfer v0.10 (endpoint_manager task monitoring, guest-collection permissions)",
+            "gcs manager api (guest collections, user credentials) at /gcs/<endpoint id>/api/",
         ],
         "require_issued_tokens": ctx.server.require_issued_tokens,
         # The *effective* values — world's if the seed set them, else the
@@ -48,6 +49,7 @@ def index(ctx: Ctx) -> tuple[int, Any]:
             "POST /_fauxbus/tick (also finishes transfer tasks whose duration is up)",
             "POST /_fauxbus/transfer/tasks (create a task: owner, collections, files)",
             'POST /_fauxbus/transfer/tasks/<task_id> {"status": ...} (move a task along)',
+            "POST /_fauxbus/transfer/submit (a person's transfer, gated by permissions)",
             "GET  /_fauxbus/auth/login?request=... (account picker, for a browser)",
             'POST /_fauxbus/auth/session {"account": "<primary identity id>"} (headless sign-in)',
         ],
@@ -155,6 +157,21 @@ def move_transfer_task(ctx: Ctx) -> tuple[int, Any]:
     return 200, {"task_id": task.task_id, **ctx.world.task_record(task)}
 
 
+def submit_transfer(ctx: Ctx) -> tuple[int, Any]:
+    # A person moving files, with Globus's access check in front: the
+    # same document /_fauxbus/transfer/tasks takes, owner_id being the
+    # person, and the task only exists if the guest collections' permissions
+    # (or a mapped collection's gateway) let them.  Refused, the answer is
+    # Transfer's PermissionDenied, naming the collection, the path and the
+    # missing permission, and no task is made.
+    try:
+        task = ctx.world.submit_transfer_as(ctx.body if ctx.body is not None else {})
+    except TransferError as err:
+        err.resource = ctx.match.string
+        raise
+    return 200, {"task_id": task.task_id, **ctx.world.task_record(task)}
+
+
 def register(server: FauxbusServer) -> None:
     # auth=False across the board: the harness's own tools must keep
     # working even when a test has made the imitated surface hostile
@@ -173,3 +190,4 @@ def register(server: FauxbusServer) -> None:
     add("POST", "/_fauxbus/tick", tick, auth=False)
     add("POST", "/_fauxbus/transfer/tasks", create_transfer_task, auth=False)
     add("POST", "/_fauxbus/transfer/tasks/([^/]+)", move_transfer_task, auth=False)
+    add("POST", "/_fauxbus/transfer/submit", submit_transfer, auth=False)

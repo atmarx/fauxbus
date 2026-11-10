@@ -171,7 +171,8 @@ directly to the admin role, marked `PROVISIONAL` in `world.py` today.
 
 Building slice A added four more to that list, slice A.2 three more,
 multi-resource-server responses two, slice B five, Transfer task
-monitoring nine, and the login shim's first three steps one each — and it
+monitoring nine, the login shim's first three steps one each, and guest
+collections six (items 28–33) — and it
 is worth noticing that every one of them is a question the audit could
 not have asked before the code existed:
 
@@ -290,8 +291,10 @@ not have asked before the code existed:
 23. **The values of the task fields Fauxbus does not model.**  The key
     set is recorded and complete; `deadline`, the `subtasks_*` counts,
     `is_ok`, `nice_status`, `effective_bytes_per_second`, `username`,
-    the legacy `name#id` endpoint strings, and the host, mapped and
-    local-user fields are null or a resting value.  So is
+    the legacy `name#id` endpoint strings, and the local-user fields
+    are null or a resting value.  (The host and mapped fields were on
+    this list until 0.6.0 modelled them for guest collections; see
+    item 32.)  So is
     `successful_transfer.dynamic`, which the reference shows as
     `false` and does not explain.  Two markers, in `World.task_doc`
     and on `dynamic`.
@@ -353,6 +356,60 @@ not have asked before the code existed:
     client case is the one worth recording first: a service account in
     a group is common, and the real record's `identity_provider` for a
     client is unknown.
+
+28. **How a GCS Manager answers past its one recorded refusal.**  The
+    result envelope, the user-credential document and the 403
+    `permission_denied` are RECORDED; everything else a refusal says is
+    not.  `not_found` and `bad_request` as codes; 403 for a mapped
+    collection with `allow_guest_collections` off and for an identity
+    the gateway does not map; 400 for a credential that is not the
+    owner's, a missing base path, or a base path changed by PATCH; 201
+    for both creates (the credential fixture's *envelope* says 201, its
+    registered status does not); the delete's empty result; the two
+    high-assurance timeouts as null.  Markers in `errors.GCSError`,
+    `gcs_api` and `World.gcs_collection_doc`.
+29. **Who a GCS Manager lets do what.**  Fauxbus refuses a user
+    credential or a guest collection whose `identity_id` is not the
+    caller's own, and a credential whose `username` is not the one the
+    gateway maps the identity to; shows a collection to anyone when it
+    is public and otherwise to its owner and role holders; lists only
+    the caller's own credentials; reads `filter=mapped_collections,
+    guest_collections` as either type; pages 100 at a time, keyed by the
+    last id, with `""` on the last page.  Each refusal errs toward the
+    real service allowing more (item 24's direction).  Markers in the
+    `World.gcs_*` methods.
+30. **Whether Globus mints a dependent-scope token by client
+    credentials.**  `manage_collections[<mapped>/data_access]` is what a
+    service asks for, and Fauxbus files the token under the endpoint
+    with the whole string as its scope — only for a seeded endpoint,
+    and without modelling the dependency (no dependent token, no
+    consent check).  Everywhere else a dependent scope is still the 501.
+    `PROVISIONAL` in `World._gcs_dependent_scope`.
+31. **The edges of a permission.**  The codes, statuses, document keys,
+    the slash rule and the 1000 limit are DOCUMENTED.  Not: the
+    BadRequest for a malformed principal, permissions value or unknown
+    field; that Exists is checked before LimitExceeded; that role-derived
+    rules do not count toward the 1000; the list order (role-derived
+    first, then oldest first); one role-derived rule per role *grant*,
+    with a `role_id` hashed from the grant.  Markers in
+    `World.add_access_rule`, `_rule_order` and beside `ACCESS_RULE_LIMIT`.
+32. **A guest task seen from its host.**  DOCUMENTED that
+    `filter_endpoint` matches the host collection and that the host
+    fields are shown by role.  Not: that `filter_endpoint_use` narrows
+    the guest-on-host match to the guest's side; that activity_manager
+    and administrator count as "activity_monitor" for the host fields;
+    that `*_host_path` is the guest's `collection_base_path` as given
+    (Fauxbus models no `root_path`); that a guest inherits its host's
+    subscription.  Markers in `endpoint_manager_task_list`,
+    `World._host_fields` and `World._subscription_of`.
+33. **Where Globus says no to a person's transfer, and whom it
+    counts.**  Fauxbus's gate refuses at submission, with a 403
+    `PermissionDenied`; the real service may accept the task and let it
+    fail on permission faults.  And it counts a subgroup's active
+    members as members of every ancestor group — the consumer's report
+    of Globus's rule, not a recording — for the calling identity alone,
+    not its linked identities.  Markers in `World.submit_transfer_as`
+    and `World.group_closure`.
 
 And `identity_set`, already at the top of this list since v0.2.15, now
 has code to point at: its entry shape and its order are two
@@ -1064,6 +1121,167 @@ at random, so the same failure renders the same bytes every run.
 Fauxbus's own errors — the 501s, a missing token — keep Fauxbus's
 dialect, because those are the fake speaking about itself.
 
+## v0.6 — Guest collections and permissions
+
+A workspace gets a guest collection, and a Globus group gets a
+permission on it.  That is Root Cellar's model (asked 2026-10-15, with
+the read door added 2026-11-09): two mapped collections over one storage
+root, used directly only by the platform's own client — an upload one
+where the writers' group gets `rw`, a read one where the readers' group
+gets `r` — and one guest collection per workspace on each, rooted at
+`/<container id>/`.  The groups nest, readers ⊃ writers ⊃ managers, by
+subgroup.  What the consumer needs to test is not that the calls return
+200 but that **the permission is the gate**: who can move files in and
+out, and that taking someone out of a group shuts the door.
+
+**The surface**, from globus-sdk 4.8.1:
+
+- `GCSClient` — `get_collection`, `get_user_credential_list`,
+  `create_user_credential`, `get_collection_list` (paginated; with
+  `mapped_collection_id` and `filter=guest_collections`),
+  `create_collection` for a guest collection, `update_collection`
+  (PATCH, `display_name` only), `delete_collection`.
+- `TransferClient` — `endpoint_acl_list`, `add_endpoint_acl_rule`,
+  `delete_endpoint_acl_rule`.
+- The task-monitoring calls of the section above, now aware of guest
+  collections.
+
+Not built, and a loud 501: GCS `/info` (only consulted to find an
+endpoint's client id, which a consumer holding an authorizer never
+asks), creating or changing a mapped collection, every other GCS
+resource, the collection list's `include`, `storage_gateway_id` and
+other filters, `get_endpoint_acl_rule` and `update_endpoint_acl_rule`
+(registered as 501s, so they do not fall to the dispatcher's 405 and
+claim Globus has no such call), `all_authenticated_users` and
+`anonymous` principals, and `expiration_date`.
+
+**Where a GCS Manager lives.**  Each GCS endpoint runs its manager at
+its own host, so there is no one address to imitate.  Fauxbus serves
+every seeded endpoint's manager from its one socket, at
+`/gcs/<endpoint id>/api/` — a prefix of Fauxbus's choosing, like
+`/_fauxbus/`, but on the imitated side of the line: tokens are required
+and failure injection reaches it.  One consequence is the SDK's, not
+Fauxbus's, and a consumer will meet it on the first line:
+**`GCSClient.__init__` turns any address that does not start with
+`https://` into `https://<address>/api/`**, so a plain-HTTP fake cannot
+be handed to the constructor.  Build the client, then set
+`client.base_url`; every request is built from that attribute.  That
+one assignment is the only change a consumer makes, and the conformance
+suite makes it too.
+
+**Tokens.**  A GCS token's resource server is the endpoint id
+(`GCSClient.resource_server` is the endpoint's client id, which "will
+be equal to the endpoint_id in most cases"; Fauxbus models the one id).
+Under `--require-issued-tokens` the GCS routes take only a live token
+minted for that endpoint, so a Transfer token, or another endpoint's, is
+the same 403 a Groups token gets at Transfer.  The consumer asks for
+`urn:globus:auth:scope:<endpoint>:manage_collections[https://auth.globus.org/scopes/<mapped>/data_access]`,
+a dependent scope, which the token endpoint used to 501 everywhere.  It
+now mints that one form — a seeded endpoint's scope with one dependency
+— filed under the endpoint, carrying the whole string; anywhere else a
+dependent scope is still the 501.  **The dependency is not modelled**:
+no dependent token is ever minted, no route checks that `data_access`
+was consented, and the high-assurance variant (plain `manage_collections`)
+is simply the undecorated scope.  Per-operation scope is not checked,
+for the reason "Auth posture" gives.  Modelling consent would be a new
+subsystem nobody has asked for; recording item 30 says what is guessed.
+
+**Who may.**  Three different authorities, and keeping them apart is
+most of the design:
+
+- A **user credential** and a **guest collection** are authorized by the
+  storage gateway's identity mapping, not by any role.  The seed says
+  which identities a gateway maps, each to a local username — the real
+  gateway evaluates expressions; a fake can only say who is in.  The
+  SDK's docstring: "in order to create a guest collection, the caller
+  must have an identity that matches the Storage Gateway policies."
+  A mapped collection with `allow_guest_collections` off hosts none.
+  The creator becomes the guest's owner, with `administrator`.
+- **Permissions** are managed by `access_manager` or `administrator`
+  on the guest collection (DOCUMENTED, docs.globus.org/api/transfer/
+  permissions, read 2026-11-09), and a role on the mapped collection
+  counts on every guest it hosts (DOCUMENTED, advanced_collection_
+  management).  The access list carries the **role-derived rules** — rw
+  on `/`, `id` and `create_time` null, `role_id` and `role_type` set —
+  which no permission call can fetch, change or delete.  Group ids are
+  **not** looked up: Globus accepts a group it cannot resolve, and the
+  permission grants nobody anything until the group exists.
+- **Task visibility** stays with the activity roles of the section
+  above, now inherited from a mapped collection by its guests.
+
+**Monitoring a guest from its host.**  `filter_endpoint=<mapped id>`
+finds every task into or out of a guest collection it hosts (the
+reference: "source or destination host endpoint or collection").  A
+task into a guest names the guest as `destination_endpoint_id` and the
+mapped collection as `destination_host_endpoint_id` and
+`destination_mapped_collection_id`, with `destination_host_path` the
+guest's base path; the same fields on the source side.  Who sees them
+follows the reference: the host fields when the mapped collection is
+public or the caller is its administrator or activity monitor; the host
+path only to the guest's administrator or the mapped collection's
+monitor.  `successful_transfers` paths are relative to the guest's
+root, as submitted.  A task whose sides are not guests keeps the 0.4.0
+document exactly: its host and mapped fields are null, as they always
+were.  Recording item 32 lists the readings.
+
+**The gate.**  `POST /_fauxbus/transfer/submit` takes the document
+`/_fauxbus/transfer/tasks` takes, `owner_id` being the person, and runs
+Globus's access check before making the task.  Into a guest collection
+needs `rw` at each destination path, out of one needs `r` (or `rw`); a
+rule covers its path and everything under it.  The person counts as
+every group they are an active member of **and every ancestor of
+those**, because Globus counts a subgroup's members as members of the
+parent — a manager in a subgroup of the ruled group passes.  It reads
+the same Groups world the Groups API writes, so a `remove` through
+`/v2/groups/<id>` refuses the next attempt.  A mapped collection lets
+through only identities its gateway maps; any other collection (a
+laptop) checks nothing.  Allowed, the task is created SUCCEEDED by
+default; refused, nothing is created and the answer is Transfer's
+`PermissionDenied`, naming the collection, the path and what was
+missing.  Refusing at submission is the PROVISIONAL part (item 33):
+the real service may accept the task and fail it on faults.  The
+decision is the thing Fauxbus promises, not where Globus reports it.
+
+**The seed.**  Four sections, in dependency order, each record's
+unknown field refused by name:
+
+```json
+{
+  "gcs_endpoints": {"<endpoint id>": {"display_name": "DTN", "storage_gateways": {
+    "<gateway id>": {"display_name": "POSIX", "connector_id": "145812c8-decc-41f1-83cf-bb2a85a2a70b",
+                     "identity_mappings": {"<client id>": "svc"}}}}},
+  "mapped_collections": {"<mapped id>": {"endpoint_id": "<endpoint id>",
+    "storage_gateway_id": "<gateway id>", "display_name": "Upload", "identity_id": null,
+    "allow_guest_collections": true, "public": true, "subscription_id": "<id>",
+    "roles": {"<client id>": "activity_monitor"}}},
+  "user_credentials": {"<credential id>": {"storage_gateway_id": "<gateway id>",
+    "identity_id": "<client id>", "username": "svc", "connector_id": "...", "display_name": null}},
+  "guest_collections": {"<guest id>": {"mapped_collection_id": "<mapped id>",
+    "display_name": "ws 1", "identity_id": "<client id>", "collection_base_path": "/c-1/",
+    "user_credential_id": null, "public": true, "roles": {"<client id>": "administrator"},
+    "permissions": {"<rule id>": {"principal_type": "group", "principal": "<group id>",
+                                  "path": "/", "permissions": "rw", "create_time": 0}}}}
+}
+```
+
+A seeded guest may leave `user_credential_id` null, so a harness can
+plant a hand-made permission and watch a consumer revoke it without
+inventing the owner's local account.  Collection ids are unique across
+`collections`, `mapped_collections` and `guest_collections`.  Mapped and
+guest collections take all four of `administrator`, `access_manager`,
+`activity_manager` and `activity_monitor`; a plain `collections` entry
+still refuses `access_manager`, which means nothing without a guest.
+One role per identity per collection, as in the section above.
+
+**Errors.**  The permission calls speak
+Transfer's dialect, with their own DOCUMENTED codes (`Exists`,
+`LimitExceeded`, `InvalidPath`, `AccessRuleNotFound`, `NotSupported`).
+A GCS Manager speaks a fifth, RECORDED from the SDK's 403: the result
+envelope, `code` in snake_case, the sentence in `message`, `detail`
+null.  An endpoint Fauxbus was never told about answers in Fauxbus's
+own dialect, since against Globus it would be a DNS name that does not
+resolve and there is nothing to imitate.
+
 ## The control plane (`/_fauxbus/`)
 
 - `POST /_fauxbus/reset` — the between-tests handshake.  If a canonical
@@ -1089,7 +1307,7 @@ dialect, because those are the fake speaking about itself.
   for the next N matching requests (or until cleared).  `GET
   /_fauxbus/failures` lists what's armed; `DELETE /_fauxbus/failures`
   disarms (all, or one by `?id=`).  Injection applies only to the
-  imitated surface (`/v2/…`, `/v0.10/…`, and the OIDC discovery and
+  imitated surface (`/v2/…`, `/v0.10/…`, `/gcs/…`, and the OIDC discovery and
   JWKS paths) — you cannot brick the control plane with it.
   One-shot inline variant: send `X-Fauxbus-Fail: 429` on any request to get
   that failure exactly once, for quick cases.
@@ -1122,6 +1340,11 @@ dialect, because those are the fake speaking about itself.
   finished task is final (409).  Collections and their role grants
   arrive only by seed (`collections`), since the slice reads tasks and
   administers nothing.
+- `POST /_fauxbus/transfer/submit` — the same document, run through
+  Globus's access check first (v0.6): `owner_id` is the person, a guest
+  collection asks its permissions, a mapped collection its gateway.
+  Allowed, a task (SUCCEEDED unless `status` says otherwise); refused, a
+  403 `PermissionDenied` and no task.
 
 **The round-trip invariant:** the document `GET /_fauxbus/state` returns
 is a valid `POST /_fauxbus/seed` body, and seeding a fresh world with a
@@ -1322,10 +1545,10 @@ read, for months, as if both legs were running.
 
   ACLs and guest-collection permissions (group-membership-driven data
   access) were the previously-penciled first slice on the reasoning that
-  they are Groups-shaped CRUD.  They keep their place in the roadmap and
-  lose their place in the queue: nobody has filed for them, and
-  principle 2 orders by consumer need, not by implementation
-  convenience.
+  they are Groups-shaped CRUD.  They kept their place in the roadmap and
+  lost their place in the queue until a consumer filed for them: Root
+  Cellar did, on 2026-10-15 and 2026-11-09, and they are built in 0.6.0
+  (the "Guest collections and permissions" section above).
 - **Auth** — two slices, both with named consumers as of 2026-08-24.
   This bullet used to read "identities lookup, token introspection,
   dependent tokens."  Those keep their place in the roadmap and lose
@@ -1481,6 +1704,49 @@ project imitates the API's behavior for local testing only, and the name is
 a confession, not an infringement: it's *faux*.
 
 ## Changelog
+
+- **0.6.0.dev0** (unreleased, 2026-11-09) — **Guest collections and
+  permissions: the permission is the gate.**  Root Cellar's ask of
+  2026-10-15, with the read door of 2026-11-09.  New imitated surface:
+  a GCS Manager per seeded endpoint at `/gcs/<endpoint id>/api/`
+  (`get_collection`, `get_collection_list`, `create_collection` for
+  guests, `update_collection` — Fauxbus's first PATCH —
+  `delete_collection`, `get_user_credential_list`,
+  `create_user_credential`) and Transfer's `endpoint_acl_list`,
+  `add_endpoint_acl_rule` and `delete_endpoint_acl_rule`.  Task
+  monitoring now sees a guest collection through its host:
+  `filter_endpoint=<mapped id>` finds tasks into and out of its guests,
+  and a guest side's host, mapped and host-path fields are filled in for
+  whoever the reference says may see them.  New control route,
+  `POST /_fauxbus/transfer/submit`: a person's transfer, allowed or
+  refused by the guest's permissions resolved through the person's
+  groups *and their parent groups*, read from the same Groups world the
+  Groups API writes.  Four new seed sections (`gcs_endpoints`,
+  `mapped_collections`, `user_credentials`, `guest_collections`, the
+  last carrying its permissions), each record's unknown field refused
+  by name.  The whole section is "Guest collections and permissions"
+  above.
+
+  **Behaviours an 0.5.0 consumer could have relied on changed.**
+  - A dependent scope at the token endpoint was always a 501; one form
+    now mints — a seeded GCS endpoint's scope with one dependency — and
+    every other is still the 501.
+  - `GET /_fauxbus/` lists two more `imitates` entries and one more
+    control route; the state dump carries four more (empty) sections, so
+    `examples/seed.json` was regenerated.
+  - Non-guest tasks are unchanged, key for key and value for value.
+
+  **Found on the way, for consumers:** globus-sdk 4.8.1's `GCSClient`
+  cannot be pointed at a plain-HTTP address through its constructor
+  (it prepends `https://`), so a consumer sets `base_url` after
+  building it.  And `GuestCollectionDocument` has no `storage_gateway_id`
+  parameter; a consumer that sends one does it through
+  `additional_fields`, which Fauxbus accepts and checks against the
+  mapped collection's gateway.
+
+  417 tests (55 new), 53 of them through the real globus-sdk 4.8.1.
+  `PROVISIONAL` 59 → 85 lines carrying the word, on recording list
+  items 28–33.
 
 - **Package release: fauxbus 0.5.0** (2026-11-07, tag `v0.5.0`) —
   **the Globus login shim reaches consumers.**  An unmodified

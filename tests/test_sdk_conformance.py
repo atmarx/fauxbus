@@ -33,9 +33,15 @@ else:
 from conftest import (  # noqa: E402
     ALICE,
     ALICE_GLOBUSID,
+    BOB,
     BOB_GLOBUSID,
+    CAROL,
     CLIENT_ID,
     CLIENT_SECRET,
+    CLOSED,
+    DAVE,
+    ENDPOINT,
+    GATEWAY,
     GROUPS_SCOPE,
     LANDING,
     LAPSED,
@@ -44,8 +50,15 @@ from conftest import (  # noqa: E402
     LOGIN_REDIRECT,
     LOGIN_SECRET,
     NATIVE_CLIENT,
+    POSIX,
+    READ,
+    READERS,
     TRANSFER_SCOPE,
+    UPLOAD,
+    WRITERS,
+    attempt,
     files,
+    guest_seed,
     make_task,
     oidc_seed,
     transfer_seed,
@@ -58,17 +71,21 @@ from globus_sdk import (  # noqa: E402
     ClientApp,
     ClientCredentialsAuthorizer,
     ConfidentialAppAuthClient,
+    GCSAPIError,
+    GCSClient,
     GlobusAppConfig,
     GroupPolicies,
     GroupsAPIError,
     GroupsClient,
     GroupsManager,
+    GuestCollectionDocument,
     IdentityMap,
     NativeAppAuthClient,
     RefreshTokenAuthorizer,
     TransferAPIError,
     TransferClient,
     UserApp,
+    UserCredentialDocument,
 )
 from globus_sdk.login_flows import CommandLineLoginFlowManager  # noqa: E402
 
@@ -1268,3 +1285,229 @@ def test_lookup_refusals_parse_as_auth_errors(signed_in):
     with pytest.raises(AuthAPIError) as exc:
         auth.get_identities(ids=[LOGIN_CLIENT])
     assert exc.value.http_status == 501
+
+
+
+# ------------------------------- guest collections and permissions (0.6.0)
+#
+# Root Cellar's ask of 2026-10-15 and 2026-11-09, called the way its
+# workspace provisioner calls it: a confidential client takes a GCS
+# token for the endpoint (with the mapped collection's data_access
+# underneath) and a Transfer token, then GCSClient finds the mapped
+# collection, finds or makes its user credential, lists the guest
+# collections already there, and makes one per workspace; TransferClient
+# rules a group onto it.  The only line a real consumer has to add is
+# the base_url assignment in ``manager`` — see gcs_api's docstring for
+# why GCSClient's constructor cannot take a plain-HTTP address.
+
+
+def manager(base_url: str, mapped: str = UPLOAD) -> GCSClient:
+    """The provisioner's GCSClient, its scope built by the SDK's own helpers."""
+    scope = GCSClient.get_gcs_endpoint_scopes(ENDPOINT).manage_collections.with_dependency(
+        GCSClient.get_gcs_collection_scopes(mapped).data_access
+    )
+    auth = ConfidentialAppAuthClient(CLIENT_ID, CLIENT_SECRET, base_url=base_url)
+    client = GCSClient(
+        "fauxbus.invalid", authorizer=ClientCredentialsAuthorizer(auth, scope)
+    )
+    client.base_url = f"{base_url}/gcs/{ENDPOINT}/api/"
+    return client
+
+
+def as_person(base_url: str, token: str) -> GCSClient:
+    client = GCSClient("fauxbus.invalid", authorizer=AccessTokenAuthorizer(token))
+    client.base_url = f"{base_url}/gcs/{ENDPOINT}/api/"
+    return client
+
+
+def provision(gcs: GCSClient, tc: TransferClient, mapped: str, container: str,
+              group: str, permissions: str) -> str:
+    """One workspace's guest collection, the provisioner's sequence verbatim but for names."""
+    mapped_doc = gcs.get_collection(mapped).data
+    assert mapped_doc["allow_guest_collections"] and mapped_doc["collection_type"] == "mapped"
+    gateway = mapped_doc["storage_gateway_id"]
+    creds = list(gcs.get_user_credential_list(storage_gateway=gateway))
+    if creds:
+        cred_id = creds[0]["id"]
+    else:
+        cred_id = gcs.create_user_credential(
+            UserCredentialDocument(
+                identity_id=CLIENT_ID, connector_id=POSIX, username="rcsvc",
+                storage_gateway_id=gateway,
+            )
+        ).data["id"]
+    existing = {
+        c["collection_base_path"]: c["id"]
+        for c in gcs.paginated.get_collection_list(
+            mapped_collection_id=mapped, filter="guest_collections"
+        ).items()
+    }
+    if f"/{container}/" in existing:
+        return existing[f"/{container}/"]
+    guest = gcs.create_collection(
+        GuestCollectionDocument(
+            display_name=f"workspace {container}",
+            identity_id=CLIENT_ID,
+            mapped_collection_id=mapped,
+            user_credential_id=cred_id,
+            collection_base_path=f"/{container}/",
+            additional_fields={"storage_gateway_id": gateway},
+        )
+    ).data
+    tc.add_endpoint_acl_rule(
+        guest["id"],
+        {"DATA_TYPE": "access", "principal_type": "group", "principal": group,
+         "path": "/", "permissions": permissions},
+    )
+    return guest["id"]
+
+
+@pytest.fixture
+def guested(fx):
+    status, doc, _ = fx.post("/_fauxbus/seed", guest_seed(clock=int(NOON.timestamp())))
+    assert status == 200, doc
+    return fx
+
+
+def test_the_provisioners_whole_sequence_runs_unmodified(guested):
+    gcs, tc = manager(guested.base_url), watcher(guested.base_url)
+    upload = provision(gcs, tc, UPLOAD, "c-0001", WRITERS, "rw")
+    read = provision(gcs, tc, READ, "c-0001", READERS, "r")
+    # Idempotent the consumer's way: the second run finds the guest by
+    # its base path and makes nothing.
+    assert provision(gcs, tc, UPLOAD, "c-0001", WRITERS, "rw") == upload
+    assert len(list(gcs.get_user_credential_list(storage_gateway=GATEWAY))) == 1
+
+    guest = gcs.get_collection(upload).data
+    assert (guest["collection_type"], guest["mapped_collection_id"], guest["identity_id"]) == (
+        "guest", UPLOAD, CLIENT_ID,
+    )
+    rules = list(tc.endpoint_acl_list(read))
+    assert [(r["principal_type"], r["principal"], r["permissions"]) for r in rules] == [
+        ("identity", CLIENT_ID, "rw"), ("group", READERS, "r"),
+    ]
+
+    gcs.update_collection(upload, GuestCollectionDocument(display_name="Renamed"))
+    assert gcs.get_collection(upload).data["display_name"] == "Renamed"
+    gcs.delete_collection(read)
+    with pytest.raises(GCSAPIError) as exc:
+        gcs.get_collection(read)
+    assert (exc.value.http_status, exc.value.code) == (404, "not_found")
+
+
+def test_the_gate_and_the_poll_through_the_sdk(guested):
+    gcs, tc = manager(guested.base_url), watcher(guested.base_url)
+    upload = provision(gcs, tc, UPLOAD, "c-0001", WRITERS, "rw")
+    read = provision(gcs, tc, READ, "c-0001", READERS, "r")
+
+    status, inbound = attempt(guested, ALICE, LAPTOP, upload, ("/home/alice/a.dat", "/run1/a.dat"))
+    assert status == 200, inbound
+    assert attempt(guested, DAVE, LAPTOP, upload)[0] == 200  # a manager, via the subgroup
+    status, outbound = attempt(guested, BOB, read, LAPTOP, ("/run1/r.csv", "/home/bob/r.csv"))
+    assert status == 200, outbound
+    assert attempt(guested, BOB, LAPTOP, read)[0] == 403  # a reader does not write
+    assert attempt(guested, CAROL, LAPTOP, upload)[0] == 403
+    assert attempt(guested, CAROL, read, LAPTOP)[0] == 403
+
+    arrived = [
+        dict(t)
+        for t in tc.paginated.endpoint_manager_task_list(
+            filter_endpoint=UPLOAD, filter_endpoint_use="destination", filter_status="SUCCEEDED"
+        ).items()
+    ]
+    assert len(arrived) == 2
+    task = next(t for t in arrived if t["task_id"] == inbound["task_id"])
+    assert task["destination_endpoint_id"] == upload
+    assert task["destination_host_endpoint_id"] == UPLOAD
+    assert task["destination_mapped_collection_id"] == UPLOAD
+    assert task["destination_host_path"] == "/c-0001/"
+    (row,) = tc.paginated.endpoint_manager_task_successful_transfers(task["task_id"]).items()
+    assert row["destination_path"] == "/run1/a.dat"
+
+    left = [
+        t["task_id"]
+        for t in tc.paginated.endpoint_manager_task_list(
+            filter_endpoint=READ, filter_endpoint_use="source", filter_status="SUCCEEDED"
+        ).items()
+    ]
+    assert left == [outbound["task_id"]]
+    assert list(
+        tc.paginated.endpoint_manager_task_list(
+            filter_endpoint=READ, filter_endpoint_use="destination", filter_status="SUCCEEDED"
+        ).items()
+    ) == []
+
+    # Out of the group, out of the collection.
+    groups = GroupsClient(authorizer=AccessTokenAuthorizer("t-platform"), base_url=guested.base_url)
+    groups.batch_membership_action(WRITERS, BatchMembershipActions().remove_members([ALICE]))
+    assert attempt(guested, ALICE, LAPTOP, upload)[0] == 403
+
+
+def test_gcs_refusals_parse_as_gcs_errors(guested):
+    gcs = manager(guested.base_url, CLOSED)
+    with pytest.raises(GCSAPIError) as exc:
+        gcs.create_collection(
+            GuestCollectionDocument(
+                display_name="nope", mapped_collection_id=CLOSED,
+                user_credential_id="00000000-0000-4000-8000-000000000000",
+                collection_base_path="/x/",
+            )
+        )
+    assert (exc.value.http_status, exc.value.code) == (403, "permission_denied")
+    assert "allow_guest_collections" in exc.value.message
+
+    with pytest.raises(GCSAPIError) as exc:
+        as_person(guested.base_url, "t-bob").create_collection(
+            GuestCollectionDocument(
+                display_name="mine", mapped_collection_id=UPLOAD,
+                user_credential_id="00000000-0000-4000-8000-000000000000",
+                collection_base_path="/bob/",
+            )
+        )
+    assert (exc.value.http_status, exc.value.code) == (403, "permission_denied")
+    assert "not mapped" in exc.value.message
+
+    tc = watcher(guested.base_url)
+    upload = provision(manager(guested.base_url), tc, UPLOAD, "c-0001", WRITERS, "rw")
+    with pytest.raises(GCSAPIError) as exc:
+        manager(guested.base_url).update_collection(
+            upload, GuestCollectionDocument(collection_base_path="/c-0002/")
+        )
+    assert (exc.value.http_status, exc.value.code) == (400, "bad_request")
+
+
+def test_permission_refusals_parse_as_transfer_errors(guested):
+    gcs, tc = manager(guested.base_url), watcher(guested.base_url)
+    upload = provision(gcs, tc, UPLOAD, "c-0001", WRITERS, "rw")
+    rule = {"DATA_TYPE": "access", "principal_type": "group", "principal": WRITERS,
+            "path": "/", "permissions": "rw"}
+    with pytest.raises(TransferAPIError) as exc:
+        tc.add_endpoint_acl_rule(upload, rule)
+    assert (exc.value.http_status, exc.value.code) == (409, "Exists")
+
+    role_rule = next(r for r in tc.endpoint_acl_list(upload) if r["role_id"])
+    assert role_rule["id"] is None and role_rule["role_type"] == "administrator"
+    with pytest.raises(TransferAPIError) as exc:
+        tc.delete_endpoint_acl_rule(upload, role_rule["role_id"])
+    assert (exc.value.http_status, exc.value.code) == (404, "AccessRuleNotFound")
+
+    # Plant 998 more through the control plane (a thousand SDK round
+    # trips would be most of this suite's wall time), then let the SDK
+    # make the thousandth and be refused the thousand-and-first.
+    _, state, _ = guested.get("/_fauxbus/state")
+    state["guest_collections"][upload]["permissions"].update({
+        f"00000000-0000-4000-8000-{0xa0000 + i:012x}": {
+            "principal_type": "identity", "principal": f"00000000-0000-4000-8000-{0xb0000 + i:012x}",
+            "path": "/", "permissions": "r", "create_time": 0,
+        }
+        for i in range(998)
+    })
+    assert guested.post("/_fauxbus/seed", state)[0] == 200
+    tc.add_endpoint_acl_rule(upload, {**rule, "principal": READERS})
+    with pytest.raises(TransferAPIError) as exc:
+        tc.add_endpoint_acl_rule(upload, {**rule, "principal": BOB, "principal_type": "identity"})
+    assert (exc.value.http_status, exc.value.code) == (409, "LimitExceeded")
+
+    explicit = [r for r in tc.endpoint_acl_list(upload) if r["id"]]
+    assert len(explicit) == 1000
+    tc.delete_endpoint_acl_rule(upload, explicit[0]["id"])
