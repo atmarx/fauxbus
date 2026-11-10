@@ -1705,9 +1705,11 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
-- **0.6.0.dev0** (unreleased, 2026-11-09) — **Guest collections and
-  permissions: the permission is the gate.**  Root Cellar's ask of
-  2026-10-15, with the read door of 2026-11-09.  New imitated surface:
+- **Package release: fauxbus 0.6.0** (2026-11-10, tag `v0.6.0`) —
+  **Guest collections and permissions: the permission is the gate.**
+  Root Cellar's ask of 2026-10-15, with the read door of 2026-11-09,
+  built on 2026-11-09.  A minor: new imitated surface and a new control
+  route.  New imitated surface:
   a GCS Manager per seeded endpoint at `/gcs/<endpoint id>/api/`
   (`get_collection`, `get_collection_list`, `create_collection` for
   guests, `update_collection` — Fauxbus's first PATCH —
@@ -1744,9 +1746,24 @@ a confession, not an infringement: it's *faux*.
   `additional_fields`, which Fauxbus accepts and checks against the
   mapped collection's gateway.
 
-  417 tests (55 new), 53 of them through the real globus-sdk 4.8.1.
-  `PROVISIONAL` 59 → 85 lines carrying the word, on recording list
-  items 28–33.
+  **Also in the release:** `fauxbus version` now prints the same list
+  of imitated services `GET /_fauxbus/` serves, one per line, from one
+  tuple.  Through 0.5.0 it was a hand-written sentence that still
+  described 0.4.0.  Its first line keeps its opening,
+  `fauxbus <version> (imitating globus-sdk <pin>)`.
+
+  **Before the tag:** pipeline #89 was green on the feature commit
+  across 3.11, 3.12 and 3.13, image scan included, with no new acks.
+
+  **Re-pin handshake:** Root Cellar moves both pins to `0.6.0` in one
+  commit, with its seed's four new sections.  Its pins were still at
+  `0.4.0`, so the same commit takes 0.5.0's four behaviour changes
+  (below) as well as the three above.  Its own seat carries that.
+
+  **PROVISIONAL inventory: 85 markers**, up from 0.5.0's 59, on
+  recording list items 28–33.  The real-Globus leg of the conformance
+  tether is still unrun: no tenancy exists.  418 tests (56 new), 53 of
+  them through the real globus-sdk 4.8.1.
 
 - **Package release: fauxbus 0.5.0** (2026-11-07, tag `v0.5.0`) —
   **the Globus login shim reaches consumers.**  An unmodified

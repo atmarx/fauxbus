@@ -48,7 +48,7 @@ fails the way the real service partially fails.
   username into a UUID and back.
 - **Transfer task monitoring** — the `endpoint_manager_*` calls a
   service uses to watch other people's transfers into a collection.
-- **Guest collections and permissions** (0.6.0, unreleased) — a GCS
+- **Guest collections and permissions** — a GCS
   Manager per seeded endpoint, enough of `GCSClient` to make a guest
   collection on a mapped one, and Transfer's ACL calls to rule a group
   onto it.  A control-plane route then lets a test try a person's
