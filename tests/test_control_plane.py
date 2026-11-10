@@ -27,6 +27,28 @@ def test_index_names_itself(fx):
     assert doc["require_issued_tokens"] is False
 
 
+def test_the_command_line_and_the_wire_describe_the_same_build(fx, capsys):
+    """`fauxbus version` lists exactly what `GET /_fauxbus/` lists.
+
+    These were two hand-written descriptions of one fact, and only the
+    wire's was pinned by a test (the one above).  So the command line's
+    quietly went stale: through 0.5.0 it still described 0.4.0, missing
+    native apps, refresh tokens and identities lookup.  Comparing the
+    two outputs — not either one to a literal — is what catches the
+    next drift, whichever side it starts on.
+    """
+    from fauxbus import SDK_PIN, __version__
+    from fauxbus.cli import main
+
+    _, doc, _ = fx.get("/_fauxbus/")
+    assert main(["version"]) == 0
+    first, *surfaces = capsys.readouterr().out.splitlines()
+    # The first line keeps its old opening, because the release
+    # checklist's clean-install check reads the version off it.
+    assert first == f"fauxbus {__version__} (imitating globus-sdk {SDK_PIN})"
+    assert [line.strip() for line in surfaces] == doc["imitates"]
+
+
 def test_index_reports_the_version_it_was_actually_built_as(fx):
     """The wire answer must match the package pip resolved.
 

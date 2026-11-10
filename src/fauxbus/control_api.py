@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import SDK_PIN, __version__
+from . import IMITATES, SDK_PIN, __version__
 from .errors import ApiError, TransferError
 from .server import Ctx, FauxbusServer
 
@@ -23,12 +23,8 @@ def index(ctx: Ctx) -> tuple[int, Any]:
     return 200, {
         "fauxbus": __version__,
         "sdk_pin": SDK_PIN,
-        "imitates": [
-            "groups v2",
-            "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",
-            "transfer v0.10 (endpoint_manager task monitoring, guest-collection permissions)",
-            "gcs manager api (guest collections, user credentials) at /gcs/<endpoint id>/api/",
-        ],
+        # One list, shared with `fauxbus version` — see IMITATES.
+        "imitates": list(IMITATES),
         "require_issued_tokens": ctx.server.require_issued_tokens,
         # The *effective* values — world's if the seed set them, else the
         # boot flags'.  The state dump shows only the world's half, so

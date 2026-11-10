@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import SDK_PIN, __version__
+from . import IMITATES, SDK_PIN, __version__
 from .auth import check_issuer
 from .server import boot_line, make_server
 from .world import SIGNED_TOKEN_CLOCKS, World
@@ -70,11 +70,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "version":
-        print(
-            f"fauxbus {__version__} (imitating the globus-sdk {SDK_PIN} GroupsClient, "
-            f"the Auth token, introspection, and OIDC authorization-code surface, "
-            f"and Transfer endpoint_manager task monitoring)"
-        )
+        # First line: the version and the SDK pin, in the shape scripts
+        # and the release checklist already grep for.  Then one line per
+        # imitated service, from the same tuple `GET /_fauxbus/` serves,
+        # so the command line can never describe an older release than
+        # the wire does.
+        print(f"fauxbus {__version__} (imitating globus-sdk {SDK_PIN})")
+        for surface in IMITATES:
+            print(f"  {surface}")
         return 0
 
     if args.issuer is not None:

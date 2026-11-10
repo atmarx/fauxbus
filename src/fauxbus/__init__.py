@@ -18,6 +18,22 @@ __version__ = "0.6.0.dev0"
 # shipped inside this SDK release (globus_sdk/testing/data/groups/).
 SDK_PIN = "4.8.1"
 
+# What Fauxbus imitates, said once.  Two places tell a person what this
+# build covers: `GET /_fauxbus/` on the wire and `fauxbus version` on
+# the command line.  They used to be two hand-written sentences, and
+# the command line's stopped being edited after 0.4.0 — so 0.5.0
+# shipped native apps, refresh tokens and identities lookup while
+# `fauxbus version` still described a release without them.  Same shape
+# as the version-number bug above: two copies of one claim, and no test
+# comparing them.  Both now read this tuple, so adding a surface here is
+# the whole edit.
+IMITATES = (
+    "groups v2",
+    "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",
+    "transfer v0.10 (endpoint_manager task monitoring, guest-collection permissions)",
+    "gcs manager api (guest collections, user credentials) at /gcs/<endpoint id>/api/",
+)
+
 # This URL ships inside every 501 body ("File an issue: ..."), which
 # makes it principle 2's escape hatch: a loud 501 is only useful if the
 # person reading it can act on it.  It pointed at the private Gitea
