@@ -752,7 +752,7 @@ def make_server(
 
 
 def boot_line(server: FauxbusServer) -> str:
-    from . import SDK_PIN
+    from . import IMITATES, SDK_PIN
 
     host, port = server.server_address[:2]
     strict = " [--require-issued-tokens]" if server.require_issued_tokens else ""
@@ -765,10 +765,14 @@ def boot_line(server: FauxbusServer) -> str:
         if issuer
         else "OIDC off until an issuer is set (--issuer or the seed's oidc.issuer)"
     )
+    # The list of services comes from IMITATES, the same tuple the
+    # control plane and `fauxbus version` read.  This banner was a third
+    # hand-written copy, and 0.6.0 shipped it without `refresh_token`,
+    # one release after the grant landed — found the day 0.6.0 went out,
+    # by the same commit that had just claimed there were only two.
+    # Semicolons between services, because the entries carry commas.
     return (
         f"fauxbus {__version__} listening on http://{host}:{port} — "
-        f"imitating: groups v2, auth v2 client_credentials + authorization_code, "
-        f"transfer v0.10 endpoint_manager task monitoring + guest-collection permissions, "
-        f"GCS Manager guest collections at /gcs/<endpoint id>/api/ "
+        f"imitating: {'; '.join(IMITATES)} "
         f"(globus-sdk {SDK_PIN} surface){strict}; {oidc}; control plane at /_fauxbus/"
     )

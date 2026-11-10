@@ -18,15 +18,18 @@ __version__ = "0.7.0.dev0"
 # shipped inside this SDK release (globus_sdk/testing/data/groups/).
 SDK_PIN = "4.8.1"
 
-# What Fauxbus imitates, said once.  Two places tell a person what this
-# build covers: `GET /_fauxbus/` on the wire and `fauxbus version` on
-# the command line.  They used to be two hand-written sentences, and
-# the command line's stopped being edited after 0.4.0 — so 0.5.0
-# shipped native apps, refresh tokens and identities lookup while
-# `fauxbus version` still described a release without them.  Same shape
-# as the version-number bug above: two copies of one claim, and no test
-# comparing them.  Both now read this tuple, so adding a surface here is
-# the whole edit.
+# What Fauxbus imitates, said once.  Three places tell a person what
+# this build covers: `GET /_fauxbus/` on the wire, `fauxbus version` on
+# the command line, and the banner `fauxbus serve` prints at boot.  They
+# used to be three hand-written sentences.  The command line's stopped
+# being edited after 0.4.0, so 0.5.0 shipped native apps, refresh tokens
+# and identities lookup while `fauxbus version` still described a
+# release without them.  0.6.0 joined the first two here and said "two
+# places" in this very comment; the banner was the third, and it went
+# out that day missing `refresh_token`.  Same shape as the
+# version-number bug above: copies of one claim, and no test comparing
+# them.  All three now read this tuple, so adding a surface here is the
+# whole edit — and if you find a fourth, it belongs here too.
 IMITATES = (
     "groups v2",
     "auth v2 (client_credentials, authorization_code + OIDC, refresh_token)",

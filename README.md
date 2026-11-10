@@ -62,6 +62,10 @@ injected 429.  Response shapes not yet backed by a recording are marked
 list is in [SPEC.md](SPEC.md), along with the full design.  Nothing is
 stable yet.
 
+`main` runs ahead of PyPI by one wording fix: the boot banner's list
+of imitated services, corrected here, lands in the next release.
+[Changelog](SPEC.md#changelog).
+
 ## Fake, not mock
 
 Your code doesn't know Fauxbus is there.  No monkeypatching, no fixture

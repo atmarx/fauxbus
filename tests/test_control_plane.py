@@ -49,6 +49,29 @@ def test_the_command_line_and_the_wire_describe_the_same_build(fx, capsys):
     assert [line.strip() for line in surfaces] == doc["imitates"]
 
 
+def test_the_boot_banner_names_every_imitated_service(fx):
+    """The third place the list is said: the line `fauxbus serve` prints.
+
+    0.6.0 shared the list between the wire and `fauxbus version` and
+    missed this one, which went out without `refresh_token`.  The banner
+    is prose, so this checks each entry appears in it whole rather than
+    pinning the sentence.
+    """
+    from fauxbus.server import boot_line, make_server
+    from fauxbus.world import World
+
+    _, doc, _ = fx.get("/_fauxbus/")
+    # Port 0: the OS picks a free one.  The server is built and closed
+    # without ever serving — boot_line only reads its configuration.
+    server = make_server("127.0.0.1", 0, world=World())
+    try:
+        banner = boot_line(server)
+    finally:
+        server.server_close()
+    for surface in doc["imitates"]:
+        assert surface in banner
+
+
 def test_index_reports_the_version_it_was_actually_built_as(fx):
     """The wire answer must match the package pip resolved.
 

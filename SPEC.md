@@ -1705,6 +1705,17 @@ a confession, not an infringement: it's *faux*.
 
 ## Changelog
 
+- **0.7.0.dev0** (unreleased, 2026-11-10) — **The boot banner reads
+  the shared list.**  0.6.0 joined the wire's `imitates` and
+  `fauxbus version` on one tuple and said, in a comment, that those
+  were the two places the list is written.  There were three.  The line
+  `fauxbus serve` prints at boot was a third hand-written copy, and it
+  went out in 0.6.0 without `refresh_token`.  Found the same day, by
+  reading the banner while checking the release from PyPI.  It now
+  joins `fauxbus.IMITATES` with semicolons, and a test checks every
+  entry appears in it.  Wording only: nothing on the wire changed.
+  419 tests.
+
 - **Package release: fauxbus 0.6.0** (2026-11-10, tag `v0.6.0`) —
   **Guest collections and permissions: the permission is the gate.**
   Root Cellar's ask of 2026-10-15, with the read door of 2026-11-09,
